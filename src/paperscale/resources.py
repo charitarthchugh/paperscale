@@ -45,9 +45,16 @@ class ResourceGovernor:
         finally:
             self._release(kind)
 
+    @contextmanager
     def open_file(self, path: Path, mode: str, **kwargs):
         with self.acquire(ResourceKind.FILE_DESCRIPTOR):
-            return self._file_opener(path, mode, **kwargs)
+            handle = self._file_opener(path, mode, **kwargs)
+            try:
+                yield handle
+            finally:
+                close = getattr(handle, "close", None)
+                if callable(close):
+                    close()
 
     def _acquire(self, kind: ResourceKind) -> None:
         if self._held_stack and kind < self._held_stack[-1]:
@@ -60,4 +67,3 @@ class ResourceGovernor:
         if not self._held_stack or self._held_stack[-1] is not kind:
             raise ResourceOrderError(f"must release resources in reverse order: {kind.name}")
         self._held_stack.pop()
-
