@@ -32,6 +32,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="reject empty, mojibake, or repeated OCR fragments before writing output",
     )
+    assemble_parser.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="mark the assembled Markdown as partial",
+    )
     assemble_parser.set_defaults(handler=_handle_assemble)
 
     for name, description in {
@@ -45,6 +50,15 @@ def build_parser() -> argparse.ArgumentParser:
         command_parser = subparsers.add_parser(name, help=description, description=description)
         command_parser.set_defaults(handler=_handle_not_yet_integrated)
 
+    doctor_parser = subparsers.add_parser("doctor", help="diagnose provider configuration")
+    doctor_subparsers = doctor_parser.add_subparsers(dest="doctor_command", required=True)
+    provider_parser = doctor_subparsers.add_parser(
+        "provider",
+        help="validate provider reachability and OCR profile compatibility",
+        description="Validate provider reachability and OCR profile compatibility without starting OCR work.",
+    )
+    provider_parser.set_defaults(handler=_handle_provider_doctor)
+
     return parser
 
 
@@ -57,7 +71,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def _handle_assemble(args: argparse.Namespace) -> int:
     pages = _read_page_artifacts(args.input)
-    markdown = assemble_document_markdown(pages, title=args.title, enforce_quality=args.enforce_quality)
+    markdown = assemble_document_markdown(
+        pages,
+        title=args.title,
+        enforce_quality=args.enforce_quality,
+        partial=args.allow_partial,
+    )
     _atomic_write_text(args.output, markdown)
     print(f"assembled {len(pages)} pages into {args.output}")
     return 0
@@ -69,6 +88,12 @@ def _handle_not_yet_integrated(args: argparse.Namespace) -> int:
         f"paperscale {command} is reserved for the document-to-Markdown OCR pipeline and awaits "
         "state/ledger/provider integration; no provider call was started."
     )
+
+
+def _handle_provider_doctor(args: argparse.Namespace) -> int:
+    del args
+    print("provider diagnostics are not yet integrated in this slice")
+    return 0
 
 
 def _read_page_artifacts(path: Path) -> list[PageMarkdownArtifact]:
