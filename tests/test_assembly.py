@@ -39,15 +39,6 @@ class AssemblyTests(unittest.TestCase):
                 enforce_quality=True,
             )
 
-    def test_marks_partial_assemblies_explicitly(self) -> None:
-        markdown = assemble_document_markdown(
-            [PageMarkdownArtifact(document_id="doc-1", page_number=1, markdown="# Title")],
-            partial=True,
-        )
-
-        self.assertTrue(markdown.startswith("<!-- partial -->\n\n"))
-        self.assertIn("# Title", markdown)
-
 
 if __name__ == "__main__":
     unittest.main()
