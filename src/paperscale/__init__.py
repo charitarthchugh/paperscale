@@ -1,4 +1,4 @@
-"""Paperscale public package surface for document-to-Markdown OCR workflows."""
+"""Paperscale local-first VLM OCR workload primitives."""
 
 __all__ = ["__version__"]
 
