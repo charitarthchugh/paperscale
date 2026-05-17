@@ -23,6 +23,7 @@ def assemble_document_markdown(
     *,
     title: str | None = None,
     enforce_quality: bool = False,
+    partial: bool = False,
 ) -> str:
     """Assemble completed page Markdown artifacts into one document.
 
@@ -55,6 +56,8 @@ def assemble_document_markdown(
     ordered_pages = sorted(pages, key=lambda page: page.page_number)
     fragments = [_normalize_fragment(page.markdown) for page in ordered_pages]
     body = f"\n\n{PAGE_BREAK}\n\n".join(fragments)
+    if partial:
+        body = "<!-- partial -->\n\n" + body
     if title:
         body = f"# {title.strip()}\n\n{body}"
     return f"{body.rstrip()}\n"
