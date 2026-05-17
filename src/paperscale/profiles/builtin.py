@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from typing import Any
 
 from paperscale.profiles.base import ModelOcrProfile, ProfileValidationResult
 
@@ -140,5 +141,5 @@ def get_builtin_profile(name: str) -> ModelOcrProfile:
         raise ValueError(f"unknown OCR profile: {name}") from exc
 
 
-def with_profile_override(name: str, **overrides: object) -> ModelOcrProfile:
+def with_profile_override(name: str, **overrides: Any) -> ModelOcrProfile:
     return replace(get_builtin_profile(name), **overrides)

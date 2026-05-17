@@ -12,6 +12,9 @@ dependencies = [
     "pdf-oxide (>=0.3.49,<0.4.0)"
 ]
 
+[tool.poetry]
+packages = [{ include = "paperscale", from = "src" }]
+
 [dependency-groups]
 dev = [
     "pyrefly (>=1.0.0,<2.0.0)",
@@ -25,3 +28,6 @@ build-backend = "poetry.core.masonry.api"
 
 [project.scripts]
 paperscale = "paperscale.cli:main"
+
+[tool.pyrefly]
+search-path = ["src", "."]

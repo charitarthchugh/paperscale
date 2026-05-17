@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 from paperscale.providers.base import PageOcrRequest
@@ -14,12 +14,8 @@ class ProfileValidationResult:
     ok: bool
     markdown: str
     retry_classification: str = "none"
-    metadata: dict[str, Any] | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
     diagnostic: str = "ok"
-
-    def __post_init__(self) -> None:
-        if self.metadata is None:
-            object.__setattr__(self, "metadata", {})
 
 
 @dataclass(frozen=True)
