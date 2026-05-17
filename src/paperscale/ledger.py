@@ -1,23 +1,15 @@
-"""Replayable page-attempt ledger and crash-recovery helpers.
-
-The ledger is deliberately provider-call aware: callers reserve an attempt and
-persist it before provider I/O, then transition to ``in_flight`` immediately
-before the provider request. Recovery distinguishes never-started reservations
-from requests that may have reached a non-idempotent provider.
-"""
+"""Ledger reservation, lease, and crash-recovery semantics."""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from enum import StrEnum
-from typing import Protocol
-from uuid import uuid4
+import uuid
+
+from paperscale.contracts import PageAttemptState, PageTask
 
 
 class LedgerState(StrEnum):
-    """Durable state for one page attempt."""
-
     PENDING = "pending"
     RESERVED = "reserved"
     IN_FLIGHT = "in_flight"
@@ -28,114 +20,67 @@ class LedgerState(StrEnum):
     SUPERSEDED = "superseded"
 
 
-@dataclass(frozen=True, slots=True)
-class LedgerRecord:
-    """Versioned compact ledger record for a page attempt."""
+class StaleEpochError(RuntimeError):
+    pass
 
-    schema_version: int
+
+class AmbiguousAttemptError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class LedgerAttempt:
     attempt_id: str
     page_id: str
     provider_request_fingerprint: str
-    worker_id: str | None
+    worker_id: str
     epoch: int
+    lease_expires_at: float
+    heartbeat_at: float
     state: LedgerState
-    lease_expires_at: float | None
-    heartbeat_at: float | None
     provider_call_started_at: float | None = None
     provider_response_committed_at: float | None = None
     result_pointer: str | None = None
-    failure_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class RecoveryReport:
-    """Summary of lease-expiry recovery transitions."""
-
     requeued_pages: list[str]
     ambiguous_pages: list[str]
 
 
-class LedgerError(RuntimeError):
-    """Base class for ledger transition failures."""
-
-
-class AmbiguousAttemptError(LedgerError):
-    """Raised when a duplicate provider call would be unsafe."""
-
-
-class StaleEpochError(LedgerError):
-    """Raised when an older worker epoch attempts to mutate current state."""
-
-
-class InvalidLedgerTransitionError(LedgerError):
-    """Raised for state-machine violations."""
-
-
-class LedgerStore(Protocol):
-    """Minimal store contract needed by the ledger state machine."""
-
-    def append(self, record: LedgerRecord) -> None:
-        """Persist a compact record transition durably."""
-
-    def latest(self, page_id: str) -> LedgerRecord | None:
-        """Return the latest compact index record for a page, if any."""
-
-    def latest_by_attempt(self, attempt_id: str) -> LedgerRecord | None:
-        """Return the latest record for an attempt, if any."""
-
-    def active_records(self) -> Iterable[LedgerRecord]:
-        """Return compact-index records that may need recovery."""
-
-
 class InMemoryLedgerStore:
-    """Deterministic ledger store for tests and fake local flows.
-
-    Production filesystem persistence belongs behind the same ``LedgerStore``
-    protocol. This test store keeps a transition log plus compact indexes and
-    intentionally exposes event hooks so tests can prove reservation-before-I/O
-    ordering without real provider calls.
-    """
+    """Small fake durable store used by tests and early invariant harnesses."""
 
     def __init__(self, *, events: list[str] | None = None) -> None:
+        self._latest_by_page: dict[str, LedgerAttempt] = {}
+        self._by_attempt: dict[str, LedgerAttempt] = {}
+        self._max_epoch_by_page: dict[str, int] = {}
         self.events = events if events is not None else []
-        self._records: list[LedgerRecord] = []
-        self._latest_by_page: dict[str, LedgerRecord] = {}
-        self._latest_by_attempt: dict[str, LedgerRecord] = {}
 
-    def append(self, record: LedgerRecord) -> None:
-        self.events.append(f"write:{record.state.value}")
-        self._records.append(record)
-        self._latest_by_page[record.page_id] = record
-        self._latest_by_attempt[record.attempt_id] = record
+    def write(self, attempt: LedgerAttempt) -> LedgerAttempt:
+        self._latest_by_page[attempt.page_id] = attempt
+        self._by_attempt[attempt.attempt_id] = attempt
+        self._max_epoch_by_page[attempt.page_id] = max(self._max_epoch_by_page.get(attempt.page_id, 0), attempt.epoch)
+        self.events.append(f"write:{attempt.state.value}")
+        return attempt
 
-    def latest(self, page_id: str) -> LedgerRecord | None:
-        return self._latest_by_page.get(page_id)
+    def require_latest(self, page_id: str) -> LedgerAttempt:
+        return self._latest_by_page[page_id]
 
-    def require_latest(self, page_id: str) -> LedgerRecord:
-        record = self.latest(page_id)
-        if record is None:
-            msg = f"no ledger record for page {page_id!r}"
-            raise KeyError(msg)
-        return record
+    def require_attempt(self, attempt_id: str) -> LedgerAttempt:
+        return self._by_attempt[attempt_id]
 
-    def latest_by_attempt(self, attempt_id: str) -> LedgerRecord | None:
-        return self._latest_by_attempt.get(attempt_id)
+    def next_epoch(self, page_id: str) -> int:
+        return self._max_epoch_by_page.get(page_id, 0) + 1
 
-    def active_records(self) -> Iterable[LedgerRecord]:
-        for record in self._latest_by_page.values():
-            if record.state in {LedgerState.RESERVED, LedgerState.IN_FLIGHT}:
-                yield record
-
-    @property
-    def records(self) -> tuple[LedgerRecord, ...]:
-        return tuple(self._records)
+    def all_latest(self) -> list[LedgerAttempt]:
+        return list(self._latest_by_page.values())
 
 
 class Ledger:
-    """Page-attempt ledger enforcing recovery and duplicate-call policy."""
-
-    def __init__(self, store: LedgerStore, *, now: Callable[[], float]) -> None:
-        self._store = store
+    def __init__(self, store: InMemoryLedgerStore, *, now) -> None:
+        self.store = store
         self._now = now
 
     def reserve_page(
@@ -145,148 +90,212 @@ class Ledger:
         provider_request_fingerprint: str,
         worker_id: str,
         lease_seconds: float,
-        allow_ambiguous_retry: bool = False,
-    ) -> LedgerRecord:
-        """Reserve a page attempt before provider I/O.
+        retry_ambiguous: bool = False,
+    ) -> LedgerAttempt:
+        try:
+            latest = self.store.require_latest(page_id)
+        except KeyError:
+            latest = None
+        if latest and latest.state == LedgerState.AMBIGUOUS and not retry_ambiguous:
+            raise AmbiguousAttemptError(f"ambiguous attempt for {page_id} requires explicit retry policy")
+        if latest and latest.state in {LedgerState.RESERVED, LedgerState.IN_FLIGHT, LedgerState.SUCCEEDED}:
+            raise RuntimeError(f"page {page_id} is not reservable from state {latest.state}")
 
-        Ambiguous work is fail-closed by default because a provider request may
-        have reached a non-idempotent model server before the crash.
-        """
-
-        now = self._now()
-        latest = self._store.latest(page_id)
-        if latest is not None:
-            if latest.state == LedgerState.AMBIGUOUS and not allow_ambiguous_retry:
-                msg = (
-                    f"page {page_id!r} has ambiguous attempt {latest.attempt_id!r}; "
-                    "retry requires explicit duplicate-call policy"
-                )
-                raise AmbiguousAttemptError(msg)
-            if latest.state in {
-                LedgerState.RESERVED,
-                LedgerState.IN_FLIGHT,
-                LedgerState.SUCCEEDED,
-                LedgerState.FAILED_TERMINAL,
-            }:
-                msg = f"cannot reserve page {page_id!r} from state {latest.state.value!r}"
-                raise InvalidLedgerTransitionError(msg)
-            epoch = latest.epoch + 1
-        else:
-            epoch = 1
-
-        record = LedgerRecord(
-            schema_version=1,
-            attempt_id=str(uuid4()),
+        current = float(self._now())
+        attempt = LedgerAttempt(
+            attempt_id=str(uuid.uuid4()),
             page_id=page_id,
             provider_request_fingerprint=provider_request_fingerprint,
             worker_id=worker_id,
-            epoch=epoch,
+            epoch=self.store.next_epoch(page_id),
+            lease_expires_at=current + lease_seconds,
+            heartbeat_at=current,
             state=LedgerState.RESERVED,
-            lease_expires_at=now + lease_seconds,
-            heartbeat_at=now,
         )
-        self._store.append(record)
-        return record
+        return self.store.write(attempt)
 
-    def mark_provider_call_started(self, attempt_id: str, *, worker_id: str, epoch: int) -> LedgerRecord:
-        current = self._require_current_attempt(attempt_id, worker_id=worker_id, epoch=epoch)
-        if current.state != LedgerState.RESERVED:
-            msg = f"provider call can start only from reserved, got {current.state.value!r}"
-            raise InvalidLedgerTransitionError(msg)
-        updated = replace(current, state=LedgerState.IN_FLIGHT, provider_call_started_at=self._now())
-        self._store.append(updated)
-        return updated
+    def mark_provider_call_started(self, attempt_id: str, *, worker_id: str, epoch: int) -> LedgerAttempt:
+        attempt = self._require_current_attempt(attempt_id, worker_id, epoch)
+        updated = replace(attempt, state=LedgerState.IN_FLIGHT, provider_call_started_at=float(self._now()))
+        return self.store.write(updated)
 
-    def heartbeat(self, attempt_id: str, *, worker_id: str, epoch: int, lease_seconds: float = 30.0) -> LedgerRecord:
-        current = self._require_current_attempt(attempt_id, worker_id=worker_id, epoch=epoch)
-        if current.state not in {LedgerState.RESERVED, LedgerState.IN_FLIGHT}:
-            msg = f"heartbeat allowed only for active attempts, got {current.state.value!r}"
-            raise InvalidLedgerTransitionError(msg)
-        now = self._now()
-        updated = replace(current, heartbeat_at=now, lease_expires_at=now + lease_seconds)
-        self._store.append(updated)
-        return updated
+    def heartbeat(self, attempt_id: str, *, worker_id: str, epoch: int, lease_seconds: float = 30.0) -> LedgerAttempt:
+        attempt = self._require_current_attempt(attempt_id, worker_id, epoch)
+        current = float(self._now())
+        return self.store.write(replace(attempt, heartbeat_at=current, lease_expires_at=current + lease_seconds))
 
-    def commit_success(
-        self,
-        attempt_id: str,
-        *,
-        worker_id: str,
-        epoch: int,
-        result_pointer: str,
-    ) -> LedgerRecord:
-        current = self._require_current_attempt(attempt_id, worker_id=worker_id, epoch=epoch)
-        if current.state != LedgerState.IN_FLIGHT:
-            msg = f"success commit allowed only from in_flight, got {current.state.value!r}"
-            raise InvalidLedgerTransitionError(msg)
+    def commit_success(self, attempt_id: str, *, worker_id: str, epoch: int, result_pointer: str) -> LedgerAttempt:
+        attempt = self._require_current_attempt(attempt_id, worker_id, epoch)
         updated = replace(
-            current,
+            attempt,
             state=LedgerState.SUCCEEDED,
-            lease_expires_at=None,
-            provider_response_committed_at=self._now(),
+            provider_response_committed_at=float(self._now()),
             result_pointer=result_pointer,
         )
-        self._store.append(updated)
-        return updated
-
-    def fail_attempt(
-        self,
-        attempt_id: str,
-        *,
-        worker_id: str,
-        epoch: int,
-        retryable: bool,
-        reason: str,
-    ) -> LedgerRecord:
-        current = self._require_current_attempt(attempt_id, worker_id=worker_id, epoch=epoch)
-        if current.state not in {LedgerState.RESERVED, LedgerState.IN_FLIGHT}:
-            msg = f"failure commit allowed only from active states, got {current.state.value!r}"
-            raise InvalidLedgerTransitionError(msg)
-        updated = replace(
-            current,
-            state=LedgerState.FAILED_RETRYABLE if retryable else LedgerState.FAILED_TERMINAL,
-            lease_expires_at=None,
-            provider_response_committed_at=self._now() if current.state == LedgerState.IN_FLIGHT else None,
-            failure_reason=reason,
-        )
-        self._store.append(updated)
-        return updated
+        return self.store.write(updated)
 
     def recover_expired_leases(self, *, now: float | None = None) -> RecoveryReport:
-        """Recover expired active attempts using compact active records only."""
-
-        observed_now = self._now() if now is None else now
-        requeued_pages: list[str] = []
-        ambiguous_pages: list[str] = []
-        for record in list(self._store.active_records()):
-            if record.lease_expires_at is None or record.lease_expires_at > observed_now:
+        current = float(self._now() if now is None else now)
+        requeued: list[str] = []
+        ambiguous: list[str] = []
+        for attempt in list(self.store.all_latest()):
+            if attempt.lease_expires_at > current:
                 continue
-            if record.state == LedgerState.RESERVED and record.provider_call_started_at is None:
-                self._store.append(
-                    replace(
-                        record,
-                        state=LedgerState.PENDING,
-                        worker_id=None,
-                        lease_expires_at=None,
-                        heartbeat_at=None,
-                    )
-                )
-                requeued_pages.append(record.page_id)
-            elif record.state == LedgerState.IN_FLIGHT and record.provider_response_committed_at is None:
-                self._store.append(replace(record, state=LedgerState.AMBIGUOUS, lease_expires_at=None))
-                ambiguous_pages.append(record.page_id)
-        return RecoveryReport(requeued_pages=requeued_pages, ambiguous_pages=ambiguous_pages)
+            if attempt.state == LedgerState.RESERVED and attempt.provider_call_started_at is None:
+                self.store.write(replace(attempt, state=LedgerState.PENDING))
+                requeued.append(attempt.page_id)
+            elif attempt.state == LedgerState.IN_FLIGHT and attempt.provider_response_committed_at is None:
+                self.store.write(replace(attempt, state=LedgerState.AMBIGUOUS))
+                ambiguous.append(attempt.page_id)
+        return RecoveryReport(requeued_pages=requeued, ambiguous_pages=ambiguous)
 
-    def _require_current_attempt(self, attempt_id: str, *, worker_id: str, epoch: int) -> LedgerRecord:
-        current = self._store.latest_by_attempt(attempt_id)
-        if current is None:
-            msg = f"unknown attempt {attempt_id!r}"
-            raise KeyError(msg)
-        latest_for_page = self._store.latest(current.page_id)
-        if latest_for_page is None or latest_for_page.attempt_id != attempt_id or latest_for_page.epoch != epoch:
-            msg = f"attempt {attempt_id!r} is stale for page {current.page_id!r}"
-            raise StaleEpochError(msg)
-        if current.worker_id != worker_id or current.epoch != epoch:
-            msg = f"attempt {attempt_id!r} has stale worker/epoch"
-            raise StaleEpochError(msg)
-        return current
+    def _require_current_attempt(self, attempt_id: str, worker_id: str, epoch: int) -> LedgerAttempt:
+        attempt = self.store.require_attempt(attempt_id)
+        latest = self.store.require_latest(attempt.page_id)
+        if latest.attempt_id != attempt_id or attempt.worker_id != worker_id or attempt.epoch != epoch:
+            raise StaleEpochError(f"stale attempt {attempt_id}")
+        return attempt
+
+
+@dataclass(frozen=True, slots=True)
+class PageAttempt:
+    attempt_id: str
+    task: PageTask
+    worker_id: str
+    fingerprint: str
+    epoch: int
+    lease_expires_at: float
+    heartbeat_at: float
+    state: PageAttemptState
+    duplicate_call_risk: bool = False
+    provider_started_at: float | None = None
+    result_pointer: str | None = None
+
+
+class PageLedger:
+    """High-level page ledger API used by crash/recovery acceptance tests."""
+
+    def __init__(self, *, store, clock) -> None:
+        self.store = store
+        self.clock = clock
+        self._attempts: dict[str, PageAttempt] = {}
+        self._latest_by_page: dict[str, str] = {}
+        self._max_epoch_by_page: dict[str, int] = {}
+
+    def reserve_page_attempt(
+        self,
+        task: PageTask,
+        *,
+        worker_id: str,
+        fingerprint: str,
+        lease_seconds: float,
+    ) -> PageAttempt:
+        latest = self._latest_attempt_for_page(task.page_id)
+        if latest is not None and latest.state == PageAttemptState.AMBIGUOUS:
+            raise AmbiguousAttemptError(f"ambiguous attempt for {task.page_id} requires explicit retry")
+        epoch = self._max_epoch_by_page.get(task.page_id, 0) + 1
+        now = float(self.clock.now())
+        attempt = PageAttempt(
+            attempt_id=str(uuid.uuid4()),
+            task=task,
+            worker_id=worker_id,
+            fingerprint=fingerprint,
+            epoch=epoch,
+            lease_expires_at=now + lease_seconds,
+            heartbeat_at=now,
+            state=PageAttemptState.RESERVED,
+        )
+        self._write_attempt(attempt, mutation="attempt_reserved")
+        return attempt
+
+    def has_durable_reservation(self, attempt_id: str) -> bool:
+        return ("attempt_reserved", attempt_id) in getattr(self.store, "mutations", [])
+
+    def mark_provider_started(self, attempt_id: str) -> PageAttempt:
+        attempt = self._require_current_attempt(attempt_id, epoch=None)
+        updated = replace(
+            attempt,
+            state=PageAttemptState.IN_FLIGHT,
+            provider_started_at=float(self.clock.now()),
+        )
+        self._write_attempt(updated, mutation="attempt_in_flight")
+        return updated
+
+    def recover_expired_attempts(self) -> dict[str, PageAttempt]:
+        now = float(self.clock.now())
+        recovered: dict[str, PageAttempt] = {}
+        for attempt_id, attempt in list(self._attempts.items()):
+            if self._latest_by_page.get(attempt.task.page_id) != attempt_id:
+                continue
+            if attempt.lease_expires_at > now:
+                continue
+            if attempt.state == PageAttemptState.RESERVED and attempt.provider_started_at is None:
+                updated = replace(attempt, state=PageAttemptState.PENDING, duplicate_call_risk=False)
+                self._write_attempt(updated, mutation="attempt_requeued")
+                recovered[attempt_id] = updated
+            elif attempt.state == PageAttemptState.IN_FLIGHT and attempt.result_pointer is None:
+                updated = replace(attempt, state=PageAttemptState.AMBIGUOUS, duplicate_call_risk=True)
+                self._write_attempt(updated, mutation="attempt_ambiguous")
+                recovered[attempt_id] = updated
+        return recovered
+
+    def next_retryable_page(self, *, allow_ambiguous: bool = False) -> PageTask | None:
+        for attempt_id in self._latest_by_page.values():
+            attempt = self._attempts[attempt_id]
+            if attempt.state == PageAttemptState.PENDING:
+                return attempt.task
+            if allow_ambiguous and attempt.state == PageAttemptState.AMBIGUOUS:
+                return attempt.task
+        return None
+
+    def steal_expired_attempt(self, attempt_id: str, *, worker_id: str) -> PageAttempt:
+        old = self._attempts[attempt_id]
+        epoch = self._max_epoch_by_page.get(old.task.page_id, old.epoch) + 1
+        now = float(self.clock.now())
+        stolen = PageAttempt(
+            attempt_id=str(uuid.uuid4()),
+            task=old.task,
+            worker_id=worker_id,
+            fingerprint=old.fingerprint,
+            epoch=epoch,
+            lease_expires_at=now + max(old.lease_expires_at - old.heartbeat_at, 1.0),
+            heartbeat_at=now,
+            state=PageAttemptState.RESERVED,
+        )
+        self._write_attempt(stolen, mutation="attempt_stolen")
+        return stolen
+
+    def heartbeat(self, attempt_id: str, *, epoch: int, lease_seconds: float = 30.0) -> PageAttempt:
+        attempt = self._require_current_attempt(attempt_id, epoch=epoch)
+        now = float(self.clock.now())
+        updated = replace(attempt, heartbeat_at=now, lease_expires_at=now + lease_seconds)
+        self._write_attempt(updated, mutation="attempt_heartbeat")
+        return updated
+
+    def commit_success(self, attempt_id: str, *, epoch: int, result_pointer: str) -> PageAttempt:
+        attempt = self._require_current_attempt(attempt_id, epoch=epoch)
+        updated = replace(attempt, state=PageAttemptState.SUCCEEDED, result_pointer=result_pointer)
+        self._write_attempt(updated, mutation="attempt_succeeded")
+        return updated
+
+    def _latest_attempt_for_page(self, page_id: str) -> PageAttempt | None:
+        latest_id = self._latest_by_page.get(page_id)
+        return self._attempts.get(latest_id) if latest_id else None
+
+    def _write_attempt(self, attempt: PageAttempt, *, mutation: str) -> None:
+        self._attempts[attempt.attempt_id] = attempt
+        self._latest_by_page[attempt.task.page_id] = attempt.attempt_id
+        self._max_epoch_by_page[attempt.task.page_id] = max(
+            self._max_epoch_by_page.get(attempt.task.page_id, 0), attempt.epoch
+        )
+        mutate = getattr(self.store, "mutate", None)
+        if callable(mutate):
+            mutate(mutation, attempt.attempt_id)
+
+    def _require_current_attempt(self, attempt_id: str, *, epoch: int | None) -> PageAttempt:
+        attempt = self._attempts[attempt_id]
+        if self._latest_by_page.get(attempt.task.page_id) != attempt_id:
+            raise StaleEpochError(f"stale attempt {attempt_id}")
+        if epoch is not None and attempt.epoch != epoch:
+            raise StaleEpochError(f"stale epoch {epoch} for {attempt_id}")
+        return attempt
