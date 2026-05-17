@@ -34,8 +34,9 @@ class Scheduler:
         self._index = index
         self._queue_size = queue_size
         self._capacity = capacity
-        self._pending_page_ids = list(index.iter_pending_page_ids())
+        self._pending_page_ids = iter(index.iter_pending_page_ids())
         self._queued_count = 0
+        self._paused = False
 
     @property
     def queued_count(self) -> int:
@@ -54,13 +55,17 @@ class Scheduler:
         return self._index.full_tree_scan()
 
     def fill_queue(self) -> None:
+        if self._paused:
+            return
         hard_cap = self._queue_size
         if self._capacity is not None:
             hard_cap = min(hard_cap, self._capacity.max_provider_queue)
-        if self._queued_count >= hard_cap:
-            return
-        self._queued_count = min(hard_cap, len(self._pending_page_ids))
+        while self._queued_count < hard_cap:
+            try:
+                next(self._pending_page_ids)
+            except StopIteration:
+                break
+            self._queued_count += 1
 
     def on_provider_overload(self, _controller: RetryStormController) -> None:
-        return
-
+        self._paused = True
