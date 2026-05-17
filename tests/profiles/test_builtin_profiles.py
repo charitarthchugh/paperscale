@@ -15,20 +15,27 @@ class BuiltinModelOcrProfileTests(unittest.TestCase):
             self.assertNotIn("visual_qa", profile.supported_public_modes)
             self.assertNotIn("arbitrary_prompt", profile.supported_public_modes)
 
-    def test_each_first_class_profile_builds_provider_neutral_request_from_same_page_task(self) -> None:
-        PageTask = require_symbol("paperscale.contracts", "PageTask")
-        get_builtin_profile = require_symbol("paperscale.profiles.builtin", "get_builtin_profile")
-        task = PageTask(document_id="doc", page_number=1, image_hash="sha256:image")
-        for name in ["lighton_ocr_2_1b", "deepseek_ocr_2", "glm_ocr"]:
-            request = get_builtin_profile(name).build_request(task, image_bytes=b"fake")
-            self.assertEqual(request.page_id, "doc:1")
-            self.assertIn("markdown", request.prompt.lower())
-            self.assertFalse(hasattr(request, "openai_messages"), "scheduler-facing request must stay provider-neutral")
+    def test_first_class_profiles_build_provider_neutral_requests_from_same_page_input(self) -> None:
+        for name in ("lighton_ocr_2_1b", "deepseek_ocr_2", "glm_ocr"):
+            with self.subTest(profile=name):
+                profile = get_builtin_profile(name)
+                request = profile.build_request("doc-7:page-3", b"same-image", "image/png")
 
-    def test_profile_specific_fingerprints_change_for_prompt_parser_decoding_and_render(self) -> None:
-        PageTask = require_symbol("paperscale.contracts", "PageTask")
-        get_builtin_profile = require_symbol("paperscale.profiles.builtin", "get_builtin_profile")
-        task = PageTask(document_id="doc", page_number=1, image_hash="sha256:image")
+                self.assertEqual(request.page_id, "doc-7:page-3")
+                self.assertEqual(request.provider, "openai-compatible-chat")
+                self.assertEqual(request.profile_name, name)
+                self.assertEqual(request.image_media_type, "image/png")
+                self.assertNotIn("scheduler", request.provider_options)
+                self.assertTrue(request.fingerprint)
+
+    def test_builtin_profiles_classify_empty_and_malformed_outputs(self) -> None:
+        for name in ("lighton_ocr_2_1b", "deepseek_ocr_2", "glm_ocr"):
+            with self.subTest(profile=name):
+                result = get_builtin_profile(name).parse_and_validate("   ")
+                self.assertFalse(result.ok)
+                self.assertEqual(result.retry_classification, "retryable")
+
+    def test_profile_request_fingerprint_changes_with_prompt_decoding_render_and_parser(self) -> None:
         profile = get_builtin_profile("deepseek_ocr_2")
         original = profile.request_fingerprint(task)
         self.assertNotEqual(original, profile.with_prompt_version("v2").request_fingerprint(task))

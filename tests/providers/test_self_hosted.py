@@ -2,8 +2,32 @@ from __future__ import annotations
 
 import unittest
 
-from tests.harness.fakes import FakeHttpClient
-from tests.harness.imports import require_symbol
+from paperscale.providers.self_hosted import (
+    InferenceServerProfile,
+    ProviderCapacityProfile,
+    ProviderOverloadController,
+    SelfHostedOpenAICompatibleProvider,
+    builtin_capacity_profile,
+)
+
+
+class FakeResponse:
+    def __init__(self, status_code: int, payload: dict[str, object]):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self) -> dict[str, object]:
+        return self._payload
+
+
+class FakeHttpClient:
+    def __init__(self, responses: list[FakeResponse]):
+        self.responses = responses
+        self.calls: list[tuple[str, str, float]] = []
+
+    def get(self, url: str, *, timeout: float) -> FakeResponse:
+        self.calls.append(("GET", url, timeout))
+        return self.responses.pop(0)
 
 
 class SelfHostedProviderProfileTests(unittest.TestCase):
@@ -38,6 +62,35 @@ class SelfHostedProviderProfileTests(unittest.TestCase):
             breaker.record_overload(status_code=429)
         self.assertTrue(breaker.is_open)
         self.assertLessEqual(breaker.queued_requests, 2)
+
+    def test_provider_overload_opens_circuit_without_growing_queue_beyond_capacity(self) -> None:
+        capacity = ProviderCapacityProfile(
+            name="tiny",
+            max_in_flight_requests=1,
+            max_provider_queue=2,
+            queue_size=2,
+            timeout_seconds=10.0,
+            backoff_initial_seconds=0.5,
+            backoff_max_seconds=3.0,
+            circuit_breaker_failure_threshold=2,
+            circuit_breaker_cooldown_seconds=10.0,
+            render_target_longest_side=800,
+        )
+        controller = ProviderOverloadController(capacity)
+
+        self.assertTrue(controller.try_enqueue())
+        self.assertTrue(controller.try_enqueue())
+        self.assertFalse(controller.try_enqueue())
+        first = controller.record_status(429)
+        second = controller.record_status(503)
+
+        self.assertTrue(first.should_retry)
+        self.assertEqual(first.backoff_seconds, 0.5)
+        self.assertFalse(first.circuit_open)
+        self.assertFalse(second.should_retry)
+        self.assertEqual(second.backoff_seconds, 1.0)
+        self.assertTrue(second.circuit_open)
+        self.assertEqual(controller.queued_requests, 2)
 
 
 if __name__ == "__main__":
