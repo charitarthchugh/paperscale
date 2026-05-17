@@ -1,26 +1,22 @@
-"""Deterministic quality gates for VLM OCR Markdown fragments.
-
-The verifier is intentionally local and side-effect free. It performs no model,
-provider, network, or filesystem calls, which keeps v1 tests deterministic and
-makes it safe to run before document assembly commits output.
-"""
+"""Deterministic quality gates for VLM OCR Markdown fragments."""
 
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import re
 
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 _TOKEN_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 _REFUSAL_PATTERNS = (
     r"\bas an ai\b",
+    r"\bi am unable to help\b",
     r"\bi can(?:'|)t help\b",
     r"\bi cannot help\b",
     r"\bi(?:'|)m sorry\b",
     r"\bsorry,? but\b",
     r"\bcannot provide\b",
-    r"\bI cannot comply\b",
+    r"\bi cannot comply\b",
 )
 
 
@@ -42,14 +38,34 @@ class QualityReport:
     issues: list[QualityIssue]
 
 
-def assess_markdown_fragment(markdown: str) -> QualityReport:
-    """Assess whether a page Markdown fragment is coherent enough to assemble.
+@dataclass(frozen=True, slots=True)
+class VerificationFinding:
+    """Persistable verifier finding attached to a page artifact."""
 
-    The checks are intentionally conservative and deterministic. They catch the
-    most common v1 failure modes from OCR/VLM output without making external
-    calls: empty output, mojibake/replacement-character floods, binary/control
-    text leakage, repeated-character loops, and repeated phrase/ngram loops.
-    """
+    accepted: bool
+    kind: str
+    retry_class: str
+    warnings: list[str] = field(default_factory=list)
+
+
+class DeterministicQualityVerifier:
+    """Local, no-extra-model verifier for v1 page Markdown fragments."""
+
+    def __init__(self, optional_slm: object | None = None) -> None:
+        self.optional_slm = optional_slm
+
+    def classify(self, markdown: str) -> VerificationFinding:
+        report = assess_markdown_fragment(markdown)
+        if report.accepted:
+            return VerificationFinding(True, "ok", "none", warnings=[])
+        issue = report.issues[0]
+        kind = _public_kind(issue.code)
+        retry_class = "terminal" if kind == "refusal" else "retryable"
+        return VerificationFinding(False, kind, retry_class, warnings=[])
+
+
+def assess_markdown_fragment(markdown: str) -> QualityReport:
+    """Assess whether a page Markdown fragment is coherent enough to assemble."""
 
     issues: list[QualityIssue] = []
     text = markdown.strip()
@@ -60,12 +76,7 @@ def assess_markdown_fragment(markdown: str) -> QualityReport:
 
     replacement_count = text.count("\ufffd")
     if replacement_count >= 3 or replacement_count / max(len(text), 1) > 0.02:
-        issues.append(
-            QualityIssue(
-                "mojibake",
-                "OCR output contains too many Unicode replacement characters.",
-            )
-        )
+        issues.append(QualityIssue("mojibake", "OCR output contains too many Unicode replacement characters."))
 
     if _CONTROL_CHAR_RE.search(text):
         issues.append(QualityIssue("control_characters", "OCR output contains control characters."))
@@ -92,6 +103,12 @@ def assess_markdown_fragment(markdown: str) -> QualityReport:
     return QualityReport(accepted=accepted, severity="ok" if accepted else "error", issues=issues)
 
 
+def _public_kind(code: str) -> str:
+    if code == "refusal_boilerplate":
+        return "refusal"
+    return code
+
+
 def _has_repeated_character_run(text: str) -> bool:
     current = ""
     run_length = 0
@@ -108,6 +125,10 @@ def _has_repeated_character_run(text: str) -> bool:
 
 def _has_repeated_ngram_loop(text: str) -> bool:
     tokens = [token.lower() for token in _TOKEN_RE.findall(text) if token.strip()]
+    if len(tokens) >= 6:
+        most_common = max((tokens.count(token) for token in set(tokens)), default=0)
+        if most_common >= 6 and most_common / len(tokens) >= 0.75:
+            return True
     if len(tokens) < 24:
         return False
 
@@ -136,7 +157,11 @@ def _has_malformed_frontmatter(text: str) -> bool:
     lines = stripped.splitlines()
     if len(lines) == 1:
         return True
-    return not any(line.strip() == "---" for line in lines[1:])
+    closing_index = next((i for i, line in enumerate(lines[1:], start=1) if line.strip() == "---"), None)
+    if closing_index is None:
+        return True
+    frontmatter = lines[1:closing_index]
+    return any(line.count("[") != line.count("]") or line.count("{") != line.count("}") for line in frontmatter)
 
 
 def _has_truncation_indicator(text: str) -> bool:

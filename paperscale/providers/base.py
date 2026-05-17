@@ -1,20 +1,27 @@
-"""Provider-neutral OCR request and response contracts."""
-
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-import base64
 import hashlib
 import json
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Protocol
 
 
-def _stable_json(value: Any) -> str:
+JsonMapping = dict[str, Any]
+
+
+def _stable_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
 
-@dataclass(frozen=True, slots=True)
+def stable_fingerprint(parts: JsonMapping) -> str:
+    payload = _stable_json(parts).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+@dataclass(frozen=True)
 class PageOcrRequest:
+    """Provider-neutral request for one page image -> Markdown OCR."""
+
     page_id: str
     provider: str
     model: str
@@ -25,33 +32,49 @@ class PageOcrRequest:
     image_hash: str
     prompt: str
     image_media_type: str
-    image_bytes: bytes
-    decoding: dict[str, Any] = field(default_factory=dict)
-    render_options: dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def image_data_url(self) -> str:
-        encoded = base64.b64encode(self.image_bytes).decode("ascii")
-        return f"data:{self.image_media_type};base64,{encoded}"
+    image_bytes: bytes = field(repr=False, compare=False)
+    decoding: JsonMapping = field(default_factory=dict)
+    render_options: JsonMapping = field(default_factory=dict)
+    provider_options: JsonMapping = field(default_factory=dict)
 
     @property
     def fingerprint(self) -> str:
-        payload = {
-            "provider": self.provider,
-            "model": self.model,
-            "profile_name": self.profile_name,
-            "profile_version": self.profile_version,
-            "prompt_hash": self.prompt_hash,
-            "parser_version": self.parser_version,
-            "image_hash": self.image_hash,
-            "decoding": self.decoding,
-            "render_options": self.render_options,
-        }
-        return hashlib.sha256(_stable_json(payload).encode("utf-8")).hexdigest()
+        """Request key sensitive to all replay-relevant provider/profile inputs."""
+
+        return stable_fingerprint(
+            {
+                "schema_version": 1,
+                "page_id": self.page_id,
+                "provider": self.provider,
+                "model": self.model,
+                "profile_name": self.profile_name,
+                "profile_version": self.profile_version,
+                "prompt_hash": self.prompt_hash,
+                "parser_version": self.parser_version,
+                "image_hash": self.image_hash,
+                "decoding": self.decoding,
+                "render_options": self.render_options,
+                "provider_options": self.provider_options,
+            }
+        )
 
 
-@dataclass(frozen=True, slots=True)
-class ProviderOcrResponse:
+@dataclass(frozen=True)
+class PageOcrResponse:
+    """Provider-neutral response after transport, before durable page commit."""
+
     markdown: str
     provider_request_id: str
-    raw: Any | None = None
+    raw: object | None = None
+    metadata: JsonMapping = field(default_factory=dict)
+
+
+class ProviderError(RuntimeError):
+    """Raised when provider transport fails before profile parsing/validation."""
+
+
+class PageOcrProvider(Protocol):
+    name: str
+
+    def send(self, request: PageOcrRequest) -> PageOcrResponse:
+        """Send a provider-neutral request and return provider-neutral output."""

@@ -4,9 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from paperscale.contracts import PageArtifact
 from paperscale.quality.verifier import assess_markdown_fragment
 
 PAGE_BREAK = "<!-- page-break -->"
+
+
+class AssemblyError(RuntimeError):
+    """Raised when document assembly cannot produce a complete artifact."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,6 +23,33 @@ class PageMarkdownArtifact:
     markdown: str
 
 
+@dataclass(frozen=True, slots=True)
+class AssemblyResult:
+    markdown: str
+    partial: bool
+    missing_pages: list[int]
+
+
+class MarkdownAssembler:
+    """Assemble durable page OCR artifacts without mutating page results."""
+
+    def __init__(self, *, required_pages: list[int]) -> None:
+        self.required_pages = list(required_pages)
+
+    def assemble(self, artifacts: list[PageArtifact], allow_partial: bool = False) -> AssemblyResult:
+        by_page = {artifact.page_number: artifact for artifact in artifacts}
+        missing = [page for page in self.required_pages if page not in by_page]
+        if missing and not allow_partial:
+            raise AssemblyError(f"missing required pages: {missing}")
+        ordered = [by_page[page] for page in self.required_pages if page in by_page]
+        fragments = [artifact.markdown.strip() for artifact in ordered]
+        markdown = f"\n\n{PAGE_BREAK}\n\n".join(fragments).rstrip()
+        partial = bool(missing)
+        if partial:
+            markdown = f"<!-- PARTIAL: missing pages {missing} -->\n\n{markdown}".rstrip()
+        return AssemblyResult(markdown=f"{markdown}\n", partial=partial, missing_pages=missing)
+
+
 def assemble_document_markdown(
     pages: list[PageMarkdownArtifact],
     *,
@@ -25,12 +57,7 @@ def assemble_document_markdown(
     enforce_quality: bool = False,
     partial: bool = False,
 ) -> str:
-    """Assemble completed page Markdown artifacts into one document.
-
-    Assembly is intentionally separate from page OCR. It validates that all
-    inputs belong to a single document, sorts by page number, and can apply the
-    deterministic quality gate before emitting the final Markdown string.
-    """
+    """Assemble completed page Markdown artifacts into one document."""
 
     if not pages:
         raise ValueError("cannot assemble a document with no pages")

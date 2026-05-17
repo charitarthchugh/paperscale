@@ -48,6 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
         "repair-index": "repair-only compact index rebuild",
     }.items():
         command_parser = subparsers.add_parser(name, help=description, description=description)
+        command_parser.add_argument("job_id", nargs="?", help="workload identifier")
         command_parser.set_defaults(handler=_handle_not_yet_integrated)
 
     doctor_parser = subparsers.add_parser("doctor", help="diagnose provider configuration")
@@ -155,3 +156,30 @@ def _fsync_parent(directory: Path) -> None:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+class CliApp:
+    """Injectable CLI facade used by tests and future command wiring."""
+
+    def __init__(self, *, store) -> None:
+        self.store = store
+
+    def run(self, argv: Sequence[str]) -> int:
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        if args.command == "status":
+            self.store.read_index("job-index")
+            return 0
+        if args.command == "repair-index":
+            self.store.scan_tree(getattr(args, "job_id", ".") or ".")
+            return 0
+        return 0
+
+
+def format_ambiguous_attempts(*, count: int, page_sample: list[str]) -> str:
+    sample = ", ".join(page_sample)
+    return (
+        f"{count} ambiguous OCR attempts require operator reconciliation. "
+        f"Sample pages: {sample}. Retrying can create duplicate provider calls; "
+        "use --retry-ambiguous only after accepting that risk or confirming idempotency."
+    )

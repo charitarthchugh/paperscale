@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
 
 class CompactIndexError(RuntimeError):
     """Raised when compact-index reads fail closed."""
+
+
+CorruptIndexError = CompactIndexError
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +31,42 @@ class RetryStormController:
     @property
     def circuit_open(self) -> bool:
         return self._overload_events >= self._capacity.circuit_breaker_threshold
+
+
+class LazyPageQueue:
+    def __init__(self, *, document_id: str, page_count: int, buffer_size: int) -> None:
+        self.document_id = document_id
+        self.total_pages = page_count
+        self._buffer_size = max(buffer_size, 0)
+        self._buffer = [f"{document_id}:{page}" for page in range(1, min(page_count, self._buffer_size) + 1)]
+
+    def peek_buffer(self) -> list[str]:
+        return list(self._buffer)
+
+    def __iter__(self) -> Iterator[str]:
+        for page in range(1, self.total_pages + 1):
+            yield f"{self.document_id}:{page}"
+
+
+class JobScheduler:
+    def __init__(self, *, store: Any, queue_size: int) -> None:
+        self.store = store
+        self.queue_size = queue_size
+
+    def status(self, _job_id: str) -> dict[str, Any]:
+        payload = self.store.read_index("job-index")
+        if not isinstance(payload, dict):
+            raise CorruptIndexError("missing or corrupt job status index")
+        return payload
+
+    def resume(self, _job_id: str) -> dict[str, Any]:
+        payload = self.store.read_index("resume-index")
+        if not isinstance(payload, dict):
+            raise CorruptIndexError("missing or corrupt resume index")
+        return payload
+
+    def build_lazy_queue(self, *, document_id: str, page_count: int) -> LazyPageQueue:
+        return LazyPageQueue(document_id=document_id, page_count=page_count, buffer_size=self.queue_size)
 
 
 class Scheduler:

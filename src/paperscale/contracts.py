@@ -74,3 +74,20 @@ def build_provider_request_fingerprint(**parts: Any) -> str:
 
     payload = json.dumps(parts, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class PageArtifact:
+    """Durable page OCR artifact consumed by assembly and diagnostics."""
+
+    page_id: str
+    markdown: str
+    result_pointer: str
+    verifier_metadata: list[Any] | None = None
+
+    @property
+    def page_number(self) -> int:
+        try:
+            return int(self.page_id.rsplit(":", 1)[1])
+        except (IndexError, ValueError) as exc:
+            raise ValueError(f"page_id {self.page_id!r} does not end with a numeric page number") from exc
