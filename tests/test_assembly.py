@@ -1,43 +1,41 @@
+from __future__ import annotations
+
 import unittest
 
-from paperscale.assembly import PageMarkdownArtifact, assemble_document_markdown
+from tests.harness.imports import require_symbol
 
 
-class AssemblyTests(unittest.TestCase):
-    def test_assembles_successful_pages_in_document_order(self) -> None:
-        markdown = assemble_document_markdown(
-            [
-                PageMarkdownArtifact(document_id="doc-1", page_number=2, markdown="Second page"),
-                PageMarkdownArtifact(document_id="doc-1", page_number=1, markdown="# Title"),
-            ],
-            title="Example",
-        )
+class MarkdownAssemblyTests(unittest.TestCase):
+    def test_page_ocr_artifact_survives_document_assembly_failure(self) -> None:
+        MarkdownAssembler = require_symbol("paperscale.assembly", "MarkdownAssembler")
+        PageArtifact = require_symbol("paperscale.contracts", "PageArtifact")
+        AssemblyError = require_symbol("paperscale.assembly", "AssemblyError")
+        artifact = PageArtifact(page_id="doc:1", markdown="# Page 1", result_pointer="artifacts/doc/1.md")
+        assembler = MarkdownAssembler(required_pages=[1, 2])
+        with self.assertRaises(AssemblyError):
+            assembler.assemble([artifact], allow_partial=False)
+        self.assertEqual(artifact.markdown, "# Page 1")
+        self.assertEqual(artifact.result_pointer, "artifacts/doc/1.md")
 
-        self.assertEqual(markdown, "# Example\n\n# Title\n\n<!-- page-break -->\n\nSecond page\n")
+    def test_partial_assembly_is_marked_and_cannot_masquerade_as_complete(self) -> None:
+        MarkdownAssembler = require_symbol("paperscale.assembly", "MarkdownAssembler")
+        PageArtifact = require_symbol("paperscale.contracts", "PageArtifact")
+        artifact = PageArtifact(page_id="doc:1", markdown="# Page 1", result_pointer="artifacts/doc/1.md")
+        result = MarkdownAssembler(required_pages=[1, 2]).assemble([artifact], allow_partial=True)
+        self.assertTrue(result.partial)
+        self.assertIn("PARTIAL", result.markdown)
+        self.assertEqual(result.missing_pages, [2])
 
-    def test_rejects_duplicate_or_cross_document_pages(self) -> None:
-        with self.assertRaisesRegex(ValueError, "duplicate page"):
-            assemble_document_markdown(
-                [
-                    PageMarkdownArtifact(document_id="doc-1", page_number=1, markdown="A"),
-                    PageMarkdownArtifact(document_id="doc-1", page_number=1, markdown="B"),
-                ]
-            )
-
-        with self.assertRaisesRegex(ValueError, "single document"):
-            assemble_document_markdown(
-                [
-                    PageMarkdownArtifact(document_id="doc-1", page_number=1, markdown="A"),
-                    PageMarkdownArtifact(document_id="doc-2", page_number=2, markdown="B"),
-                ]
-            )
-
-    def test_quality_gate_can_block_bad_fragments(self) -> None:
-        with self.assertRaisesRegex(ValueError, "quality check failed"):
-            assemble_document_markdown(
-                [PageMarkdownArtifact(document_id="doc-1", page_number=1, markdown="Noise " * 100)],
-                enforce_quality=True,
-            )
+    def test_pages_are_assembled_in_document_order(self) -> None:
+        MarkdownAssembler = require_symbol("paperscale.assembly", "MarkdownAssembler")
+        PageArtifact = require_symbol("paperscale.contracts", "PageArtifact")
+        artifacts = [
+            PageArtifact(page_id="doc:2", markdown="Page 2", result_pointer="artifacts/doc/2.md"),
+            PageArtifact(page_id="doc:1", markdown="Page 1", result_pointer="artifacts/doc/1.md"),
+        ]
+        result = MarkdownAssembler(required_pages=[1, 2]).assemble(artifacts)
+        self.assertLess(result.markdown.index("Page 1"), result.markdown.index("Page 2"))
+        self.assertFalse(result.partial)
 
 
 if __name__ == "__main__":
