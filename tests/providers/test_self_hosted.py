@@ -32,36 +32,66 @@ class FakeHttpClient:
 
 class SelfHostedProviderProfileTests(unittest.TestCase):
     def test_vllm_models_health_check_verifies_served_model(self) -> None:
-        SelfHostedOpenAICompatibleProvider = require_symbol(
-            "paperscale.providers.self_hosted", "SelfHostedOpenAICompatibleProvider"
-        )
-        InferenceServerProfile = require_symbol("paperscale.providers.self_hosted", "InferenceServerProfile")
-        profile = InferenceServerProfile(
+        server = InferenceServerProfile(
             endpoint="http://localhost:8000/v1",
-            health_check_path="/models",
-            served_model="zai-org/GLM-OCR",
-            auth_mode="none",
+            served_model="lightonai/LightOnOCR-2-1B",
+            health_path="/models",
+            timeout_seconds=3.0,
         )
-        client = FakeHttpClient(models=["zai-org/GLM-OCR"])
-        provider = SelfHostedOpenAICompatibleProvider(profile=profile, http_client=client)
-        self.assertTrue(provider.health_check().ok)
-        self.assertEqual(client.calls, ["/models"])
+        capacity = builtin_capacity_profile("local-vllm-small")
+        client = FakeHttpClient(
+            [FakeResponse(200, {"data": [{"id": "lightonai/LightOnOCR-2-1B"}]})]
+        )
 
-    def test_local_vllm_small_capacity_defaults_are_conservative(self) -> None:
-        builtin_capacity_profile = require_symbol("paperscale.providers.self_hosted", "builtin_capacity_profile")
-        profile = builtin_capacity_profile("local-vllm-small")
-        self.assertLessEqual(profile.max_in_flight_requests, 2)
-        self.assertLessEqual(profile.max_provider_side_queued_requests, 4)
-        self.assertLessEqual(profile.render_target_longest_side, 1280)
-        self.assertGreaterEqual(profile.timeout_seconds, 30)
+        provider = SelfHostedOpenAICompatibleProvider(server, capacity, http_client=client)
+        result = provider.health_check()
 
-    def test_overload_trips_circuit_breaker_without_growing_queue(self) -> None:
-        ProviderCircuitBreaker = require_symbol("paperscale.providers.self_hosted", "ProviderCircuitBreaker")
-        breaker = ProviderCircuitBreaker(queue_size=2, overload_threshold=3)
-        for _ in range(3):
-            breaker.record_overload(status_code=429)
-        self.assertTrue(breaker.is_open)
-        self.assertLessEqual(breaker.queued_requests, 2)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.served_model, "lightonai/LightOnOCR-2-1B")
+        self.assertEqual(client.calls, [("GET", "http://localhost:8000/v1/models", 3.0)])
+
+    def test_vllm_models_health_check_fails_for_wrong_model_without_network_retry(self) -> None:
+        server = InferenceServerProfile(
+            endpoint="http://localhost:8000/v1/",
+            served_model="deepseek-ai/DeepSeek-OCR-2",
+        )
+        client = FakeHttpClient([FakeResponse(200, {"data": [{"id": "other-model"}]})])
+
+        provider = SelfHostedOpenAICompatibleProvider(
+            server, builtin_capacity_profile("local-vllm-small"), http_client=client
+        )
+        result = provider.health_check()
+
+        self.assertFalse(result.ok)
+        self.assertIn("deepseek-ai/DeepSeek-OCR-2", result.diagnostic)
+        self.assertEqual(len(client.calls), 1)
+
+    def test_local_vllm_small_capacity_uses_conservative_defaults(self) -> None:
+        capacity = builtin_capacity_profile("local-vllm-small")
+
+        self.assertEqual(capacity.max_in_flight_requests, 2)
+        self.assertEqual(capacity.max_provider_queue, 4)
+        self.assertEqual(capacity.queue_size, 4)
+        self.assertGreaterEqual(capacity.timeout_seconds, 60.0)
+        self.assertLessEqual(capacity.render_target_longest_side, 1280)
+
+    def test_capacity_fingerprint_changes_when_constrained_hardware_tuning_changes(self) -> None:
+        base = builtin_capacity_profile("local-vllm-small")
+        tuned = ProviderCapacityProfile(
+            name=base.name,
+            max_in_flight_requests=base.max_in_flight_requests,
+            max_provider_queue=base.max_provider_queue + 1,
+            queue_size=base.queue_size,
+            timeout_seconds=base.timeout_seconds,
+            backoff_initial_seconds=base.backoff_initial_seconds,
+            backoff_max_seconds=base.backoff_max_seconds,
+            circuit_breaker_failure_threshold=base.circuit_breaker_failure_threshold,
+            circuit_breaker_cooldown_seconds=base.circuit_breaker_cooldown_seconds,
+            render_target_longest_side=base.render_target_longest_side,
+            image_format=base.image_format,
+        )
+
+        self.assertNotEqual(base.fingerprint(), tuned.fingerprint())
 
     def test_provider_overload_opens_circuit_without_growing_queue_beyond_capacity(self) -> None:
         capacity = ProviderCapacityProfile(

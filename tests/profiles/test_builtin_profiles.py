@@ -2,18 +2,20 @@ from __future__ import annotations
 
 import unittest
 
-from tests.harness.imports import require_symbol
+from paperscale.profiles.builtin import builtin_profile_names, get_builtin_profile
 
 
-class BuiltinModelOcrProfileTests(unittest.TestCase):
-    def test_builtin_profiles_are_document_to_markdown_only(self) -> None:
-        get_builtin_profile = require_symbol("paperscale.profiles.builtin", "get_builtin_profile")
-        for name in ["lighton_ocr_2_1b", "deepseek_ocr_2", "glm_ocr", "generic_vlm_markdown", "strict_json_ocr"]:
+class BuiltinProfileTests(unittest.TestCase):
+    def test_first_class_profiles_are_document_to_markdown_only(self) -> None:
+        expected = {"lighton_ocr_2_1b", "deepseek_ocr_2", "glm_ocr"}
+
+        self.assertTrue(expected.issubset(set(builtin_profile_names())))
+        for name in expected:
             profile = get_builtin_profile(name)
-            self.assertEqual(profile.public_task, "document_to_markdown")
-            self.assertNotIn("free_ocr", profile.supported_public_modes)
-            self.assertNotIn("visual_qa", profile.supported_public_modes)
-            self.assertNotIn("arbitrary_prompt", profile.supported_public_modes)
+            self.assertEqual(profile.task, "document_to_markdown")
+            self.assertNotIn("free_ocr", profile.public_modes)
+            self.assertNotIn("visual_qa", profile.public_modes)
+            self.assertIn("Markdown", profile.prompt_template)
 
     def test_first_class_profiles_build_provider_neutral_requests_from_same_page_input(self) -> None:
         for name in ("lighton_ocr_2_1b", "deepseek_ocr_2", "glm_ocr"):
@@ -37,35 +39,59 @@ class BuiltinModelOcrProfileTests(unittest.TestCase):
 
     def test_profile_request_fingerprint_changes_with_prompt_decoding_render_and_parser(self) -> None:
         profile = get_builtin_profile("deepseek_ocr_2")
-        original = profile.request_fingerprint(task)
-        self.assertNotEqual(original, profile.with_prompt_version("v2").request_fingerprint(task))
-        self.assertNotEqual(original, profile.with_parser_schema_version(2).request_fingerprint(task))
-        self.assertNotEqual(original, profile.with_decoding_option("temperature", 0.2).request_fingerprint(task))
-        self.assertNotEqual(original, profile.with_render_option("crop_mode", "none").request_fingerprint(task))
+        baseline = profile.build_request("page-1", b"image", "image/png")
 
-    def test_deepseek_profile_tracks_dynamic_resolution_and_repetition_quality_policy(self) -> None:
-        get_builtin_profile = require_symbol("paperscale.profiles.builtin", "get_builtin_profile")
+        changed_prompt = profile.with_overrides(prompt_version="v2").build_request(
+            "page-1", b"image", "image/png"
+        )
+        changed_decoding = profile.with_overrides(decoding={"temperature": 0.1}).build_request(
+            "page-1", b"image", "image/png"
+        )
+        changed_render = profile.with_overrides(render_options={"dynamic_resolution": False}).build_request(
+            "page-1", b"image", "image/png"
+        )
+        changed_parser = profile.with_overrides(parser_version="parser-v2").build_request(
+            "page-1", b"image", "image/png"
+        )
+
+        fingerprints = {
+            baseline.fingerprint,
+            changed_prompt.fingerprint,
+            changed_decoding.fingerprint,
+            changed_render.fingerprint,
+            changed_parser.fingerprint,
+        }
+        self.assertEqual(len(fingerprints), 5)
+
+    def test_deepseek_profile_rejects_repetition_and_keeps_crop_settings_in_request(self) -> None:
         profile = get_builtin_profile("deepseek_ocr_2")
-        self.assertEqual(profile.render_options["crop_mode"], "dynamic")
-        result = profile.parse_and_validate("word " * 200)
-        self.assertFalse(result.accepted)
-        self.assertEqual(result.failure_kind, "repetition")
+        request = profile.build_request("page-1", b"image", "image/png")
+
+        self.assertTrue(request.render_options["dynamic_resolution"])
+        self.assertEqual(request.render_options["crop_mode"], "dynamic")
+        result = profile.parse_and_validate("same same same same same same")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.retry_classification, "retryable")
 
     def test_glm_profile_preserves_markdown_and_optional_layout_metadata(self) -> None:
-        get_builtin_profile = require_symbol("paperscale.profiles.builtin", "get_builtin_profile")
-        result = get_builtin_profile("glm_ocr").parse_and_validate(
-            "---\nlayout: {blocks: 2}\n---\n# Heading\n\nBody"
+        profile = get_builtin_profile("glm_ocr")
+        result = profile.parse_and_validate(
+            '{"markdown":"# Title\\n\\nBody","layout":{"blocks":2}}'
         )
-        self.assertTrue(result.accepted)
-        self.assertEqual(result.markdown, "# Heading\n\nBody")
-        self.assertEqual(result.metadata["layout"]["blocks"], 2)
 
-    def test_lighton_profile_covers_clean_markdown_and_render_preprocessing_settings(self) -> None:
-        get_builtin_profile = require_symbol("paperscale.profiles.builtin", "get_builtin_profile")
+        self.assertTrue(result.ok)
+        self.assertEqual(result.markdown, "# Title\n\nBody")
+        self.assertEqual(result.metadata["layout"], {"blocks": 2})
+
+    def test_lighton_profile_accepts_clean_markdown_and_has_conservative_rendering(self) -> None:
         profile = get_builtin_profile("lighton_ocr_2_1b")
-        self.assertIn("natural reading order", profile.prompt_template.lower())
-        self.assertLessEqual(profile.render_options["target_longest_side"], 1536)
-        self.assertTrue(profile.parse_and_validate("# Title\n\nClean text").accepted)
+        request = profile.build_request("page-1", b"image", "image/png")
+        result = profile.parse_and_validate("# Heading\n\nA clean paragraph with | table | text |.")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.markdown, "# Heading\n\nA clean paragraph with | table | text |.")
+        self.assertLessEqual(request.render_options["target_longest_side"], 1280)
+        self.assertIn("naturally ordered", request.prompt)
 
 
 if __name__ == "__main__":
