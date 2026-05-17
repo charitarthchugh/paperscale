@@ -1,0 +1,24 @@
+[project]
+name = "paperscale"
+version = "0.1.0"
+description = "OCR at scale using VLMs"
+authors = [
+    {name = "charitarthchugh",email = "37895518+charitarthchugh@users.noreply.github.com"}
+]
+license = "MIT"
+requires-python = ">3.12"
+dependencies = [
+    "openai (>=2.37.0,<3.0.0)",
+    "pdf-oxide (>=0.3.49,<0.4.0)"
+]
+
+[dependency-groups]
+dev = [
+    "pyrefly (>=1.0.0,<2.0.0)",
+    "ruff (>=0.15.13,<0.16.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

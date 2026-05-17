@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.pyrefly/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+.venv/
+
+# Local/editor state
+.idea/
+.vscode/
+
+# OMX/OMC runtime state
+.omx/state/
+.omx/logs/
+.omx/team/
+.omx/worktrees/
+.omx/metrics.json
+.omx/hud-config.json
+.omx/setup-scope.json
+.omc/
+
+# OS
+.DS_Store
