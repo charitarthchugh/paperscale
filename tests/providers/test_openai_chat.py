@@ -47,6 +47,8 @@ class OpenAIChatProviderTests(unittest.TestCase):
         call = client.calls[0]
         self.assertEqual(call["model"], request.model)
         self.assertEqual(call["temperature"], request.decoding["temperature"])
+        self.assertEqual(call["max_output_tokens"], request.decoding["max_tokens"])
+        self.assertNotIn("max_tokens", call)
         self.assertIn("input", call)
 
     def test_base_request_fingerprint_includes_provider_model_profile_and_image_hash(self) -> None:

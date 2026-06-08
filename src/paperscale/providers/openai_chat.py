@@ -27,7 +27,7 @@ class OpenAIChatProvider:
                     ],
                 }
             ],
-            **request.decoding,
+            **_responses_decoding(request.decoding),
         }
         try:
             response = self._client.responses.create(**payload)
@@ -41,6 +41,13 @@ class OpenAIChatProvider:
             raw=response,
             metadata={"provider": self.name, "model": request.model},
         )
+
+
+def _responses_decoding(decoding: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(decoding)
+    if "max_tokens" in payload and "max_output_tokens" not in payload:
+        payload["max_output_tokens"] = payload.pop("max_tokens")
+    return payload
 
 
 def _data_url(media_type: str, image_bytes: bytes) -> str:
