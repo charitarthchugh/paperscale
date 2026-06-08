@@ -39,17 +39,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     assemble_parser.set_defaults(handler=_handle_assemble)
 
-    for name, description in {
-        "run": "run page OCR for a document-to-Markdown workload",
-        "status": "show compact-index workload status",
-        "resume": "resume pending work using compact indexes",
-        "reconcile": "surface ambiguous attempts and duplicate-call risk",
-        "fsck": "repair-only filesystem consistency check",
-        "repair-index": "repair-only compact index rebuild",
-    }.items():
-        command_parser = subparsers.add_parser(name, help=description, description=description)
-        command_parser.add_argument("job_id", nargs="?", help="workload identifier")
-        command_parser.set_defaults(handler=_handle_not_yet_integrated)
+    run_parser = subparsers.add_parser("run", help="run page OCR for a document-to-Markdown workload")
+    _add_runner_options(run_parser, include_job_id=True)
+    run_parser.add_argument("--input", required=True, type=Path, help="PDF input path")
+    run_parser.add_argument("--output", required=True, type=Path, help="Markdown output path")
+    run_parser.add_argument("--allow-partial", action="store_true", help="assemble succeeded pages even if some pages fail")
+    run_parser.set_defaults(handler=_handle_run)
+
+    status_parser = subparsers.add_parser("status", help="show compact-index workload status")
+    _add_state_job_options(status_parser)
+    status_parser.add_argument("--json", action="store_true", help="emit JSON")
+    status_parser.set_defaults(handler=_handle_status)
+
+    resume_parser = subparsers.add_parser("resume", help="resume pending work using compact indexes")
+    _add_state_job_options(resume_parser)
+    resume_parser.add_argument("--retry-ambiguous", action="store_true", help="retry ambiguous in-flight attempts")
+    resume_parser.add_argument("--allow-partial", action="store_true", help="assemble succeeded pages even if some pages fail")
+    resume_parser.set_defaults(handler=_handle_resume)
+
+    reconcile_parser = subparsers.add_parser("reconcile", help="surface ambiguous attempts and duplicate-call risk")
+    _add_state_job_options(reconcile_parser)
+    reconcile_parser.add_argument("--json", action="store_true", help="emit JSON")
+    reconcile_parser.set_defaults(handler=_handle_reconcile)
+
+    fsck_parser = subparsers.add_parser("fsck", help="scan-only filesystem consistency check")
+    _add_state_job_options(fsck_parser)
+    fsck_parser.set_defaults(handler=_handle_fsck)
+
+    repair_parser = subparsers.add_parser("repair-index", help="explicit scan path that rebuilds compact indexes")
+    _add_state_job_options(repair_parser)
+    repair_parser.set_defaults(handler=_handle_repair_index)
 
     doctor_parser = subparsers.add_parser("doctor", help="diagnose provider configuration")
     doctor_subparsers = doctor_parser.add_subparsers(dest="doctor_command", required=True)
@@ -58,10 +77,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="validate provider reachability and OCR profile compatibility",
         description="Validate provider reachability and OCR profile compatibility without starting OCR work.",
     )
+    provider_parser.add_argument("--base-url", required=True, help="OpenAI-compatible base URL; /v1 is appended when omitted")
+    provider_parser.add_argument("--model", required=True, help="served model id to validate")
+    provider_parser.add_argument("--capacity", default="local-vllm-small", help="capacity profile")
+    provider_parser.add_argument("--profile", default="generic_vlm_markdown", help="OCR profile")
     provider_parser.set_defaults(handler=_handle_provider_doctor)
 
     return parser
 
+
+def _add_runner_options(parser: argparse.ArgumentParser, *, include_job_id: bool) -> None:
+    if include_job_id:
+        parser.add_argument("--job-id", help="workload identifier")
+    parser.add_argument("--state-root", default=Path(".paperscale"), type=Path, help="state root directory")
+    parser.add_argument("--profile", default="generic_vlm_markdown", help="OCR profile")
+    parser.add_argument("--base-url", required=True, help="OpenAI-compatible base URL; /v1 is appended when omitted")
+    parser.add_argument("--model", help="served model id")
+    parser.add_argument("--capacity", default="local-vllm-small", help="capacity profile")
+
+
+def _add_state_job_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("job_id", help="workload identifier")
+    parser.add_argument("--state-root", default=Path(".paperscale"), type=Path, help="state root directory")
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
@@ -83,18 +120,84 @@ def _handle_assemble(args: argparse.Namespace) -> int:
     return 0
 
 
-def _handle_not_yet_integrated(args: argparse.Namespace) -> int:
-    command = args.command
-    raise SystemExit(
-        f"paperscale {command} is reserved for the document-to-Markdown OCR pipeline and awaits "
-        "state/ledger/provider integration; no provider call was started."
+def _runner_from_args(args: argparse.Namespace):
+    from paperscale.runner import DocumentOcrRunner, RunnerConfig
+
+    return DocumentOcrRunner(
+        RunnerConfig(
+            state_root=args.state_root,
+            profile=getattr(args, "profile", "generic_vlm_markdown"),
+            base_url=getattr(args, "base_url", ""),
+            model=getattr(args, "model", None),
+            capacity=getattr(args, "capacity", "local-vllm-small"),
+        )
     )
 
 
-def _handle_provider_doctor(args: argparse.Namespace) -> int:
-    del args
-    print("provider diagnostics are not yet integrated in this slice")
+def _handle_run(args: argparse.Namespace) -> int:
+    runner = _runner_from_args(args)
+    status = runner.run(input_path=args.input, output_path=args.output, job_id=args.job_id, allow_partial=args.allow_partial)
+    print(f"job {status.job_id}: succeeded={status.succeeded}/{status.pages_total} output={status.output_path}")
+    return 0 if status.complete or (args.allow_partial and status.succeeded > 0) else 1
+
+
+def _handle_status(args: argparse.Namespace) -> int:
+    from paperscale.runner import DocumentOcrRunner, RunnerConfig
+
+    status = DocumentOcrRunner(RunnerConfig(state_root=args.state_root)).status(args.job_id)
+    if args.json:
+        print(json.dumps(status.to_json_summary(), sort_keys=True))
+    else:
+        print(f"job {status.job_id}: succeeded={status.succeeded}/{status.pages_total} pending={status.pending} failed_retryable={status.failed_retryable} ambiguous={status.ambiguous}")
     return 0
+
+
+def _handle_resume(args: argparse.Namespace) -> int:
+    runner = _runner_from_args(args)
+    status = runner.resume(args.job_id, retry_ambiguous=args.retry_ambiguous, allow_partial=args.allow_partial)
+    print(f"job {status.job_id}: succeeded={status.succeeded}/{status.pages_total} output={status.output_path}")
+    return 0 if status.complete or (args.allow_partial and status.succeeded > 0) else 1
+
+
+def _handle_reconcile(args: argparse.Namespace) -> int:
+    from paperscale.runner import DocumentOcrRunner, RunnerConfig
+
+    payload = DocumentOcrRunner(RunnerConfig(state_root=args.state_root)).reconcile(args.job_id)
+    if args.json:
+        print(json.dumps(payload, sort_keys=True))
+    else:
+        ambiguous = payload.get("ambiguous_attempts", [])
+        print(format_ambiguous_attempts(count=len(ambiguous), page_sample=[str(item.get("page_number")) for item in ambiguous[:5]]))
+    return 0
+
+
+def _handle_fsck(args: argparse.Namespace) -> int:
+    from paperscale.runner import DocumentOcrRunner, RunnerConfig
+
+    payload = DocumentOcrRunner(RunnerConfig(state_root=args.state_root)).fsck(args.job_id)
+    print(json.dumps(payload, sort_keys=True))
+    return 0 if not payload.get("issues") else 1
+
+
+def _handle_repair_index(args: argparse.Namespace) -> int:
+    from paperscale.runner import DocumentOcrRunner, RunnerConfig
+
+    status = DocumentOcrRunner(RunnerConfig(state_root=args.state_root)).repair_index(args.job_id)
+    print(f"job {status.job_id}: rebuilt indexes succeeded={status.succeeded}/{status.pages_total}")
+    return 0
+
+
+def _handle_provider_doctor(args: argparse.Namespace) -> int:
+    from paperscale.runner import doctor_provider
+
+    payload = doctor_provider(base_url=args.base_url, model=args.model, capacity=args.capacity, profile=args.profile)
+    print(f"endpoint: {payload['endpoint']}")
+    print(f"observed_models: {', '.join(payload['observed_models']) or '<none>'}")
+    print(f"ocr_profile: {payload['ocr_profile']}")
+    print(f"capacity_profile: {payload['capacity_profile']}")
+    print(f"compatible: {str(payload['compatible']).lower()}")
+    print(f"diagnostic: {payload['diagnostic']}")
+    return 0 if payload["compatible"] else 1
 
 
 def _read_page_artifacts(path: Path) -> list[PageMarkdownArtifact]:
