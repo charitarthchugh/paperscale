@@ -137,8 +137,6 @@ def _has_repeated_ngram_loop(text: str) -> bool:
             continue
         ngrams = zip(*(tokens[offset:] for offset in range(ngram_size)), strict=False)
         counts = Counter(tuple(ngram) for ngram in ngrams)
-        if not counts:
-            continue
         _ngram, count = counts.most_common(1)[0]
         if count >= 12 and (count * ngram_size) / len(tokens) >= 0.35:
             return True
