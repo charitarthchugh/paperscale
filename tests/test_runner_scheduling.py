@@ -89,5 +89,43 @@ class GovernedOrderingTests(unittest.TestCase):
             )
 
 
+class RetryBackoffTests(unittest.TestCase):
+    def test_transient_provider_errors_are_retried_with_backoff_then_succeed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / ".paperscale"
+            sleeps: list[float] = []
+            provider = _ScriptedProvider(fail_first=2)
+            runner = _runner(state_root, provider, sleeper=sleeps.append, capacity="local-vllm-small")
+            status = runner.run(input_path=state_root / "in.pdf", output_path=state_root / "out.md", job_id="job")
+            self.assertEqual(status.succeeded, 1)
+            self.assertEqual(provider.calls, 3)          # 2 failures + 1 success
+            self.assertEqual(sleeps, [1.0, 2.0])         # exponential backoff from local-vllm-small
+
+
+class CircuitBreakerTests(unittest.TestCase):
+    def test_circuit_opens_after_threshold_and_leaves_remaining_pages_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / ".paperscale"
+            sleeps: list[float] = []
+            provider = _ScriptedProvider(always_fail=True)
+            runner = DocumentOcrRunner(
+                RunnerConfig(state_root=state_root, base_url="http://fake/v1", model="mock-vlm", capacity="local-vllm-small"),
+                provider=provider,
+                renderer_factory=lambda _path, _options: _FakeRenderer([b"page-1", b"page-2"]),
+                sleeper=sleeps.append,
+            )
+            status = runner.run(
+                input_path=state_root / "in.pdf",
+                output_path=state_root / "out.md",
+                job_id="job",
+                allow_partial=True,
+            )
+            self.assertEqual(provider.calls, 3)            # threshold=3 attempts on page 1 trips the breaker
+            self.assertEqual(status.succeeded, 0)
+            self.assertEqual(status.failed_retryable, 1)   # page 1 left failed_retryable
+            self.assertEqual(status.pending, 1)            # page 2 never started
+            self.assertEqual(len(sleeps), 2)               # 2 backoffs before the 3rd failure
+
+
 if __name__ == "__main__":
     unittest.main()
