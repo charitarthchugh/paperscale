@@ -90,11 +90,11 @@ _BUILTINS: dict[str, ModelOcrProfile] = {
         prompt_version="v1",
         parser_version="deepseek-markdown-parser-v1",
         output_format="structured_markdown",
-        prompt_template=(
-            "Convert document page {page_id} to Markdown using DeepSeek-OCR-2 "
-            "document parsing mode. Preserve document structure and avoid repeated "
-            "tokens. Return only Markdown; free OCR mode is not available."
-        ),
+        # DeepSeek-OCR-2 requires its native `<image>` placeholder + a short OCR
+        # instruction; a verbose instruction without it makes the model emit an empty
+        # completion on many pages. The plain "convert to markdown" form returns clean
+        # Markdown (the `<|grounding|>` variant adds bbox coordinate prefixes).
+        prompt_template="<image>\nConvert the document to markdown.",
         decoding={
             "temperature": 0.0,
             "top_p": 0.95,
