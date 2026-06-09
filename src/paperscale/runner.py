@@ -19,9 +19,11 @@ from paperscale.providers.base import PageOcrProvider
 from paperscale.providers.openai_chat import OpenAIChatProvider
 from paperscale.providers.self_hosted import (
     InferenceServerProfile,
+    ProviderCapacityProfile,
     SelfHostedOpenAICompatibleProvider,
     builtin_capacity_profile,
 )
+from paperscale.resources import ResourceGovernor, ResourceKind
 from paperscale.quality.verifier import DeterministicQualityVerifier
 from paperscale.rendering import PdfPageRenderer
 from paperscale.scheduler import CompactIndexError
@@ -29,6 +31,13 @@ from paperscale.state.fs_store import FileSystemStateStore
 
 Json = dict[str, Any]
 RendererFactory = Callable[[Path, dict[str, Any]], Any]
+
+
+@dataclass(frozen=True, slots=True)
+class _PageOutcome:
+    """Result of a single page attempt, used to drive retry/circuit decisions."""
+
+    status: str  # "succeeded" | "transport_error" | "content_failure"
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +158,8 @@ class DocumentOcrRunner:
         provider: PageOcrProvider | None = None,
         renderer_factory: RendererFactory | None = None,
         clock: Callable[[], float] | None = None,
+        governor: ResourceGovernor | None = None,
+        sleeper: Callable[[float], None] | None = None,
     ) -> None:
         self.config = config or RunnerConfig()
         self.state = FileSystemStateStore(Path(self.config.state_root))
@@ -156,6 +167,8 @@ class DocumentOcrRunner:
         self.renderer_factory = renderer_factory or (lambda path, options: PdfPageRenderer(path, render_options=options))
         self.clock = clock or time.time
         self.verifier = DeterministicQualityVerifier()
+        self.governor = governor or ResourceGovernor()
+        self._sleep = sleeper or time.sleep
 
     def run(
         self,
@@ -392,6 +405,12 @@ class DocumentOcrRunner:
                 pages[page_key] = {**old, "state": "failed_retryable", "artifact_path": None}
         return self._write_indexes(manifest, pages, partial=False)
 
+    def _capacity_for(self, manifest: JobManifest) -> ProviderCapacityProfile:
+        try:
+            return builtin_capacity_profile(manifest.capacity)
+        except ValueError:
+            return builtin_capacity_profile("local-vllm-small")
+
     def _process_pages(
         self,
         manifest: JobManifest,
@@ -580,7 +599,8 @@ class DocumentOcrRunner:
             self._write_indexes(manifest, pages, partial=False)
 
     def _write_manifest(self, manifest: JobManifest) -> None:
-        self.state.write_json_atomic(self._manifest_rel(manifest.job_id), manifest.to_json())
+        with self.governor.acquire(ResourceKind.STATE_STORE):
+            self.state.write_json_atomic(self._manifest_rel(manifest.job_id), manifest.to_json())
 
     def _read_manifest(self, job_id: str) -> JobManifest:
         payload = self.state.read_json(self._manifest_rel(job_id))
@@ -644,13 +664,15 @@ class DocumentOcrRunner:
                 if isinstance(entry, dict) and entry.get("state") == "ambiguous"
             ],
         }
-        self.state.write_json_atomic(self._index_rel(manifest.job_id, "status"), status_index)
-        self.state.write_json_atomic(self._index_rel(manifest.job_id, "resume"), resume_index)
-        self.state.write_json_atomic(self._index_rel(manifest.job_id, "reconcile"), reconcile_index)
+        with self.governor.acquire(ResourceKind.STATE_STORE):
+            self.state.write_json_atomic(self._index_rel(manifest.job_id, "status"), status_index)
+            self.state.write_json_atomic(self._index_rel(manifest.job_id, "resume"), resume_index)
+            self.state.write_json_atomic(self._index_rel(manifest.job_id, "reconcile"), reconcile_index)
         return JobStatus.from_index(status_index)
 
     def _write_ledger(self, job_id: str, attempt_id: str, payload: Json) -> None:
-        self.state.write_json_atomic(self._ledger_rel(job_id, attempt_id), payload)
+        with self.governor.acquire(ResourceKind.STATE_STORE):
+            self.state.write_json_atomic(self._ledger_rel(job_id, attempt_id), payload)
 
     def _job_dir(self, job_id: str) -> Path:
         return self.state.root / "jobs" / job_id
