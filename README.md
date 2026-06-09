@@ -9,6 +9,15 @@ pages.
 
 ## Install
 
+paperscale renders PDF pages with **poppler**, so the `pdftoppm` and `pdfinfo`
+binaries must be on your PATH:
+
+```bash
+sudo pacman -S poppler          # Arch
+sudo apt install poppler-utils  # Debian/Ubuntu
+brew install poppler            # macOS
+```
+
 paperscale is a Poetry project. Install the package and its console scripts:
 
 ```bash
