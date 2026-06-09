@@ -60,6 +60,13 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile_parser = subparsers.add_parser("reconcile", help="surface ambiguous attempts and duplicate-call risk")
     _add_state_job_options(reconcile_parser)
     reconcile_parser.add_argument("--json", action="store_true", help="emit JSON")
+    resolve_group = reconcile_parser.add_mutually_exclusive_group()
+    resolve_group.add_argument(
+        "--supersede", type=int, metavar="PAGE", help="mark the ambiguous attempt superseded and requeue the page as pending"
+    )
+    resolve_group.add_argument(
+        "--accept", type=int, metavar="PAGE", help="accept the page's existing artifact and mark it succeeded"
+    )
     reconcile_parser.set_defaults(handler=_handle_reconcile)
 
     fsck_parser = subparsers.add_parser("fsck", help="scan-only filesystem consistency check")
@@ -162,7 +169,16 @@ def _handle_resume(args: argparse.Namespace) -> int:
 def _handle_reconcile(args: argparse.Namespace) -> int:
     from paperscale.runner import DocumentOcrRunner, RunnerConfig
 
-    payload = DocumentOcrRunner(RunnerConfig(state_root=args.state_root)).reconcile(args.job_id)
+    runner = DocumentOcrRunner(RunnerConfig(state_root=args.state_root))
+    if args.supersede is not None:
+        status = runner.resolve_ambiguous(args.job_id, args.supersede, action="supersede")
+        print(f"job {status.job_id}: page {args.supersede} superseded; succeeded={status.succeeded}/{status.pages_total} pending={status.pending}")
+        return 0
+    if args.accept is not None:
+        status = runner.resolve_ambiguous(args.job_id, args.accept, action="accept")
+        print(f"job {status.job_id}: page {args.accept} accepted; succeeded={status.succeeded}/{status.pages_total}")
+        return 0
+    payload = runner.reconcile(args.job_id)
     if args.json:
         print(json.dumps(payload, sort_keys=True))
     else:
@@ -284,5 +300,7 @@ def format_ambiguous_attempts(*, count: int, page_sample: list[str]) -> str:
     return (
         f"{count} ambiguous OCR attempts require operator reconciliation. "
         f"Sample pages: {sample}. Retrying can create duplicate provider calls; "
-        "use --retry-ambiguous only after accepting that risk or confirming idempotency."
+        "use --retry-ambiguous only after accepting that risk or confirming idempotency. "
+        "Per page, resolve with `reconcile --supersede PAGE` (discard the uncertain attempt and requeue) "
+        "or `reconcile --accept PAGE` (keep the page's already-written artifact)."
     )

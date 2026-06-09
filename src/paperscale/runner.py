@@ -13,7 +13,7 @@ import uuid
 import urllib.request
 
 from paperscale.assembly import MarkdownAssembler
-from paperscale.contracts import CURRENT_SCHEMA_VERSION, PageArtifact
+from paperscale.contracts import CURRENT_SCHEMA_VERSION, PageArtifact, ensure_known_schema
 from paperscale.profiles.builtin import get_builtin_profile
 from paperscale.providers.base import PageOcrProvider
 from paperscale.providers.openai_chat import OpenAIChatProvider
@@ -210,22 +210,166 @@ class DocumentOcrRunner:
         return self._read_index(job_id, "reconcile")
 
     def fsck(self, job_id: str) -> Json:
+        """Scan-only ledger/index/artifact triangulation. Never mutates state."""
         manifest = self._read_manifest(job_id)
         status_index = self._read_index(job_id, "status")
-        issues: list[Json] = []
         pages = status_index.get("pages", {})
-        for page_text, page in pages.items():
-            if isinstance(page, dict) and page.get("state") == "succeeded":
-                artifact = self._artifact_rel(job_id, int(page_text))
-                if not (self.state.root / artifact).exists():
-                    issues.append({"code": "missing_artifact", "page_number": int(page_text), "path": str(artifact)})
-        artifact_dir = self._job_dir(job_id) / "artifacts" / "pages"
-        if artifact_dir.exists():
-            known = set(pages)
-            for artifact in artifact_dir.glob("*.json"):
-                if artifact.stem not in known:
-                    issues.append({"code": "orphan_artifact", "page_number": artifact.stem})
+        if not isinstance(pages, dict):
+            raise CompactIndexError(f"missing pages in status index for {job_id}")
+        ledger_by_page = self._ledger_attempts_by_page(job_id)
+        issues: list[Json] = []
+        for page_number in range(1, manifest.page_count + 1):
+            page = pages.get(str(page_number))
+            if not isinstance(page, dict):
+                issues.append({"code": "missing_page", "page_number": page_number})
+                continue
+            state = page.get("state")
+            if state == "succeeded":
+                issues.extend(self._fsck_succeeded_page(job_id, page_number, page, ledger_by_page))
+            elif state in {"reserved", "in_flight"}:
+                issues.append({
+                    "code": "stale_lease",
+                    "page_number": page_number,
+                    "state": state,
+                    "lease_expires_at": self._ledger_lease(job_id, page.get("attempt_id")),
+                })
+        issues.extend(self._fsck_orphan_artifacts(job_id, pages))
+        issues.extend(self._fsck_count_mismatches(manifest, status_index, pages))
         return {"job_id": job_id, "scanned": True, "pages_total": manifest.page_count, "issues": issues}
+
+    def _fsck_succeeded_page(self, job_id: str, page_number: int, page: Json, ledger_by_page: dict[int, list[Json]]) -> list[Json]:
+        found: list[Json] = []
+        artifact_rel = self._artifact_rel(job_id, page_number)
+        if not (self.state.root / artifact_rel).exists():
+            found.append({"code": "missing_artifact", "page_number": page_number, "path": str(artifact_rel)})
+        else:
+            artifact = self.state.read_json(artifact_rel)
+            ensure_known_schema(artifact)
+            indexed = page.get("fingerprint")
+            if indexed is not None and artifact.get("fingerprint") != indexed:
+                found.append({
+                    "code": "fingerprint_mismatch",
+                    "page_number": page_number,
+                    "indexed": indexed,
+                    "artifact": artifact.get("fingerprint"),
+                })
+        if not any(attempt.get("state") == "succeeded" for attempt in ledger_by_page.get(page_number, [])):
+            found.append({
+                "code": "ledger_mismatch",
+                "page_number": page_number,
+                "detail": "succeeded page has no terminal-succeeded ledger attempt",
+            })
+        return found
+
+    def _fsck_orphan_artifacts(self, job_id: str, pages: Json) -> list[Json]:
+        artifact_dir = self._job_dir(job_id) / "artifacts" / "pages"
+        if not artifact_dir.exists():
+            return []
+        known = set(pages)
+        return [
+            {"code": "orphan_artifact", "page_number": artifact.stem}
+            for artifact in sorted(artifact_dir.glob("*.json"))
+            if artifact.stem not in known
+        ]
+
+    def _fsck_count_mismatches(self, manifest: JobManifest, status_index: Json, pages: Json) -> list[Json]:
+        found: list[Json] = []
+        actual = _count_states(pages)
+        for field in ("succeeded", "failed_retryable", "failed_terminal", "ambiguous", "pending"):
+            indexed = int(status_index.get(field, 0))
+            if actual.get(field, 0) != indexed:
+                found.append({"code": "count_mismatch", "field": field, "indexed": indexed, "actual": actual.get(field, 0)})
+        if len(pages) != manifest.page_count:
+            found.append({"code": "count_mismatch", "field": "pages_total", "indexed": manifest.page_count, "actual": len(pages)})
+        return found
+
+    def _ledger_attempts_by_page(self, job_id: str) -> dict[int, list[Json]]:
+        result: dict[int, list[Json]] = {}
+        ledger_dir = self._job_dir(job_id) / "ledger"
+        if not ledger_dir.exists():
+            return result
+        for path in sorted(ledger_dir.glob("*.json")):
+            try:
+                record = self.state.read_json(self._ledger_rel(job_id, path.stem))
+            except (FileNotFoundError, json.JSONDecodeError):
+                continue
+            ensure_known_schema(record)
+            page_number = record.get("page_number")
+            if isinstance(page_number, int):
+                result.setdefault(page_number, []).append(record)
+        return result
+
+    def _ledger_lease(self, job_id: str, attempt_id: Any) -> float | None:
+        if not isinstance(attempt_id, str):
+            return None
+        try:
+            attempt = self.state.read_json(self._ledger_rel(job_id, attempt_id))
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+        ensure_known_schema(attempt)
+        lease = attempt.get("lease_expires_at")
+        return float(lease) if isinstance(lease, (int, float)) else None
+
+    def resolve_ambiguous(self, job_id: str, page_number: int, *, action: str) -> JobStatus:
+        """Operator action to resolve an ambiguous page by superseding its attempt.
+
+        ``supersede`` discards the uncertain attempt and requeues the page (pending);
+        ``accept`` adopts the page's already-written artifact and marks it succeeded.
+        Both record the prior attempt as ``superseded`` in the ledger.
+        """
+        if action not in {"supersede", "accept"}:
+            raise ValueError(f"unknown reconcile action {action!r}")
+        manifest = self._read_manifest(job_id)
+        pages = self._read_pages_from_status(job_id)
+        entry = pages.get(str(page_number))
+        if not isinstance(entry, dict):
+            raise ValueError(f"unknown page {page_number} for job {job_id!r}")
+        if entry.get("state") != "ambiguous":
+            raise ValueError(f"page {page_number} is not ambiguous (state={entry.get('state')!r})")
+        if action == "accept":
+            pages[str(page_number)] = self._accept_ambiguous_artifact(job_id, page_number, entry)
+        else:
+            pages[str(page_number)] = {
+                "state": "pending",
+                "epoch": int(entry.get("epoch") or 0),
+                "attempt_id": None,
+                "fingerprint": None,
+                "duplicate_call_risk": False,
+            }
+        self._supersede_attempt(job_id, page_number, entry, resolution="accepted" if action == "accept" else "discarded")
+        self._assemble_if_ready(manifest, pages, allow_partial=False)
+        return self._write_indexes(manifest, pages, partial=False)
+
+    def _accept_ambiguous_artifact(self, job_id: str, page_number: int, entry: Json) -> Json:
+        artifact_rel = self._artifact_rel(job_id, page_number)
+        if not (self.state.root / artifact_rel).exists():
+            raise FileNotFoundError(f"no artifact to accept for page {page_number} of job {job_id!r}")
+        artifact = self.state.read_json(artifact_rel)
+        ensure_known_schema(artifact)
+        return {
+            "state": "succeeded",
+            "artifact_path": str(artifact_rel),
+            "fingerprint": artifact.get("fingerprint"),
+            "epoch": int(entry.get("epoch") or 0),
+        }
+
+    def _supersede_attempt(self, job_id: str, page_number: int, entry: Json, *, resolution: str) -> None:
+        attempt_id = entry.get("attempt_id")
+        if not isinstance(attempt_id, str):
+            return
+        try:
+            attempt = self.state.read_json(self._ledger_rel(job_id, attempt_id))
+            ensure_known_schema(attempt)
+        except (FileNotFoundError, json.JSONDecodeError):
+            attempt = {
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "kind": "page_attempt",
+                "attempt_id": attempt_id,
+                "job_id": job_id,
+                "page_number": page_number,
+            }
+        superseded = {**attempt, "state": "superseded", "resolution": resolution, "resolved_at": float(self.clock())}
+        self._write_ledger(job_id, attempt_id, superseded)
 
     def repair_index(self, job_id: str) -> JobStatus:
         manifest = self._read_manifest(job_id)
@@ -237,6 +381,7 @@ class DocumentOcrRunner:
             artifact_path = self.state.root / self._artifact_rel(job_id, page_number)
             if artifact_path.exists():
                 artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+                ensure_known_schema(artifact)
                 pages[page_key] = {
                     **old,
                     "state": "succeeded",
@@ -390,6 +535,7 @@ class DocumentOcrRunner:
         artifacts: list[PageArtifact] = []
         for page_number in sorted(succeeded_pages):
             payload = self.state.read_json(self._artifact_rel(manifest.job_id, page_number))
+            ensure_known_schema(payload)
             artifacts.append(
                 PageArtifact(
                     page_id=str(payload["page_id"]),
@@ -417,6 +563,7 @@ class DocumentOcrRunner:
                 attempt = self.state.read_json(attempt_path)
             except FileNotFoundError:
                 continue
+            ensure_known_schema(attempt)
             if float(attempt.get("lease_expires_at", now + 1)) > now:
                 continue
             if attempt.get("state") == "reserved" and attempt.get("provider_started_at") is None:
@@ -436,7 +583,9 @@ class DocumentOcrRunner:
         self.state.write_json_atomic(self._manifest_rel(manifest.job_id), manifest.to_json())
 
     def _read_manifest(self, job_id: str) -> JobManifest:
-        return JobManifest.from_json(self.state.read_json(self._manifest_rel(job_id)))
+        payload = self.state.read_json(self._manifest_rel(job_id))
+        ensure_known_schema(payload)
+        return JobManifest.from_json(payload)
 
     def _read_index(self, job_id: str, name: str) -> Json:
         try:
@@ -445,6 +594,7 @@ class DocumentOcrRunner:
             raise CompactIndexError(f"missing or corrupt {name} index for {job_id}") from exc
         if not isinstance(payload, dict):
             raise CompactIndexError(f"missing or corrupt {name} index for {job_id}")
+        ensure_known_schema(payload)
         return payload
 
     def _read_pages_from_status(self, job_id: str) -> Json:
@@ -488,6 +638,7 @@ class DocumentOcrRunner:
                     "page_number": int(page),
                     "attempt_id": entry.get("attempt_id"),
                     "duplicate_call_risk": True,
+                    "recommended_actions": ["supersede", "accept"],
                 }
                 for page, entry in pages.items()
                 if isinstance(entry, dict) and entry.get("state") == "ambiguous"
