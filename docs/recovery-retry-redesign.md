@@ -9,8 +9,9 @@ and tests in `tests/test_recovery_retry_redesign.py`.
 
 Implementation extensions (to make every document complete, validated at 233/233
 pages over 30 scanned law PDFs against a real DeepSeek-OCR-2 server):
-- **Rendering uses PDFium** (`pypdfium2`), which rasterizes scanned ImageMask/CCITT
-  pages that the old `pdf_oxide` backend skipped (blank image → empty OCR).
+- **Rendering uses poppler** (`pdftoppm`/`pdfinfo`), which rasterizes scanned
+  ImageMask/CCITT pages that the old `pdf_oxide` backend skipped (blank image →
+  empty OCR). Requires the `poppler-utils` binaries on PATH.
 - **`empty_output` joins the render-remediation set** — an empty completion on a
   content page re-renders at higher DPI rather than re-rolling identically.
 - **Blank-page acceptance** — a near-blank render (`png_dark_fraction` below
