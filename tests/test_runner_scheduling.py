@@ -109,7 +109,12 @@ class CircuitBreakerTests(unittest.TestCase):
             sleeps: list[float] = []
             provider = _ScriptedProvider(always_fail=True)
             runner = DocumentOcrRunner(
-                RunnerConfig(state_root=state_root, base_url="http://fake/v1", model="mock-vlm", capacity="local-vllm-small"),
+                # Pin in-flight to 1 so the breaker test is deterministic/sequential:
+                # page 1 trips the circuit before page 2 is ever pulled.
+                RunnerConfig(
+                    state_root=state_root, base_url="http://fake/v1", model="mock-vlm",
+                    capacity="local-vllm-small", max_in_flight_requests=1,
+                ),
                 provider=provider,
                 renderer_factory=lambda _path, _options: _FakeRenderer([b"page-1", b"page-2"]),
                 sleeper=sleeps.append,

@@ -18,7 +18,23 @@ class FileSystemStateStore:
         self.root.mkdir(parents=True, exist_ok=True)
         self.debug_tree_scan_count = 0
 
-    def write_json_atomic(self, relative_path: str | Path, payload: dict[str, Any], *, crash_hook: Any | None = None) -> Path:
+    def write_json_atomic(
+        self,
+        relative_path: str | Path,
+        payload: dict[str, Any],
+        *,
+        crash_hook: Any | None = None,
+        fsync: bool = True,
+    ) -> Path:
+        """Atomically write JSON via temp-file + ``os.replace``.
+
+        ``fsync=True`` (default) durably persists the bytes and the rename — use it
+        for the *truth* (artifacts, ledger, claim/done markers). ``fsync=False`` is
+        atomic (no torn reads) but not durable — use it only for the derived,
+        rebuildable compact indexes, where losing the last write on power loss is
+        harmless because resume reconciles from the truth.
+        """
+
         target = self.root / relative_path
         target.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
@@ -27,11 +43,13 @@ class FileSystemStateStore:
                 json.dump(payload, file, sort_keys=True, separators=(",", ":"))
                 file.write("\n")
                 file.flush()
-                os.fsync(file.fileno())
+                if fsync:
+                    os.fsync(file.fileno())
             if crash_hook is not None:
                 crash_hook.checkpoint("after_temp_fsync_before_replace")
             os.replace(tmp, target)
-            self._fsync_dir(target.parent)
+            if fsync:
+                self._fsync_dir(target.parent)
         except BaseException:
             try:
                 os.unlink(tmp)

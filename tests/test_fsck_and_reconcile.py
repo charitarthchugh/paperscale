@@ -208,12 +208,40 @@ class ReconcileSupersedeTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 runner.resolve_ambiguous("job", 1, action="supersede")
 
-    def test_recovery_marks_inflight_ambiguous_with_recommended_actions(self) -> None:
+    def test_recovery_adopts_matching_artifact_without_provider_call(self) -> None:
+        # Adopt-then-requeue: a crashed in_flight page whose durable artifact exists
+        # and whose fingerprint matches the attempt is adopted as succeeded on resume,
+        # with zero provider calls (the default, non-metered behavior).
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / ".paperscale"
+            runner = _run_job(state_root, "job", pages=2)
+            job_dir = state_root / "jobs" / "job"
+            attempt_id = _make_page_inflight_expired(job_dir, 2)
+            # Keep the attempt fingerprint in sync with the surviving artifact so the
+            # adoption fingerprint-match holds.
+            artifact = json.loads((job_dir / "artifacts" / "pages" / "2.json").read_text(encoding="utf-8"))
+            attempt_path = job_dir / "ledger" / f"{attempt_id}.json"
+            attempt = json.loads(attempt_path.read_text(encoding="utf-8"))
+            attempt["fingerprint"] = artifact["fingerprint"]
+            attempt_path.write_text(json.dumps(attempt, sort_keys=True), encoding="utf-8")
+            # No provider responses left: any re-call would raise, proving none happens.
+            runner.provider = _OkProvider([])
+
+            status = runner.resume("job", allow_partial=True)
+
+            self.assertTrue(status.complete)
+            self.assertEqual(_read_status(job_dir)["pages"]["2"]["state"], "succeeded")
+            self.assertEqual(runner.reconcile("job")["ambiguous_attempts"], [])
+
+    def test_metered_recovery_marks_inflight_ambiguous_when_no_artifact(self) -> None:
+        # The ambiguous/reconcile machinery is retained but opt-in for metered endpoints.
         with tempfile.TemporaryDirectory() as tmp:
             state_root = Path(tmp) / ".paperscale"
             runner = _run_job(state_root, "job", pages=2)
             job_dir = state_root / "jobs" / "job"
             _make_page_inflight_expired(job_dir, 2)
+            (job_dir / "artifacts" / "pages" / "2.json").unlink()  # no adoptable artifact
+            runner.config = RunnerConfig(state_root=state_root, base_url="http://fake/v1", model="mock-vlm", metered=True)
 
             runner.resume("job", allow_partial=True)
             payload = runner.reconcile("job")

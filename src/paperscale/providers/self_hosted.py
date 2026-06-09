@@ -176,14 +176,58 @@ class BackoffDecision:
 class ProviderOverloadController:
     """Small deterministic retry/circuit helper for scheduler-visible provider pressure."""
 
-    def __init__(self, capacity: ProviderCapacityProfile) -> None:
+    def __init__(
+        self,
+        capacity: ProviderCapacityProfile,
+        *,
+        floor: int | None = None,
+        ceiling: int | None = None,
+        decrease_factor: float = 0.5,
+        additive_step: int = 1,
+        success_threshold: int = 3,
+    ) -> None:
         self.capacity = capacity
         self._consecutive_failures = 0
         self._queued_requests = 0
+        # AIMD adaptive concurrency: float between floor (~server max_num_seqs) and
+        # ceiling (~4x max_num_seqs == client max_in_flight). Start fed at ceiling;
+        # AIMD's job is snap-back on overload, not ramp-up.
+        self._ceiling = int(ceiling if ceiling is not None else capacity.max_in_flight_requests)
+        self._floor = int(floor if floor is not None else max(1, self._ceiling // 4))
+        self._floor = max(1, min(self._floor, self._ceiling))
+        self._decrease_factor = decrease_factor
+        self._additive_step = max(1, additive_step)
+        self._success_threshold = max(1, success_threshold)
+        self._concurrency = self._ceiling
+        self._consecutive_successes = 0
 
     @property
     def queued_requests(self) -> int:
         return self._queued_requests
+
+    @property
+    def concurrency_limit(self) -> int:
+        """Current AIMD-governed in-flight target; resizes the runner's semaphore."""
+        return self._concurrency
+
+    def _shrink(self) -> None:
+        self._concurrency = max(self._floor, int(self._concurrency * self._decrease_factor))
+        self._consecutive_successes = 0
+
+    def _grow_on_success(self) -> None:
+        self._consecutive_successes += 1
+        if self._consecutive_successes >= self._success_threshold:
+            self._consecutive_successes = 0
+            self._concurrency = min(self._ceiling, self._concurrency + self._additive_step)
+
+    def note_content_failure(self) -> None:
+        """Record a content/parse/verify rejection.
+
+        Signal hygiene: a content ``400`` or a mojibake/repetition rejection is NOT
+        an overload signal, so it must never shrink concurrency or trip the circuit
+        (else a mojibake-heavy run self-throttles against a healthy server).
+        """
+        return None
 
     @property
     def circuit_open(self) -> bool:
@@ -201,11 +245,13 @@ class ProviderOverloadController:
 
     def record_success(self) -> BackoffDecision:
         self._consecutive_failures = 0
+        self._grow_on_success()
         return BackoffDecision(False, 0.0, False, "success")
 
     def record_status(self, status_code: int) -> BackoffDecision:
         if status_code in (429, 500, 502, 503, 504):
             self._consecutive_failures += 1
+            self._shrink()
             backoff = min(
                 self.capacity.backoff_initial_seconds * (2 ** (self._consecutive_failures - 1)),
                 self.capacity.backoff_max_seconds,
@@ -229,6 +275,7 @@ class ProviderOverloadController:
             self._consecutive_failures = 0
             return BackoffDecision(False, 0.0, False, "non-retryable provider error")
         self._consecutive_failures += 1
+        self._shrink()
         backoff = min(
             self.capacity.backoff_initial_seconds * (2 ** (self._consecutive_failures - 1)),
             self.capacity.backoff_max_seconds,

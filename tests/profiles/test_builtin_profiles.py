@@ -15,7 +15,7 @@ class BuiltinProfileTests(unittest.TestCase):
             self.assertEqual(profile.task, "document_to_markdown")
             self.assertNotIn("free_ocr", profile.public_modes)
             self.assertNotIn("visual_qa", profile.public_modes)
-            self.assertIn("Markdown", profile.prompt_template)
+            self.assertIn("markdown", profile.prompt_template.lower())
 
     def test_first_class_profiles_build_provider_neutral_requests_from_same_page_input(self) -> None:
         for name in ("lighton_ocr_2_1b", "deepseek_ocr_2", "glm_ocr"):

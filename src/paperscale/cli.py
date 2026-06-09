@@ -46,6 +46,12 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--allow-partial", action="store_true", help="assemble succeeded pages even if some pages fail")
     run_parser.set_defaults(handler=_handle_run)
 
+    enqueue_parser = subparsers.add_parser("enqueue", help="register a job for later `work` processing (does not run it)")
+    _add_runner_options(enqueue_parser, include_job_id=True)
+    enqueue_parser.add_argument("--input", required=True, type=Path, help="PDF input path")
+    enqueue_parser.add_argument("--output", required=True, type=Path, help="Markdown output path")
+    enqueue_parser.set_defaults(handler=_handle_enqueue)
+
     status_parser = subparsers.add_parser("status", help="show compact-index workload status")
     _add_state_job_options(status_parser)
     status_parser.add_argument("--json", action="store_true", help="emit JSON")
@@ -53,9 +59,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     resume_parser = subparsers.add_parser("resume", help="resume pending work using compact indexes")
     _add_state_job_options(resume_parser)
+    _add_recovery_concurrency_options(resume_parser)
     resume_parser.add_argument("--retry-ambiguous", action="store_true", help="retry ambiguous in-flight attempts")
     resume_parser.add_argument("--allow-partial", action="store_true", help="assemble succeeded pages even if some pages fail")
     resume_parser.set_defaults(handler=_handle_resume)
+
+    work_parser = subparsers.add_parser(
+        "work", help="claim and run available incomplete jobs (single machine, multi-process)"
+    )
+    work_parser.add_argument("--state-root", default=Path(".paperscale"), type=Path, help="state root directory")
+    work_parser.add_argument("--worker-id", default="local", help="worker identity stamped on claims/attempts")
+    work_parser.add_argument("--max-jobs", type=int, default=None, help="stop after claiming this many jobs")
+    _add_recovery_concurrency_options(work_parser)
+    work_parser.set_defaults(handler=_handle_work)
 
     reconcile_parser = subparsers.add_parser("reconcile", help="surface ambiguous attempts and duplicate-call risk")
     _add_state_job_options(reconcile_parser)
@@ -101,6 +117,23 @@ def _add_runner_options(parser: argparse.ArgumentParser, *, include_job_id: bool
     parser.add_argument("--base-url", required=True, help="OpenAI-compatible base URL; /v1 is appended when omitted")
     parser.add_argument("--model", help="served model id")
     parser.add_argument("--capacity", default="local-vllm-small", help="capacity profile")
+    _add_recovery_concurrency_options(parser)
+
+
+def _add_recovery_concurrency_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--metered",
+        action="store_true",
+        help="treat the provider as billable/non-idempotent: escalate crashed in-flight pages to ambiguous (not auto-requeue). NOT persisted; pass it on every invocation.",
+    )
+    parser.add_argument("--max-attempts", type=int, default=8, help="hard per-page retry cap before terminal demotion")
+    parser.add_argument(
+        "--server-max-num-seqs", type=int, default=128,
+        help="server's --max-num-seqs; max_in_flight defaults to 4x this",
+    )
+    parser.add_argument("--max-in-flight-requests", type=int, default=None, help="process-wide cap on requests sent to the server")
+    parser.add_argument("--max-open-documents", type=int, default=128, help="cap on concurrently open PDF handles")
+    parser.add_argument("--render-ahead", type=int, default=None, help="bounded decoded-image prefetch (pages)")
 
 
 def _add_state_job_options(parser: argparse.ArgumentParser) -> None:
@@ -137,15 +170,58 @@ def _runner_from_args(args: argparse.Namespace):
             base_url=getattr(args, "base_url", ""),
             model=getattr(args, "model", None),
             capacity=getattr(args, "capacity", "local-vllm-small"),
+            worker_id=getattr(args, "worker_id", "local"),
+            metered=bool(getattr(args, "metered", False)),
+            max_attempts=int(getattr(args, "max_attempts", 8)),
+            server_max_num_seqs=int(getattr(args, "server_max_num_seqs", 128)),
+            max_in_flight_requests=getattr(args, "max_in_flight_requests", None),
+            max_open_documents=int(getattr(args, "max_open_documents", 128)),
+            render_ahead=getattr(args, "render_ahead", None),
         )
     )
+
+
+def _print_run_status(status) -> int:
+    """Print a status line and pick the exit code, distinguishing settled-with-failures."""
+    print(f"job {status.job_id}: succeeded={status.succeeded}/{status.pages_total} output={status.output_path}")
+    if status.complete:
+        return 0
+    if status.settled and status.has_terminal_failures:
+        # Reporting-only: resume cannot progress. Make the message actionable.
+        print(
+            f"job {status.job_id}: settled with {status.failed_terminal} terminal failure(s); "
+            f"resume will not progress — pass --allow-partial to assemble "
+            f"{status.succeeded}/{status.pages_total}, or re-source the failed page(s)."
+        )
+        return 2
+    if status.succeeded > 0 and status.partial:
+        return 0
+    return 1
 
 
 def _handle_run(args: argparse.Namespace) -> int:
     runner = _runner_from_args(args)
     status = runner.run(input_path=args.input, output_path=args.output, job_id=args.job_id, allow_partial=args.allow_partial)
-    print(f"job {status.job_id}: succeeded={status.succeeded}/{status.pages_total} output={status.output_path}")
-    return 0 if status.complete or (args.allow_partial and status.succeeded > 0) else 1
+    return _print_run_status(status)
+
+
+def _handle_enqueue(args: argparse.Namespace) -> int:
+    runner = _runner_from_args(args)
+    job_id = runner.enqueue(input_path=args.input, output_path=args.output, job_id=args.job_id)
+    print(f"enqueued job {job_id}")
+    return 0
+
+
+def _handle_work(args: argparse.Namespace) -> int:
+    runner = _runner_from_args(args)
+    statuses = runner.work(max_jobs=getattr(args, "max_jobs", None))
+    if not statuses:
+        print("no claimable jobs")
+        return 0
+    for status in statuses:
+        state = "complete" if status.complete else ("settled" if status.settled else "in-progress")
+        print(f"job {status.job_id}: {state} succeeded={status.succeeded}/{status.pages_total}")
+    return 0 if all(s.complete for s in statuses) else 1
 
 
 def _handle_status(args: argparse.Namespace) -> int:
@@ -162,8 +238,7 @@ def _handle_status(args: argparse.Namespace) -> int:
 def _handle_resume(args: argparse.Namespace) -> int:
     runner = _runner_from_args(args)
     status = runner.resume(args.job_id, retry_ambiguous=args.retry_ambiguous, allow_partial=args.allow_partial)
-    print(f"job {status.job_id}: succeeded={status.succeeded}/{status.pages_total} output={status.output_path}")
-    return 0 if status.complete or (args.allow_partial and status.succeeded > 0) else 1
+    return _print_run_status(status)
 
 
 def _handle_reconcile(args: argparse.Namespace) -> int:
