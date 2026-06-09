@@ -20,6 +20,7 @@ from paperscale.providers.openai_chat import OpenAIChatProvider
 from paperscale.providers.self_hosted import (
     InferenceServerProfile,
     ProviderCapacityProfile,
+    ProviderOverloadController,
     SelfHostedOpenAICompatibleProvider,
     builtin_capacity_profile,
 )
@@ -421,7 +422,11 @@ class DocumentOcrRunner:
         retry_ambiguous: bool,
     ) -> JobStatus:
         profile = get_builtin_profile(manifest.profile)
+        capacity = self._capacity_for(manifest)
+        overload = ProviderOverloadController(capacity)
         for page_number in range(1, manifest.page_count + 1):
+            if overload.circuit_open:
+                break
             page = pages[str(page_number)]
             state = page.get("state")
             if state == "succeeded":
@@ -430,14 +435,25 @@ class DocumentOcrRunner:
                 continue
             if state not in {"pending", "failed_retryable", "reserved", "ambiguous"}:
                 continue
-            rendered = renderer.render_page(page_number)
-            request = profile.build_request(
-                f"{manifest.document_id}:{page_number}",
-                rendered.image_bytes,
-                getattr(rendered, "media_type", "image/png"),
-                model=manifest.model,
-            )
-            self._process_page(manifest, pages, page_number, request)
+            with self.governor.acquire(ResourceKind.SCHEDULER):
+                with self.governor.acquire(ResourceKind.RENDER):
+                    rendered = renderer.render_page(page_number)
+                request = profile.build_request(
+                    f"{manifest.document_id}:{page_number}",
+                    rendered.image_bytes,
+                    getattr(rendered, "media_type", "image/png"),
+                    model=manifest.model,
+                )
+                while True:
+                    outcome = self._process_page(manifest, pages, page_number, request)
+                    if outcome.status != "transport_error":
+                        if outcome.status == "succeeded":
+                            overload.record_success()
+                        break
+                    decision = overload.record_failure(retryable=True)
+                    if not decision.should_retry:
+                        break
+                    self._sleep(decision.backoff_seconds)
         self._assemble_if_ready(manifest, pages, allow_partial=allow_partial)
         return self._write_indexes(manifest, pages, partial=allow_partial and _count_states(pages).get("succeeded", 0) < manifest.page_count)
 
@@ -447,97 +463,101 @@ class DocumentOcrRunner:
             return self.provider
         return _default_provider(manifest.base_url)
 
-    def _process_page(self, manifest: JobManifest, pages: Json, page_number: int, request: Any) -> None:
+    def _process_page(self, manifest: JobManifest, pages: Json, page_number: int, request: Any) -> _PageOutcome:
         page_key = str(page_number)
         previous = pages[page_key]
         epoch = int(previous.get("epoch") or 0) + 1
         attempt_id = str(uuid.uuid4())
         now = float(self.clock())
-        attempt = {
-            "schema_version": CURRENT_SCHEMA_VERSION,
-            "kind": "page_attempt",
-            "attempt_id": attempt_id,
-            "job_id": manifest.job_id,
-            "page_id": request.page_id,
-            "page_number": page_number,
-            "state": "reserved",
-            "fingerprint": request.fingerprint,
-            "worker_id": self.config.worker_id,
-            "epoch": epoch,
-            "lease_expires_at": now + self.config.lease_seconds,
-            "heartbeat_at": now,
-            "provider_started_at": None,
-            "provider_response_committed_at": None,
-            "result_pointer": None,
-            "diagnostic": None,
-        }
-        self._write_ledger(manifest.job_id, attempt_id, attempt)
-        pages[page_key] = {
-            "state": "reserved",
-            "epoch": epoch,
-            "attempt_id": attempt_id,
-            "fingerprint": request.fingerprint,
-        }
-        self._write_indexes(manifest, pages, partial=False)
+        with self.governor.acquire(ResourceKind.PROVIDER):
+            with self.governor.acquire(ResourceKind.PAGE_LEASE):
+                attempt = {
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "kind": "page_attempt",
+                    "attempt_id": attempt_id,
+                    "job_id": manifest.job_id,
+                    "page_id": request.page_id,
+                    "page_number": page_number,
+                    "state": "reserved",
+                    "fingerprint": request.fingerprint,
+                    "worker_id": self.config.worker_id,
+                    "epoch": epoch,
+                    "lease_expires_at": now + self.config.lease_seconds,
+                    "heartbeat_at": now,
+                    "provider_started_at": None,
+                    "provider_response_committed_at": None,
+                    "result_pointer": None,
+                    "diagnostic": None,
+                }
+                self._write_ledger(manifest.job_id, attempt_id, attempt)
+                pages[page_key] = {
+                    "state": "reserved",
+                    "epoch": epoch,
+                    "attempt_id": attempt_id,
+                    "fingerprint": request.fingerprint,
+                }
+                self._write_indexes(manifest, pages, partial=False)
 
-        attempt = {**attempt, "state": "in_flight", "provider_started_at": float(self.clock())}
-        self._write_ledger(manifest.job_id, attempt_id, attempt)
-        pages[page_key] = {**pages[page_key], "state": "in_flight"}
-        self._write_indexes(manifest, pages, partial=False)
+                attempt = {**attempt, "state": "in_flight", "provider_started_at": float(self.clock())}
+                self._write_ledger(manifest.job_id, attempt_id, attempt)
+                pages[page_key] = {**pages[page_key], "state": "in_flight"}
+                self._write_indexes(manifest, pages, partial=False)
 
-        try:
-            response = self._provider_for(manifest).send(request)
-        except Exception as exc:
-            self._fail_attempt(manifest, pages, page_number, attempt, state="failed_retryable", diagnostic=str(exc))
-            return
+                try:
+                    response = self._provider_for(manifest).send(request)
+                except Exception as exc:
+                    self._fail_attempt(manifest, pages, page_number, attempt, state="failed_retryable", diagnostic=str(exc))
+                    return _PageOutcome("transport_error")
 
-        parsed = get_builtin_profile(manifest.profile).parse_and_validate(response.markdown)
-        if not parsed.ok:
-            state = "failed_terminal" if parsed.retry_classification == "terminal" else "failed_retryable"
-            self._fail_attempt(manifest, pages, page_number, attempt, state=state, diagnostic=parsed.diagnostic)
-            return
-        finding = self.verifier.classify(parsed.markdown)
-        if not finding.accepted:
-            state = "failed_terminal" if finding.retry_class == "terminal" else "failed_retryable"
-            self._fail_attempt(manifest, pages, page_number, attempt, state=state, diagnostic=finding.kind)
-            return
+                parsed = get_builtin_profile(manifest.profile).parse_and_validate(response.markdown)
+                if not parsed.ok:
+                    state = "failed_terminal" if parsed.retry_classification == "terminal" else "failed_retryable"
+                    self._fail_attempt(manifest, pages, page_number, attempt, state=state, diagnostic=parsed.diagnostic)
+                    return _PageOutcome("content_failure")
+                finding = self.verifier.classify(parsed.markdown)
+                if not finding.accepted:
+                    state = "failed_terminal" if finding.retry_class == "terminal" else "failed_retryable"
+                    self._fail_attempt(manifest, pages, page_number, attempt, state=state, diagnostic=finding.kind)
+                    return _PageOutcome("content_failure")
 
-        artifact_rel = self._artifact_rel(manifest.job_id, page_number)
-        artifact = {
-            "schema_version": CURRENT_SCHEMA_VERSION,
-            "kind": "page_artifact",
-            "document_id": manifest.document_id,
-            "page_number": page_number,
-            "page_id": request.page_id,
-            "markdown": parsed.markdown,
-            "result_pointer": str(artifact_rel),
-            "verifier_metadata": [finding.__dict__ if hasattr(finding, "__dict__") else {
-                "accepted": finding.accepted,
-                "kind": finding.kind,
-                "retry_class": finding.retry_class,
-                "warnings": list(finding.warnings),
-            }],
-            "fingerprint": request.fingerprint,
-            "image_hash": request.image_hash,
-            "provider_request_id": response.provider_request_id,
-            "provider_metadata": response.metadata,
-            "profile_metadata": parsed.metadata,
-        }
-        self.state.write_json_atomic(artifact_rel, artifact)
-        committed = {
-            **attempt,
-            "state": "succeeded",
-            "provider_response_committed_at": float(self.clock()),
-            "result_pointer": str(artifact_rel),
-        }
-        self._write_ledger(manifest.job_id, attempt_id, committed)
-        pages[page_key] = {
-            **pages[page_key],
-            "state": "succeeded",
-            "artifact_path": str(artifact_rel),
-            "fingerprint": request.fingerprint,
-        }
-        self._write_indexes(manifest, pages, partial=False)
+                artifact_rel = self._artifact_rel(manifest.job_id, page_number)
+                artifact = {
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "kind": "page_artifact",
+                    "document_id": manifest.document_id,
+                    "page_number": page_number,
+                    "page_id": request.page_id,
+                    "markdown": parsed.markdown,
+                    "result_pointer": str(artifact_rel),
+                    "verifier_metadata": [finding.__dict__ if hasattr(finding, "__dict__") else {
+                        "accepted": finding.accepted,
+                        "kind": finding.kind,
+                        "retry_class": finding.retry_class,
+                        "warnings": list(finding.warnings),
+                    }],
+                    "fingerprint": request.fingerprint,
+                    "image_hash": request.image_hash,
+                    "provider_request_id": response.provider_request_id,
+                    "provider_metadata": response.metadata,
+                    "profile_metadata": parsed.metadata,
+                }
+                with self.governor.acquire(ResourceKind.STATE_STORE):
+                    self.state.write_json_atomic(artifact_rel, artifact)
+                committed = {
+                    **attempt,
+                    "state": "succeeded",
+                    "provider_response_committed_at": float(self.clock()),
+                    "result_pointer": str(artifact_rel),
+                }
+                self._write_ledger(manifest.job_id, attempt_id, committed)
+                pages[page_key] = {
+                    **pages[page_key],
+                    "state": "succeeded",
+                    "artifact_path": str(artifact_rel),
+                    "fingerprint": request.fingerprint,
+                }
+                self._write_indexes(manifest, pages, partial=False)
+                return _PageOutcome("succeeded")
 
     def _fail_attempt(self, manifest: JobManifest, pages: Json, page_number: int, attempt: Json, *, state: str, diagnostic: str) -> None:
         failed = {**attempt, "state": state, "diagnostic": diagnostic}
