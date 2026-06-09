@@ -363,6 +363,40 @@ class DocumentOcrRunner:
         manifest, _pages, _renderer = self._create_job(input_path=input_path, output_path=output_path, job_id=job_id)
         return manifest.job_id
 
+    def enqueue_many(
+        self, inputs: list[Path], *, output_dir: Path
+    ) -> tuple[list[str], list[tuple[Path, str]]]:
+        """Enqueue one job per input PDF; outputs land in ``output_dir`` as ``<id>.md``.
+
+        Job ids derive from each file's stem, de-duplicated across the batch and any
+        existing jobs. Returns ``(enqueued_job_ids, skipped)`` where ``skipped`` pairs
+        each unreadable/duplicate-failing path with its reason — a single bad PDF never
+        aborts the batch.
+        """
+        output_dir = Path(output_dir)
+        enqueued: list[str] = []
+        skipped: list[tuple[Path, str]] = []
+        used: set[str] = set()
+        for input_path in inputs:
+            job_id = self._unique_job_id(input_path, used)
+            try:
+                self.enqueue(input_path=input_path, output_path=output_dir / f"{job_id}.md", job_id=job_id)
+            except Exception as exc:  # noqa: BLE001 - skip unreadable PDFs, keep going
+                skipped.append((input_path, str(exc)))
+                continue
+            used.add(job_id)
+            enqueued.append(job_id)
+        return enqueued, skipped
+
+    def _unique_job_id(self, input_path: Path, used: set[str]) -> str:
+        base = input_path.stem or "job"
+        candidate = base
+        suffix = 1
+        while candidate in used or self._job_dir(candidate).exists():
+            candidate = f"{base}-{suffix}"
+            suffix += 1
+        return candidate
+
     def run(
         self,
         *,

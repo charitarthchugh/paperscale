@@ -41,15 +41,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser("run", help="run page OCR for a document-to-Markdown workload")
     _add_runner_options(run_parser, include_job_id=True)
-    run_parser.add_argument("--input", required=True, type=Path, help="PDF input path")
-    run_parser.add_argument("--output", required=True, type=Path, help="Markdown output path")
+    _add_input_options(run_parser)
     run_parser.add_argument("--allow-partial", action="store_true", help="assemble succeeded pages even if some pages fail")
     run_parser.set_defaults(handler=_handle_run)
 
-    enqueue_parser = subparsers.add_parser("enqueue", help="register a job for later `work` processing (does not run it)")
+    enqueue_parser = subparsers.add_parser("enqueue", help="register job(s) for later `work` processing (does not run them)")
     _add_runner_options(enqueue_parser, include_job_id=True)
-    enqueue_parser.add_argument("--input", required=True, type=Path, help="PDF input path")
-    enqueue_parser.add_argument("--output", required=True, type=Path, help="Markdown output path")
+    _add_input_options(enqueue_parser)
     enqueue_parser.set_defaults(handler=_handle_enqueue)
 
     status_parser = subparsers.add_parser("status", help="show compact-index workload status")
@@ -118,6 +116,40 @@ def _add_runner_options(parser: argparse.ArgumentParser, *, include_job_id: bool
     parser.add_argument("--model", help="served model id")
     parser.add_argument("--capacity", default="local-vllm-small", help="capacity profile")
     _add_recovery_concurrency_options(parser)
+
+
+def _add_input_options(parser: argparse.ArgumentParser) -> None:
+    """Single-document (--input/--output) or batch (--input-list/--output-dir) inputs.
+
+    --input-list points at a text file with one document path per line ('-' reads
+    stdin); blank lines and '#' comments are ignored. Validation that exactly one
+    mode is supplied happens in the handler so the error message is actionable.
+    """
+    parser.add_argument("--input", type=Path, help="PDF input path (single document)")
+    parser.add_argument("--output", type=Path, help="Markdown output path (single document)")
+    parser.add_argument(
+        "--input-list",
+        type=str,
+        metavar="FILE",
+        help="text file with one document path per line ('-' for stdin); one job per line",
+    )
+    parser.add_argument("--output-dir", type=Path, help="directory for batch Markdown outputs (<job-id>.md)")
+
+
+def _read_path_list(source: str) -> list[Path]:
+    import sys
+
+    if source == "-":
+        text = sys.stdin.read()
+    else:
+        text = Path(source).read_text(encoding="utf-8")
+    paths: list[Path] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        paths.append(Path(stripped))
+    return paths
 
 
 def _add_recovery_concurrency_options(parser: argparse.ArgumentParser) -> None:
@@ -199,14 +231,49 @@ def _print_run_status(status) -> int:
     return 1
 
 
+def _validate_input_mode(args: argparse.Namespace) -> str:
+    """Return 'single' or 'batch'; exit with a clear message if the mode is ambiguous."""
+    single = args.input is not None or args.output is not None
+    batch = args.input_list is not None
+    if batch and single:
+        raise SystemExit("error: use either --input/--output or --input-list/--output-dir, not both")
+    if batch:
+        if args.output_dir is None:
+            raise SystemExit("error: --input-list requires --output-dir")
+        return "batch"
+    if args.input is not None and args.output is not None:
+        return "single"
+    raise SystemExit("error: provide --input and --output, or --input-list and --output-dir")
+
+
+def _enqueue_batch(runner, args: argparse.Namespace) -> tuple[list[str], list[tuple]]:
+    inputs = _read_path_list(args.input_list)
+    enqueued, skipped = runner.enqueue_many(inputs, output_dir=args.output_dir)
+    for path, reason in skipped:
+        print(f"skipped {path}: {reason}")
+    print(f"enqueued {len(enqueued)} job(s)" + (f", skipped {len(skipped)}" if skipped else ""))
+    return enqueued, skipped
+
+
 def _handle_run(args: argparse.Namespace) -> int:
     runner = _runner_from_args(args)
+    if _validate_input_mode(args) == "batch":
+        enqueued, _skipped = _enqueue_batch(runner, args)
+        if not enqueued:
+            return 1
+        statuses = runner.work()
+        for status in statuses:
+            _print_run_status(status)
+        return 0 if all(s.complete for s in statuses) else 1
     status = runner.run(input_path=args.input, output_path=args.output, job_id=args.job_id, allow_partial=args.allow_partial)
     return _print_run_status(status)
 
 
 def _handle_enqueue(args: argparse.Namespace) -> int:
     runner = _runner_from_args(args)
+    if _validate_input_mode(args) == "batch":
+        enqueued, _skipped = _enqueue_batch(runner, args)
+        return 0 if enqueued else 1
     job_id = runner.enqueue(input_path=args.input, output_path=args.output, job_id=args.job_id)
     print(f"enqueued job {job_id}")
     return 0
