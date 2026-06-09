@@ -29,4 +29,24 @@ writes belong in the state-store implementation.
 
 Ambiguous work should be surfaced with page IDs and duplicate-call risk. The
 ledger intentionally raises `AmbiguousAttemptError` by default to prevent silent
-provider replays against non-idempotent endpoints.
+provider replays against non-idempotent endpoints. Operators resolve ambiguous
+pages with `reconcile --supersede PAGE` (discard the uncertain attempt, requeue)
+or `reconcile --accept PAGE` (adopt the page's already-written artifact); both
+record the prior attempt as `superseded`.
+
+## Resource governance and capacity
+
+The real `DocumentOcrRunner` processes pages sequentially under a
+`ResourceGovernor`, which enforces the global acquisition order
+`scheduler -> render -> provider -> page_lease -> state_store`. Persistence is
+governed at `state_store_lock` granularity; the state store owns its own
+transient file descriptors.
+
+Provider pressure is controlled by the capacity profile resolved from
+`manifest.capacity` (`builtin_capacity_profile`). Transient provider transport
+errors are retried with exponential backoff (`backoff_initial_seconds` doubling
+up to `backoff_max_seconds`). After `circuit_breaker_failure_threshold`
+consecutive failures the circuit opens: the run stops and any pages not yet
+started stay `pending`, so a later `paperscale resume` continues the work.
+Content failures (parse/verify rejections) are classified by the profile and are
+not retried within a single run.
