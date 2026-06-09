@@ -123,5 +123,53 @@ class SelfHostedProviderProfileTests(unittest.TestCase):
         self.assertEqual(controller.queued_requests, 2)
 
 
+def _capacity(threshold: int = 3, *, initial: float = 1.0, maximum: float = 8.0):
+    from paperscale.providers.self_hosted import ProviderCapacityProfile
+
+    return ProviderCapacityProfile(
+        name="test",
+        max_in_flight_requests=1,
+        max_provider_queue=1,
+        queue_size=1,
+        timeout_seconds=1.0,
+        backoff_initial_seconds=initial,
+        backoff_max_seconds=maximum,
+        circuit_breaker_failure_threshold=threshold,
+        circuit_breaker_cooldown_seconds=1.0,
+        render_target_longest_side=10,
+    )
+
+
+class RecordFailureTests(unittest.TestCase):
+    def test_retryable_failures_open_circuit_after_threshold(self) -> None:
+        from paperscale.providers.self_hosted import ProviderOverloadController
+
+        controller = ProviderOverloadController(_capacity(threshold=3))
+        first = controller.record_failure(retryable=True)
+        second = controller.record_failure(retryable=True)
+        third = controller.record_failure(retryable=True)
+        self.assertTrue(first.should_retry)
+        self.assertFalse(first.circuit_open)
+        self.assertTrue(second.should_retry)
+        self.assertTrue(third.circuit_open)
+        self.assertFalse(third.should_retry)
+
+    def test_backoff_grows_exponentially_then_caps(self) -> None:
+        from paperscale.providers.self_hosted import ProviderOverloadController
+
+        controller = ProviderOverloadController(_capacity(threshold=10, initial=1.0, maximum=8.0))
+        backoffs = [controller.record_failure(retryable=True).backoff_seconds for _ in range(5)]
+        self.assertEqual(backoffs, [1.0, 2.0, 4.0, 8.0, 8.0])
+
+    def test_non_retryable_failure_resets_consecutive_count(self) -> None:
+        from paperscale.providers.self_hosted import ProviderOverloadController
+
+        controller = ProviderOverloadController(_capacity(threshold=2))
+        controller.record_failure(retryable=True)
+        decision = controller.record_failure(retryable=False)
+        self.assertFalse(decision.should_retry)
+        self.assertFalse(controller.circuit_open)
+
+
 if __name__ == "__main__":
     unittest.main()

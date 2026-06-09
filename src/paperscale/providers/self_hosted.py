@@ -219,6 +219,27 @@ class ProviderOverloadController:
         self._consecutive_failures = 0
         return BackoffDecision(False, 0.0, False, f"non-retryable HTTP {status_code}")
 
+    def record_failure(self, *, retryable: bool) -> BackoffDecision:
+        """Account for a provider transport failure surfaced as an exception.
+
+        Transport-agnostic counterpart to record_status: callers that only see
+        exceptions (no HTTP status) use this to drive backoff and the circuit breaker.
+        """
+        if not retryable:
+            self._consecutive_failures = 0
+            return BackoffDecision(False, 0.0, False, "non-retryable provider error")
+        self._consecutive_failures += 1
+        backoff = min(
+            self.capacity.backoff_initial_seconds * (2 ** (self._consecutive_failures - 1)),
+            self.capacity.backoff_max_seconds,
+        )
+        return BackoffDecision(
+            should_retry=not self.circuit_open,
+            backoff_seconds=backoff,
+            circuit_open=self.circuit_open,
+            diagnostic="provider transport error",
+        )
+
 
 class HttpClient(Protocol):
     def get(self, url: str, *, timeout: float) -> Any: ...
