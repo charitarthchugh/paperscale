@@ -43,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_runner_options(run_parser, include_job_id=True)
     _add_input_options(run_parser)
     run_parser.add_argument("--allow-partial", action="store_true", help="assemble succeeded pages even if some pages fail")
+    _add_quiet_option(run_parser)
     run_parser.set_defaults(handler=_handle_run)
 
     enqueue_parser = subparsers.add_parser("enqueue", help="register job(s) for later `work` processing (does not run them)")
@@ -60,6 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_recovery_concurrency_options(resume_parser)
     resume_parser.add_argument("--retry-ambiguous", action="store_true", help="retry ambiguous in-flight attempts")
     resume_parser.add_argument("--allow-partial", action="store_true", help="assemble succeeded pages even if some pages fail")
+    _add_quiet_option(resume_parser)
     resume_parser.set_defaults(handler=_handle_resume)
 
     work_parser = subparsers.add_parser(
@@ -69,6 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
     work_parser.add_argument("--worker-id", default="local", help="worker identity stamped on claims/attempts")
     work_parser.add_argument("--max-jobs", type=int, default=None, help="stop after claiming this many jobs")
     _add_recovery_concurrency_options(work_parser)
+    _add_quiet_option(work_parser)
     work_parser.set_defaults(handler=_handle_work)
 
     reconcile_parser = subparsers.add_parser("reconcile", help="surface ambiguous attempts and duplicate-call risk")
@@ -136,6 +139,14 @@ def _add_input_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output-dir", type=Path, help="directory for batch Markdown outputs (<job-id>.md)")
 
 
+def _add_quiet_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="suppress progress/throughput logging (errors still shown); logging is on by default",
+    )
+
+
 def _read_path_list(source: str) -> list[Path]:
     import sys
 
@@ -173,8 +184,11 @@ def _add_state_job_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--state-root", default=Path(".paperscale"), type=Path, help="state root directory")
 
 def main(argv: Sequence[str] | None = None) -> int:
+    from paperscale.observability import configure_logging
+
     parser = build_parser()
     args = parser.parse_args(argv)
+    configure_logging(quiet=bool(getattr(args, "quiet", False)))
     handler = args.handler
     return int(handler(args))
 
@@ -280,10 +294,12 @@ def _handle_enqueue(args: argparse.Namespace) -> int:
 
 
 def _handle_work(args: argparse.Namespace) -> int:
+    from paperscale.observability import get_logger
+
     runner = _runner_from_args(args)
     statuses = runner.work(max_jobs=getattr(args, "max_jobs", None))
     if not statuses:
-        print("no claimable jobs")
+        get_logger().info("no claimable jobs")
         return 0
     for status in statuses:
         state = "complete" if status.complete else ("settled" if status.settled else "in-progress")

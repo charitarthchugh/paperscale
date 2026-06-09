@@ -53,11 +53,17 @@ class AsyncOpenAIChatProvider:
             raise ProviderError(f"OpenAI-compatible chat request failed: {exc}") from exc
 
         markdown = _extract_chat_text(response)
+        input_tokens, output_tokens = _usage(response)
         return PageOcrResponse(
             markdown=markdown,
             provider_request_id=_response_id(response, request.fingerprint),
             raw=response,
-            metadata={"provider": self.name, "model": request.model},
+            metadata={
+                "provider": self.name,
+                "model": request.model,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+            },
         )
 
 
@@ -123,6 +129,21 @@ def _extract_chat_text(response: object) -> str:
     if content is None:
         return ""  # empty completion -> empty_output content failure, not transport error
     raise ProviderError("provider response chat content was not text")
+
+
+def _usage(response: object) -> tuple[int, int]:
+    """Extract (input_tokens, output_tokens) from a chat response; 0 when absent."""
+    usage = getattr(response, "usage", None)
+    if usage is None and isinstance(response, dict):
+        usage = response.get("usage")
+    if usage is None:
+        return 0, 0
+    prompt = getattr(usage, "prompt_tokens", None)
+    completion = getattr(usage, "completion_tokens", None)
+    if prompt is None and isinstance(usage, dict):
+        prompt = usage.get("prompt_tokens")
+        completion = usage.get("completion_tokens")
+    return int(prompt or 0), int(completion or 0)
 
 
 def _response_id(response: object, fallback: str) -> str:

@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import dataclass
 import inspect
 import json
+import logging
 import os
 from pathlib import Path
 import tempfile
@@ -16,6 +17,7 @@ import urllib.request
 
 from paperscale.async_pool import AdaptiveLimiter
 from paperscale.assembly import MarkdownAssembler
+from paperscale.observability import MetricsKeeper, format_duration, get_logger
 from paperscale.contracts import CURRENT_SCHEMA_VERSION, PageArtifact, ensure_known_schema
 from paperscale.profiles.builtin import get_builtin_profile
 from paperscale.providers.base import PageOcrProvider
@@ -50,6 +52,26 @@ _BLANK_INK_THRESHOLD = 0.01
 # noise), so the page is accepted as blank rather than failed.
 _BLANK_ELIGIBLE_DIAGNOSTICS = frozenset({"empty_output", "repeated_ngram", "repeated_character"})
 
+# How often the progress reporter logs an olmOCR-style throughput line.
+_PROGRESS_INTERVAL_SECONDS = 10.0
+_REMAINING_STATES = frozenset({"pending", "failed_retryable", "reserved", "in_flight"})
+
+
+def _remaining_pages(pages: Json) -> int:
+    return sum(
+        1 for entry in pages.values()
+        if isinstance(entry, dict) and entry.get("state") in _REMAINING_STATES
+    )
+
+
+def _human_count(value: float) -> str:
+    number = int(value)
+    if number < 1000:
+        return str(number)
+    if number < 1_000_000:
+        return f"{number / 1000:.1f}k"
+    return f"{number / 1_000_000:.2f}M"
+
 
 def _render_is_blank(image_bytes: bytes) -> bool:
     try:
@@ -82,6 +104,7 @@ class _RunContext:
     manifest: "JobManifest"
     pages: dict[str, Any]
     retry_ambiguous: bool
+    metrics: MetricsKeeper
 
 
 _WRITER_CLOSE = object()
@@ -784,6 +807,7 @@ class DocumentOcrRunner:
 
         writer = _IndexWriter(self, manifest, pages, partial=allow_partial)
         writer_task = asyncio.create_task(writer.run())
+        metrics = MetricsKeeper()
         ctx = _RunContext(
             profile=profile,
             provider=provider,
@@ -795,10 +819,21 @@ class DocumentOcrRunner:
             manifest=manifest,
             pages=pages,
             retry_ambiguous=retry_ambiguous,
+            metrics=metrics,
         )
         worker_count = max(1, min(ceiling, self.config.render_ahead_limit, queue.qsize() or 1))
+        logger = get_logger()
+        to_process = queue.qsize()
+        logger.info(
+            "job %s: starting %d page(s), %d worker(s), in-flight cap %d",
+            manifest.job_id, to_process, worker_count, ceiling,
+        )
         heartbeat_task = (
             asyncio.create_task(self._heartbeat_loop(heartbeat)) if heartbeat is not None else None
+        )
+        # Periodic olmOCR-style progress reporter (suppressed when logging is quiet).
+        reporter_task = (
+            asyncio.create_task(self._report_progress(ctx)) if logger.isEnabledFor(logging.INFO) else None
         )
         try:
             workers = [
@@ -807,6 +842,8 @@ class DocumentOcrRunner:
             ]
             await asyncio.gather(*workers)
         finally:
+            if reporter_task is not None:
+                reporter_task.cancel()
             if heartbeat_task is not None:
                 heartbeat_task.cancel()
             await writer.close()
@@ -815,7 +852,57 @@ class DocumentOcrRunner:
 
         self._assemble_if_ready(manifest, pages, allow_partial=allow_partial)
         partial = allow_partial and _count_states(pages).get("succeeded", 0) < manifest.page_count
-        return self._write_indexes(manifest, pages, partial=partial)
+        status = self._write_indexes(manifest, pages, partial=partial)
+        self._log_final_summary(manifest, metrics)
+        return status
+
+    async def _report_progress(self, ctx: "_RunContext") -> None:
+        logger = get_logger()
+        try:
+            while True:
+                await asyncio.sleep(_PROGRESS_INTERVAL_SECONDS)
+                logger.info(self._progress_line(ctx))
+        except asyncio.CancelledError:
+            return
+
+    def _progress_line(self, ctx: "_RunContext") -> str:
+        metrics = ctx.metrics
+        total = ctx.manifest.page_count
+        done = int(metrics.get("pages_completed"))
+        failed = int(metrics.get("pages_failed"))
+        remaining = _remaining_pages(ctx.pages)
+        processed = done + failed
+        err_pct = (failed / processed * 100.0) if processed else 0.0
+        window_pg = metrics.window_rate("pages_completed")
+        window_label = f"{int(metrics.window_seconds // 60)}m"
+        eta = format_duration(remaining / window_pg) if window_pg > 0 else "?"
+        return (
+            f"job {ctx.manifest.job_id}: pages {done}/{total} · "
+            f"{metrics.cumulative_rate('pages_completed'):.2f} pg/s "
+            f"({window_pg:.2f} pg/s {window_label}) · "
+            f"tok_in {_human_count(metrics.get('input_tokens'))} "
+            f"({metrics.window_rate('input_tokens'):.0f}/s) "
+            f"tok_out {_human_count(metrics.get('output_tokens'))} "
+            f"({metrics.window_rate('output_tokens'):.0f}/s) · "
+            f"failed {failed} ({err_pct:.1f}%) · remaining {remaining} · "
+            f"in-flight {ctx.limiter.in_use}/{ctx.limiter.limit} · "
+            f"elapsed {format_duration(metrics.elapsed())} · eta ~{eta}"
+        )
+
+    def _log_final_summary(self, manifest: JobManifest, metrics: MetricsKeeper) -> None:
+        logger = get_logger()
+        if not logger.isEnabledFor(logging.INFO):
+            return
+        elapsed = metrics.elapsed()
+        done = int(metrics.get("pages_completed"))
+        failed = int(metrics.get("pages_failed"))
+        logger.info(
+            "job %s: done — %d/%d pages succeeded, %d failed, %d blank · "
+            "tok_in %s tok_out %s · %s at %.2f pg/s avg",
+            manifest.job_id, done, manifest.page_count, failed, int(metrics.get("pages_blank")),
+            _human_count(metrics.get("input_tokens")), _human_count(metrics.get("output_tokens")),
+            format_duration(elapsed), metrics.cumulative_rate("pages_completed"),
+        )
 
     async def _heartbeat_loop(self, heartbeat: Callable[[], None]) -> None:
         try:
@@ -1012,6 +1099,8 @@ class DocumentOcrRunner:
         await ctx.writer.publish(
             page_number, {**reserved_entry, "state": state, "diagnostic": diagnostic}, notable=terminal
         )
+        if terminal:
+            ctx.metrics.add(pages_failed=1)
         return _AttemptResult("terminal" if terminal else "content_retryable", diagnostic, not terminal, 0.0)
 
     async def _commit_success(
@@ -1066,6 +1155,12 @@ class DocumentOcrRunner:
             {**reserved_entry, "state": "succeeded", "artifact_path": str(artifact_rel)},
             notable=False,
         )
+        meta = getattr(response, "metadata", None) or {}
+        ctx.metrics.add(
+            pages_completed=1,
+            input_tokens=int(meta.get("input_tokens", 0) or 0),
+            output_tokens=int(meta.get("output_tokens", 0) or 0),
+        )
 
     async def _maybe_commit_blank(
         self,
@@ -1098,6 +1193,7 @@ class DocumentOcrRunner:
         await self._commit_success(
             ctx, governor, page_number, attempt_id, attempt, reserved_entry, request, response, parsed, finding
         )
+        ctx.metrics.add(pages_blank=1)
         ctx.overload.record_success()
         await ctx.limiter.set_limit(ctx.overload.concurrency_limit)
         return _AttemptResult("succeeded", "blank_page", False, 0.0)
@@ -1107,6 +1203,7 @@ class DocumentOcrRunner:
         entry = dict(ctx.pages[str(page_number)])
         entry.update({"state": "failed_terminal", "diagnostic": diagnostic, "overrides": accumulated})
         await ctx.writer.publish(page_number, entry, notable=True)
+        ctx.metrics.add(pages_failed=1)
 
     async def _awrite_ledger(self, governor: ResourceGovernor, job_id: str, attempt_id: str, payload: Json) -> None:
         with governor.acquire(ResourceKind.STATE_STORE):
