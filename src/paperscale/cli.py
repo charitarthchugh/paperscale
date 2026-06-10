@@ -51,6 +51,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_input_options(enqueue_parser)
     enqueue_parser.set_defaults(handler=_handle_enqueue)
 
+    plan_parser = subparsers.add_parser(
+        "plan",
+        help="plan a batch into one immutable candidate manifest for lazy `work` materialization",
+    )
+    _add_runner_options(plan_parser, include_job_id=False)
+    _add_input_options(plan_parser)
+    plan_parser.set_defaults(handler=_handle_plan)
+
     status_parser = subparsers.add_parser("status", help="show compact-index workload status")
     _add_state_job_options(status_parser)
     status_parser.add_argument("--json", action="store_true", help="emit JSON")
@@ -70,6 +78,11 @@ def build_parser() -> argparse.ArgumentParser:
     work_parser.add_argument("--state-root", default=Path(".paperscale"), type=Path, help="state root directory")
     work_parser.add_argument("--worker-id", default="local", help="worker identity stamped on claims/attempts")
     work_parser.add_argument("--max-jobs", type=int, default=None, help="stop after claiming this many jobs")
+    work_parser.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="clear failed markers and re-attempt failed candidates",
+    )
     _add_recovery_concurrency_options(work_parser)
     _add_quiet_option(work_parser)
     work_parser.set_defaults(handler=_handle_work)
@@ -297,7 +310,10 @@ def _handle_work(args: argparse.Namespace) -> int:
     from paperscale.observability import get_logger
 
     runner = _runner_from_args(args)
-    statuses = runner.work(max_jobs=getattr(args, "max_jobs", None))
+    statuses = runner.work(
+        max_jobs=getattr(args, "max_jobs", None),
+        retry_failed=bool(getattr(args, "retry_failed", False)),
+    )
     if not statuses:
         get_logger().info("no claimable jobs")
         return 0
@@ -305,6 +321,25 @@ def _handle_work(args: argparse.Namespace) -> int:
         state = "complete" if status.complete else ("settled" if status.settled else "in-progress")
         print(f"job {status.job_id}: {state} succeeded={status.succeeded}/{status.pages_total}")
     return 0 if all(s.complete for s in statuses) else 1
+
+
+def _handle_plan(args: argparse.Namespace) -> int:
+    from paperscale.candidates import plan_candidates, read_candidates
+
+    if args.input_list is None or args.output_dir is None:
+        raise SystemExit("error: plan requires --input-list and --output-dir")
+    inputs = _read_path_list(args.input_list)
+    target = plan_candidates(
+        inputs,
+        output_dir=args.output_dir,
+        state_root=args.state_root,
+        profile=args.profile,
+        model=args.model,
+        base_url=args.base_url,
+        capacity=args.capacity,
+    )
+    print(f"planned {len(read_candidates(target))} candidate(s) into {target}")
+    return 0
 
 
 def _handle_status(args: argparse.Namespace) -> int:
