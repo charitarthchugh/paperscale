@@ -1,9 +1,12 @@
 """Tests for pure pipeline helpers (no server, no rendering)."""
 
+import errno
 import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 from paperscale import pipeline
 from paperscale.pipeline import PageResult
@@ -111,6 +114,47 @@ class WipeWorkspaceTests(unittest.TestCase):
             pipeline._wipe_workspace_progress(ws)
             for sub in ("results", "done_flags", "worker_locks"):
                 self.assertFalse((Path(ws) / sub).exists())
+
+
+class FdExhaustionBackoffTests(unittest.IsolatedAsyncioTestCase):
+    """Out-of-fd (EMFILE/ENFILE) is a soft drop: retried, never a counted failure."""
+
+    async def test_fd_exhaustion_is_dropped_then_succeeds(self):
+        good = _page(1, "ok")
+        calls = {"n": 0}
+
+        async def fake_try(args, pdf, page, attempt, image, blank):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise OSError(errno.EMFILE, "Too many open files")
+            return good
+
+        with (
+            mock.patch.object(pipeline, "try_single_page", fake_try),
+            mock.patch.object(pipeline.asyncio, "sleep", new=mock.AsyncMock()) as sleep,
+        ):
+            result = await pipeline.try_single_page_with_backoff(
+                SimpleNamespace(), "doc.pdf", 1, attempt=0, image_base64="x", render_is_blank=False
+            )
+
+        # The page recovers without ever returning a failure (None) to the caller,
+        # so process_page's per-page retry budget is untouched.
+        self.assertIs(result, good)
+        self.assertEqual(calls["n"], 3)  # two soft drops + one success
+        self.assertEqual(sleep.await_count, 2)
+
+    async def test_non_fd_connection_error_aborts_after_max_backoff(self):
+        async def always_refused(*args, **kwargs):
+            raise ConnectionError("connection refused")
+
+        with (
+            mock.patch.object(pipeline, "try_single_page", always_refused),
+            mock.patch.object(pipeline.asyncio, "sleep", new=mock.AsyncMock()),
+        ):
+            with self.assertRaises(SystemExit):
+                await pipeline.try_single_page_with_backoff(
+                    SimpleNamespace(), "doc.pdf", 1, attempt=0, image_base64="x", render_is_blank=False
+                )
 
 
 if __name__ == "__main__":
