@@ -29,6 +29,7 @@ import asyncio
 import atexit
 import base64
 import datetime
+import errno
 import glob
 import hashlib
 import json
@@ -255,22 +256,47 @@ async def try_single_page_with_backoff(
     image_base64: str,
     render_is_blank: bool,
 ) -> PageResult | None:
-    """Wrapper around try_single_page that handles connection errors with exponential backoff."""
-    MAX_BACKOFF_ATTEMPTS = 10
+    """Wrapper around try_single_page that retries transient send-side errors.
 
-    for backoff_count in range(MAX_BACKOFF_ATTEMPTS):
+    File-descriptor exhaustion on the sending machine (EMFILE/ENFILE) is a soft
+    drop: the request is backed off and retried indefinitely (capped delay)
+    rather than counted as a failure, so it never consumes one of the page's
+    retries and never aborts the job. It self-resolves as in-flight requests
+    release their sockets. Other connection errors use a bounded exponential
+    backoff and abort the job only if they never recover.
+    """
+    MAX_BACKOFF_ATTEMPTS = 10
+    FD_MAX_BACKOFF_SECONDS = 30
+
+    conn_backoff = 0
+    fd_backoff = 0
+    while True:
         try:
             return await try_single_page(args, pdf_orig_path, page_num, attempt, image_base64, render_is_blank)
-        except (ConnectionError, OSError, asyncio.TimeoutError) as e:
-            sleep_delay = 10 * (2**backoff_count)
+        except OSError as e:
+            if e.errno in (errno.EMFILE, errno.ENFILE):
+                # Out of file descriptors on this machine: drop the request for now
+                # without failing it (does not consume a page retry).
+                sleep_delay = min(2**fd_backoff, FD_MAX_BACKOFF_SECONDS)
+                fd_backoff += 1
+                metrics.add_metrics(fd_exhaustion_drops=1)
+                logger.warning(
+                    f"Out of file descriptors sending {pdf_orig_path}-{page_num} (errno {e.errno}); "
+                    f"dropping request without failing it, retrying in {sleep_delay}s"
+                )
+                await asyncio.sleep(sleep_delay)
+                continue
+
+            conn_backoff += 1
+            if conn_backoff > MAX_BACKOFF_ATTEMPTS:
+                logger.error(f"Max backoff attempts reached for {pdf_orig_path}-{page_num}, terminating job")
+                sys.exit(1)
+            sleep_delay = 10 * (2 ** (conn_backoff - 1))
             logger.warning(
                 f"Connection error on {pdf_orig_path}-{page_num} attempt {attempt}: {type(e).__name__}: {e}. "
-                f"Backoff {backoff_count + 1}/{MAX_BACKOFF_ATTEMPTS}, sleeping {sleep_delay}s"
+                f"Backoff {conn_backoff}/{MAX_BACKOFF_ATTEMPTS}, sleeping {sleep_delay}s"
             )
             await asyncio.sleep(sleep_delay)
-
-    logger.error(f"Max backoff attempts reached for {pdf_orig_path}-{page_num}, terminating job")
-    sys.exit(1)
 
 
 async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path: str, page_num: int) -> PageResult:
