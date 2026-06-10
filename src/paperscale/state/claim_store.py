@@ -64,6 +64,9 @@ class ClaimStore:
     def _done_path(self, job_id: str) -> Path:
         return self._job_dir(job_id) / "done.json"
 
+    def _failed_path(self, job_id: str) -> Path:
+        return self._job_dir(job_id) / "failed.json"
+
     # -- done marker (durable truth) --------------------------------------
     def is_done(self, job_id: str) -> bool:
         return self._done_path(job_id).exists()
@@ -82,6 +85,47 @@ class ClaimStore:
             "completed_at": float(self._clock()),
         }
         _write_json_fsync(self._done_path(job_id), payload)
+
+    # -- failed marker (durable terminal failure) -------------------------
+    def is_failed(self, job_id: str) -> bool:
+        return self._failed_path(job_id).exists()
+
+    def mark_failed(self, job_id: str, reason: str) -> None:
+        """Write a durable, fsync'd terminal-failure marker.
+
+        Mirrors ``mark_done`` for jobs that have failed permanently. Unlike the
+        done marker, ``try_claim`` does NOT auto-skip on a failed marker;
+        discovery-level skipping (and ``work --retry-failed``, which calls
+        ``clear_failed``) is the caller's responsibility.
+        """
+        payload = {
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "kind": "job_failed_marker",
+            "job_id": job_id,
+            "worker_id": self.worker_id,
+            "reason": reason,
+            "failed_at": float(self._clock()),
+        }
+        _write_json_fsync(self._failed_path(job_id), payload)
+
+    def clear_failed(self, job_id: str) -> None:
+        """Remove the terminal-failure marker if present (no-op if absent)."""
+        try:
+            self._failed_path(job_id).unlink()
+        except FileNotFoundError:
+            pass
+
+    def terminal_outcome(self, job_id: str) -> str | None:
+        """Return the durable terminal state with done-precedence.
+
+        ``"done"`` if a done marker exists, else ``"failed"`` if a failed marker
+        exists, else ``None``. A job carrying both markers reports ``"done"``.
+        """
+        if self.is_done(job_id):
+            return "done"
+        if self.is_failed(job_id):
+            return "failed"
+        return None
 
     # -- claim lifecycle ---------------------------------------------------
     def try_claim(self, job_id: str, *, skip_if_done: bool = True) -> Claim | None:

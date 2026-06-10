@@ -82,6 +82,75 @@ class ClaimStoreTests(unittest.TestCase):
             self.assertIsNotNone(again)
             self.assertEqual(again.worker_id, "worker-b")
 
+    def test_mark_failed_writes_discoverable_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = [100.0]
+            a = self._store(root, now, "worker-a")
+            self.assertFalse(a.is_failed("job-6"))
+            a.mark_failed("job-6", "boom")
+            self.assertTrue(a.is_failed("job-6"))
+            marker = root / "jobs" / "job-6" / "failed.json"
+            self.assertTrue(marker.exists())
+
+    def test_clear_failed_removes_marker_and_is_noop_when_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = [100.0]
+            a = self._store(root, now, "worker-a")
+            a.mark_failed("job-7", "boom")
+            self.assertTrue(a.is_failed("job-7"))
+            a.clear_failed("job-7")
+            self.assertFalse(a.is_failed("job-7"))
+            # Clearing an absent marker is a no-op (no error).
+            a.clear_failed("job-7")
+            self.assertFalse(a.is_failed("job-7"))
+
+    def test_terminal_outcome_none_when_no_markers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = [100.0]
+            a = self._store(root, now, "worker-a")
+            self.assertIsNone(a.terminal_outcome("job-8"))
+
+    def test_terminal_outcome_failed_when_only_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = [100.0]
+            a = self._store(root, now, "worker-a")
+            a.mark_failed("job-9", "boom")
+            self.assertEqual(a.terminal_outcome("job-9"), "failed")
+
+    def test_terminal_outcome_done_when_only_done(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = [100.0]
+            a = self._store(root, now, "worker-a")
+            a.mark_done("job-10")
+            self.assertEqual(a.terminal_outcome("job-10"), "done")
+
+    def test_terminal_outcome_done_precedence_when_both_markers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = [100.0]
+            a = self._store(root, now, "worker-a")
+            a.mark_failed("job-11", "boom")
+            a.mark_done("job-11")
+            self.assertTrue(a.is_done("job-11"))
+            self.assertTrue(a.is_failed("job-11"))
+            self.assertEqual(a.terminal_outcome("job-11"), "done")
+
+    def test_failed_marker_does_not_block_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = [100.0]
+            a = self._store(root, now, "worker-a")
+            a.mark_failed("job-12", "boom")
+            # try_claim only auto-skips on is_done, NOT is_failed.
+            claim = a.try_claim("job-12")
+            self.assertIsNotNone(claim)
+            self.assertEqual(claim.worker_id, "worker-a")
+
 
 if __name__ == "__main__":
     unittest.main()
