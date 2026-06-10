@@ -966,11 +966,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ocr-model", dest="ocr_model_name", default=DEFAULT_MODEL, choices=sorted(MODEL_REGISTRY), help="OCR model adapter to use.")
     parser.add_argument("--model", default=None, help="Served model id sent to the server / hugging face path for an internal server.")
 
-    parser.add_argument("--pages_per_group", type=int, default=argparse.SUPPRESS, help="Aim for this many PDF pages per work item group.")
+    parser.add_argument("--pages_per_group", type=int, default=100, help="Aim for this many PDF pages per work item group.")
     parser.add_argument("--max_page_retries", type=int, default=8, help="Max number of times to retry a page.")
     parser.add_argument("--max_page_error_rate", type=float, default=0.004, help="Allowable fraction of fallback pages per document.")
-    parser.add_argument("--workers", type=int, default=20, help="Number of concurrent workers.")
-    parser.add_argument("--max_concurrent_requests", type=int, default=1600, help="Max concurrent server requests.")
+    parser.add_argument("--workers", type=int, default=4, help="Max number of page groups processed at once.")
+    parser.add_argument("--max_concurrent_requests", type=int, default=500, help="Max requests in-flight to the inference provider at once.")
     parser.add_argument("--max_server_ready_timeout", type=int, default=600, help="Seconds to wait for the server to become ready.")
     parser.add_argument("--apply_filter", action="store_true", help="Apply basic English/non-spam/non-form PDF filtering.")
     parser.add_argument("--stats", action="store_true", help="Report workspace statistics instead of running any job.")
@@ -1028,9 +1028,6 @@ async def main():
 
     global max_concurrent_requests_limit
     max_concurrent_requests_limit = asyncio.BoundedSemaphore(args.max_concurrent_requests)
-
-    if not hasattr(args, "pages_per_group"):
-        args.pages_per_group = 50 if args.api_key is not None else 500
 
     # We need poppler to render/inspect pdfs.
     check_poppler_version()
