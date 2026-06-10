@@ -1,4 +1,3 @@
-"""Paperscale OCR workload manager."""
+from paperscale.version import VERSION, VERSION_SHORT
 
-__all__ = ["__version__"]
-__version__ = "0.1.0"
+__all__ = ["VERSION", "VERSION_SHORT"]
