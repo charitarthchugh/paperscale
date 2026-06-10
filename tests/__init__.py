@@ -1,1 +1,0 @@
-"""Paperscale test package."""
