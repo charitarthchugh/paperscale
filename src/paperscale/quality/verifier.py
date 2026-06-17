@@ -8,16 +8,25 @@ import re
 
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 _TOKEN_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
+# Phrases only an assistant declining a task produces — safe to match anywhere.
 _REFUSAL_PATTERNS = (
     r"\bas an ai\b",
     r"\bi am unable to help\b",
     r"\bi can(?:'|)t help\b",
     r"\bi cannot help\b",
-    r"\bi(?:'|)m sorry\b",
-    r"\bsorry,? but\b",
-    r"\bcannot provide\b",
+    r"\bi cannot provide\b",
     r"\bi cannot comply\b",
 )
+# Polite phrases that also appear verbatim in real documents (deposition
+# transcripts, letters). Only a refusal when they dominate a SHORT output; in a
+# full transcribed page they are quoted speech, not the model refusing.
+_POLITE_REFUSAL_PATTERNS = (
+    r"\bi(?:'|)m sorry\b",
+    r"\bsorry,? but\b",
+)
+# A genuine refusal is brief and is the whole response; transcribed pages that
+# merely quote an apology run far longer than this.
+_REFUSAL_MAX_LEN = 600
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +118,15 @@ def _public_kind(code: str) -> str:
     return code
 
 
+# Characters that legitimately tile in documents and so do not signal a model
+# loop: form-field blanks (____), dotted leaders (....), rules and separators
+# (--- *** === ~~~), bullets, and en/em dashes. A long contiguous run of these is
+# page furniture, not degeneration. Genuine character loops repeat letters,
+# digits, or other punctuation; space-separated loops (e.g. "— — —") are caught
+# by the n-gram gate instead, so excluding the dashes here does not hide them.
+_FILL_RUN_CHARS = frozenset("_.-–—·•*=~")
+
+
 def _has_repeated_character_run(text: str) -> bool:
     current = ""
     run_length = 0
@@ -118,7 +136,7 @@ def _has_repeated_character_run(text: str) -> bool:
         else:
             current = char
             run_length = 1
-        if not char.isspace() and run_length >= 24:
+        if not char.isspace() and char not in _FILL_RUN_CHARS and run_length >= 24:
             return True
     return False
 
@@ -145,7 +163,11 @@ def _has_repeated_ngram_loop(text: str) -> bool:
 
 def _has_refusal_boilerplate(text: str) -> bool:
     lowered = text.lower()
-    return any(re.search(pattern, lowered, flags=re.IGNORECASE) for pattern in _REFUSAL_PATTERNS)
+    if any(re.search(pattern, lowered) for pattern in _REFUSAL_PATTERNS):
+        return True
+    if len(text.strip()) <= _REFUSAL_MAX_LEN:
+        return any(re.search(pattern, lowered) for pattern in _POLITE_REFUSAL_PATTERNS)
+    return False
 
 
 def _has_malformed_frontmatter(text: str) -> bool:
