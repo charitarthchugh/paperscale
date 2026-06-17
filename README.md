@@ -14,7 +14,10 @@ It keeps olmOCR's document management, queueing, and CLI 1:1, with two additions
   olmOCR. Pick one with `--ocr-model` (`markdown` is the default; `olmocr`
   reproduces the original YAML-front-matter + rotation behavior; `lightonocr2`
   drives [LightOnOCR-2-1B](https://huggingface.co/lightonai/LightOnOCR-2-1B), a
-  SOTA 1B Markdown-OCR model — image-only prompt, rendered at 1540px by default).
+  SOTA 1B Markdown-OCR model — image-only prompt, rendered at 1540px by default;
+  `lightonocr2-soup` is the same adapter on the more-robust
+  [`-ocr-soup`](https://huggingface.co/lightonai/LightOnOCR-2-1B-ocr-soup)
+  merged checkpoint).
 - **Opt-out resume** — completed work items are skipped on restart by default
   (olmOCR's done-flag behavior). `--no-resume` wipes prior progress and
   reprocesses the workspace from scratch.
@@ -62,8 +65,8 @@ poetry run paperscale ./workspace \
   flags, `results/*.jsonl`, and (with `--markdown`) `markdown/` live.
 - `--pdfs` — local PDF/image paths, a glob (`'docs/*.pdf'`), `.tar.gz` tarballs,
   or a `.txt` file listing one path per line.
-- `--ocr-model {lightonocr2,markdown,olmocr}` — which OCR adapter drives
-  prompting/parsing.
+- `--ocr-model {lightonocr2,lightonocr2-soup,markdown,olmocr}` — which OCR
+  adapter drives prompting/parsing.
 - `--model` — the served model id sent in each request (or a Hugging Face path
   for the internal server).
 
@@ -85,6 +88,21 @@ See `poetry run paperscale --help` for every flag.
 [LightOnOCR-2-1B](https://huggingface.co/lightonai/LightOnOCR-2-1B). It sends the
 page image with no text prompt and renders at 1540px by default (override with
 `--target_longest_image_dim`).
+
+`--ocr-model lightonocr2-soup` is the same adapter pointed at the
+[`-ocr-soup`](https://huggingface.co/lightonai/LightOnOCR-2-1B-ocr-soup)
+checkpoint — a task-arithmetic merge of the base and RLVR-trained weights for
+extra robustness on hard pages, with identical prompting and output. (The
+`bbox` / `bbox-soup` variants emit bounding boxes and are not wired up.) Serve it
+the same way, swapping the model id:
+
+```bash
+vllm serve lightonai/LightOnOCR-2-1B-ocr-soup --port 8000 \
+  --limit-mm-per-prompt '{"image": 1}' --mm-processor-cache-gb 0 --no-enable-prefix-caching
+
+poetry run paperscale ./workspace --pdfs './docs/*.pdf' \
+  --ocr-model lightonocr2-soup --server http://127.0.0.1:8000/v1 --markdown
+```
 
 Against an external vLLM server (recommended):
 

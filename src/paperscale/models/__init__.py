@@ -7,7 +7,7 @@ default and works with any OpenAI-compatible model that emits Markdown.
 from __future__ import annotations
 
 from paperscale.models.base import OCRModel
-from paperscale.models.lightonocr import LightOnOCRModel
+from paperscale.models.lightonocr import LightOnOCRModel, LightOnOCRSoupModel
 from paperscale.models.markdown import MarkdownModel
 from paperscale.models.olmocr import OlmOCRModel
 
@@ -17,6 +17,7 @@ MODEL_REGISTRY: dict[str, type[OCRModel]] = {
     "markdown": MarkdownModel,
     "olmocr": OlmOCRModel,
     "lightonocr2": LightOnOCRModel,
+    "lightonocr2-soup": LightOnOCRSoupModel,
 }
 
 
@@ -35,6 +36,7 @@ __all__ = [
     "MarkdownModel",
     "OlmOCRModel",
     "LightOnOCRModel",
+    "LightOnOCRSoupModel",
     "MODEL_REGISTRY",
     "DEFAULT_MODEL",
     "build_ocr_model",

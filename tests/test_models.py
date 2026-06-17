@@ -2,7 +2,15 @@
 
 import unittest
 
-from paperscale.models import DEFAULT_MODEL, MODEL_REGISTRY, LightOnOCRModel, MarkdownModel, OlmOCRModel, build_ocr_model
+from paperscale.models import (
+    DEFAULT_MODEL,
+    MODEL_REGISTRY,
+    LightOnOCRModel,
+    LightOnOCRSoupModel,
+    MarkdownModel,
+    OlmOCRModel,
+    build_ocr_model,
+)
 from paperscale.models.markdown import _strip_code_fence
 from paperscale.prompts import PageResponse
 
@@ -15,9 +23,10 @@ class RegistryTests(unittest.TestCase):
         self.assertIsInstance(build_ocr_model("markdown"), MarkdownModel)
         self.assertIsInstance(build_ocr_model("olmocr"), OlmOCRModel)
         self.assertIsInstance(build_ocr_model("lightonocr2"), LightOnOCRModel)
+        self.assertIsInstance(build_ocr_model("lightonocr2-soup"), LightOnOCRSoupModel)
 
     def test_registry_contents(self):
-        self.assertEqual(set(MODEL_REGISTRY), {"markdown", "olmocr", "lightonocr2"})
+        self.assertEqual(set(MODEL_REGISTRY), {"markdown", "olmocr", "lightonocr2", "lightonocr2-soup"})
 
     def test_unknown_model_raises_with_choices(self):
         with self.assertRaises(ValueError) as ctx:
@@ -144,6 +153,25 @@ class LightOnOCRModelTests(unittest.TestCase):
 
     def test_recipe(self):
         self.assertEqual(self.model.default_model_name, "lightonai/LightOnOCR-2-1B")
+        self.assertEqual(self.model.preferred_longest_image_dim, 1540)
+        self.assertEqual(self.model.sampling_params(), {"top_p": 0.9})
+
+
+class LightOnOCRSoupModelTests(unittest.TestCase):
+    """The -ocr-soup variant only swaps the served checkpoint."""
+
+    def setUp(self):
+        self.model = LightOnOCRSoupModel()
+
+    def test_is_lightonocr_subclass(self):
+        self.assertIsInstance(self.model, LightOnOCRModel)
+
+    def test_serves_soup_checkpoint(self):
+        self.assertEqual(self.model.default_model_name, "lightonai/LightOnOCR-2-1B-ocr-soup")
+
+    def test_inherits_image_only_recipe(self):
+        content = self.model.build_messages("BASE64DATA")[0]["content"]
+        self.assertEqual({part["type"] for part in content}, {"image_url"})
         self.assertEqual(self.model.preferred_longest_image_dim, 1540)
         self.assertEqual(self.model.sampling_params(), {"top_p": 0.9})
 
