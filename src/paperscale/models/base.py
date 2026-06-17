@@ -31,6 +31,10 @@ class OCRModel(abc.ABC):
     #: is served under.
     default_model_name: str = "paperscale"
 
+    #: Longest-side dimension (px) the pipeline renders pages at when the user
+    #: does not pass ``--target_longest_image_dim``. Override per model.
+    preferred_longest_image_dim: int = 1288
+
     @abc.abstractmethod
     def build_messages(self, image_base64: str) -> list[dict]:
         """Build the chat ``messages`` array for a single page image (PNG, base64)."""
@@ -42,6 +46,14 @@ class OCRModel(abc.ABC):
         is correct for free-form Markdown models.
         """
         return None
+
+    def sampling_params(self) -> dict:
+        """Extra OpenAI sampling params merged into each request (e.g. ``top_p``).
+
+        Must not set ``temperature``: the pipeline owns it for per-attempt retry
+        escalation. The default adds nothing.
+        """
+        return {}
 
     @abc.abstractmethod
     def parse(self, content: str) -> PageResponse:
