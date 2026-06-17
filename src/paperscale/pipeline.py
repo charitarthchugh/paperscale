@@ -119,6 +119,27 @@ def _render_is_blank(image_base64: str) -> bool:
         return False
 
 
+def _capture_reject(pdf_orig_path: str, page_num: int, attempt: int, kind: str, raw_text: str) -> None:
+    """Debug hook: append the raw rejected model output to ``$PAPERSCALE_DEBUG_REJECTS``.
+
+    The looping/garbled text that fails the quality gate is normally discarded
+    (the page falls back to pdftotext), so a run cannot show *what* a page looped
+    on. When the env var names a JSONL path, capture each rejected attempt's raw
+    text there before it is thrown away. No-op when unset, so it is inert in
+    normal runs. Workers are asyncio tasks in one process, so single-line appends
+    do not interleave.
+    """
+    path = os.environ.get("PAPERSCALE_DEBUG_REJECTS")
+    if not path:
+        return
+    try:
+        record = {"source": pdf_orig_path, "page": page_num, "attempt": attempt, "kind": kind, "len": len(raw_text), "text": raw_text}
+        with open(path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:  # debug capture must never affect a run
+        logger.warning("PAPERSCALE_DEBUG_REJECTS capture failed", exc_info=True)
+
+
 @dataclass(frozen=True)
 class PageResult:
     source_path: str
@@ -218,6 +239,7 @@ async def try_single_page(
             is_valid = False
             is_terminal = finding.retry_class == "terminal"
             metrics.add_metrics(**{f"quality_reject_{finding.kind}": 1})
+            _capture_reject(pdf_orig_path, page_num, attempt, finding.kind, model_response_markdown)
 
         return PageResult(
             pdf_orig_path,
