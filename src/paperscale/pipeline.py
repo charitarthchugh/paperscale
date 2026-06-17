@@ -628,6 +628,41 @@ def get_markdown_path(workspace: str, source_file: str) -> str:
     return os.path.join(workspace, "markdown", dir_path, md_filename)
 
 
+def export_markdown_from_results(args) -> int:
+    """Regenerate per-document Markdown from already-written results/*.jsonl (no inference).
+
+    Markdown is normally a side-effect of processing, gated on ``--markdown`` at the
+    moment a work item completes. That means a completed workspace can have full dolma
+    records in ``results/`` but no Markdown — e.g. ``--markdown`` was omitted, or it was
+    added on a later *resumed* run where the work was already done and thus skipped.
+    This rebuilds the Markdown mirror from those records, reusing the exact same layout
+    as the inline writer. One bad record never aborts the export: blank/unparseable
+    lines are skipped with a warning.
+    """
+    results_dir = os.path.join(args.workspace, "results")
+    written = 0
+    for jsonl_path in sorted(glob.glob(os.path.join(results_dir, "*.jsonl"))):
+        with open(jsonl_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    doc = json.loads(line)
+                    source_file = doc["metadata"]["Source-File"]
+                    text = doc["text"]
+                except (json.JSONDecodeError, KeyError, TypeError) as e:
+                    logger.warning(f"Skipping unparseable record in {jsonl_path}: {e}")
+                    continue
+                markdown_path = get_markdown_path(args.workspace, source_file)
+                os.makedirs(os.path.dirname(markdown_path), exist_ok=True)
+                with open(markdown_path, "w") as md_f:
+                    md_f.write(text)
+                written += 1
+    logger.info(f"Exported {written} markdown file(s) from {results_dir}")
+    return written
+
+
 async def worker(args, work_queue: WorkQueue, worker_id):
     while True:
         work_item = await work_queue.get_work()
@@ -1001,6 +1036,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--apply_filter", action="store_true", help="Apply basic English/non-spam/non-form PDF filtering.")
     parser.add_argument("--stats", action="store_true", help="Report workspace statistics instead of running any job.")
     parser.add_argument("--markdown", action="store_true", help="Also write per-document Markdown mirroring the input folder structure.")
+    parser.add_argument("--export-markdown", dest="export_markdown", action="store_true", help="Regenerate Markdown from existing results/*.jsonl (no inference) and exit. Use to recover Markdown from an already-processed workspace.")
     parser.add_argument("--target_longest_image_dim", type=int, default=1288, help="Longest-side dimension for rendered page images.")
     parser.add_argument("--guided_decoding", action="store_true", help="Enable guided decoding when the model adapter provides a regex.")
 
@@ -1044,6 +1080,11 @@ async def main():
 
     if args.workspace.startswith("s3://"):
         raise SystemExit("error: paperscale only supports local workspaces (S3 support was removed).")
+
+    if args.export_markdown:
+        count = export_markdown_from_results(args)
+        logger.info(f"Wrote {count} markdown file(s) under {os.path.join(args.workspace, 'markdown')}")
+        return
 
     # Resolve the OCR model adapter and the served model name.
     args.ocr_model = build_ocr_model(args.ocr_model_name)
