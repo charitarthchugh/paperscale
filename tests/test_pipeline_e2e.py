@@ -106,6 +106,7 @@ def _make_args(workspace: str, server_url: str, pdf_path: str):
     )
     args.ocr_model = build_ocr_model(args.ocr_model_name)
     args.model = args.ocr_model.default_model_name
+    args.target_longest_image_dim = pipeline.resolve_render_dim(args)
     return args
 
 
@@ -225,6 +226,47 @@ class ProcessPageQualityGateTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(result.is_fallback)
             self.assertEqual(result.response.natural_text, CANNED_MARKDOWN)
             self.assertEqual(server.request_count, 2)
+
+
+class BuildPageQueryTests(unittest.TestCase):
+    """build_page_query merges the adapter's sampling params, temperature aside."""
+
+    def test_lightonocr2_includes_top_p(self):
+        query = pipeline.build_page_query("IMG", build_ocr_model("lightonocr2"), "served")
+        self.assertEqual(query["model"], "served")
+        self.assertEqual(query["top_p"], 0.9)
+
+    def test_markdown_has_no_top_p(self):
+        query = pipeline.build_page_query("IMG", build_ocr_model("markdown"), "served")
+        self.assertNotIn("top_p", query)
+
+    def test_temperature_remains_caller_controlled(self):
+        query = pipeline.build_page_query("IMG", build_ocr_model("lightonocr2"), "served")
+        query["temperature"] = 0.5  # the per-attempt override the caller applies
+        self.assertEqual(query["temperature"], 0.5)
+
+
+class ResolveRenderDimTests(unittest.TestCase):
+    """--target_longest_image_dim defaults to the model's preferred when omitted."""
+
+    def _args(self, extra):
+        parser = _build_arg_parser()
+        args, _ = parser.parse_known_args(["ws", *extra])
+        args.ocr_model = build_ocr_model(args.ocr_model_name)
+        return args
+
+    def test_model_preferred_when_flag_absent(self):
+        args = self._args(["--ocr-model", "lightonocr2"])
+        self.assertIsNone(args.target_longest_image_dim)  # parser default
+        self.assertEqual(pipeline.resolve_render_dim(args), 1540)
+
+    def test_markdown_default_dim(self):
+        args = self._args([])
+        self.assertEqual(pipeline.resolve_render_dim(args), 1288)
+
+    def test_explicit_flag_wins(self):
+        args = self._args(["--ocr-model", "lightonocr2", "--target_longest_image_dim", "999"])
+        self.assertEqual(pipeline.resolve_render_dim(args), 999)
 
 
 if __name__ == "__main__":

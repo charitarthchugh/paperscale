@@ -136,12 +136,23 @@ class PageResult:
 
 def build_page_query(image_base64: str, ocr_model: OCRModel, served_model_name: str) -> dict:
     MAX_TOKENS = 8000
-    return {
+    query = {
         "model": served_model_name,
         "messages": ocr_model.build_messages(image_base64),
         "max_tokens": MAX_TOKENS,
         "temperature": 0.0,  # Overridden per attempt by the caller.
     }
+    # Model-specific sampling extras (e.g. top_p). Temperature stays
+    # caller-controlled for per-attempt retry escalation.
+    query.update(ocr_model.sampling_params())
+    return query
+
+
+def resolve_render_dim(args) -> int:
+    """Pick the page render dimension: an explicit CLI flag wins, else the model's preferred."""
+    if args.target_longest_image_dim is None:
+        return args.ocr_model.preferred_longest_image_dim
+    return args.target_longest_image_dim
 
 
 async def try_single_page(
@@ -1037,7 +1048,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stats", action="store_true", help="Report workspace statistics instead of running any job.")
     parser.add_argument("--markdown", action="store_true", help="Also write per-document Markdown mirroring the input folder structure.")
     parser.add_argument("--export-markdown", dest="export_markdown", action="store_true", help="Regenerate Markdown from existing results/*.jsonl (no inference) and exit. Use to recover Markdown from an already-processed workspace.")
-    parser.add_argument("--target_longest_image_dim", type=int, default=1288, help="Longest-side dimension for rendered page images.")
+    parser.add_argument("--target_longest_image_dim", type=int, default=None, help="Longest-side dimension for rendered page images (default: per-model — 1288 for markdown/olmocr, 1540 for lightonocr2).")
     parser.add_argument("--guided_decoding", action="store_true", help="Enable guided decoding when the model adapter provides a regex.")
 
     resume_group = parser.add_mutually_exclusive_group()
@@ -1090,6 +1101,8 @@ async def main():
     args.ocr_model = build_ocr_model(args.ocr_model_name)
     if args.model is None:
         args.model = args.ocr_model.default_model_name
+    # Render size: explicit --target_longest_image_dim wins, else the model's preferred.
+    args.target_longest_image_dim = resolve_render_dim(args)
 
     use_internal_server = not args.server
 
