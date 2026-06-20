@@ -284,6 +284,12 @@ class QianfanOCRModelTests(unittest.TestCase):
         result = self.model.parse("<think>layout...</think>\n# Title")
         self.assertEqual(result.natural_text, "# Title")
 
+    def test_parse_keeps_content_before_stray_think_close(self):
+        # A literal "</think>" in the page (no opening tag) must NOT truncate the
+        # transcription — matched-pair stripping only.
+        result = self.model.parse("real content </think> tail")
+        self.assertEqual(result.natural_text, "real content </think> tail")
+
     def test_parse_detects_html_table(self):
         result = self.model.parse("Intro\n<table><tr><td>a</td></tr></table>")
         self.assertTrue(result.is_table)
@@ -407,6 +413,13 @@ class Surya2ModelTests(unittest.TestCase):
         evil = "<div>" * 2000 + "x" + "</div>" * 2000
         result = self.model.parse(evil)  # must not raise RecursionError
         self.assertIsInstance(result, PageResponse)
+
+    def test_parse_flags_tolerate_attribute_quoting(self):
+        # is_table/is_diagram must not depend on the model's quoting style.
+        single = "<div data-label='Table'><table><tr><td>x</td></tr></table></div>"
+        self.assertTrue(self.model.parse(single).is_table)
+        spaced = "<div data-label = \"Figure\">fig</div>"
+        self.assertTrue(self.model.parse(spaced).is_diagram)
 
 
 if __name__ == "__main__":

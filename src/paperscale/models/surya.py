@@ -57,7 +57,13 @@ SURYA_OCR_PROMPT = (
 # Section headers/titles become Markdown headings; the rest of a block's body is
 # already semantic HTML (<p>/<b>/<ol>/<table>/<math> …) that markdownify converts.
 _HEADING_LABELS = {"Section-Header", "Title"}
-_DIAGRAM_LABELS = {"Figure", "Image", "Diagram"}
+_DIAGRAM_LABELS = ("Figure", "Image", "Diagram")
+
+# Table/diagram page flags, read from the block labels. Tolerant of the model's
+# attribute quoting (single or double quotes, optional surrounding whitespace) so a
+# correctly-transcribed page isn't mis-flagged on a quoting change.
+_TABLE_LABEL_RE = re.compile(r"""data-label\s*=\s*["']Table["']""")
+_DIAGRAM_LABEL_RE = re.compile(r"""data-label\s*=\s*["'](?:%s)["']""" % "|".join(_DIAGRAM_LABELS))
 
 # Collapse runs of 3+ newlines (markdownify's block spacing) down to a blank line.
 _EXCESS_BLANKS = re.compile(r"\n{3,}")
@@ -138,8 +144,8 @@ class Surya2Model(OCRModel):
         markdown = _EXCESS_BLANKS.sub("\n\n", markdown).strip()
 
         # Label markers are the cheapest reliable signal for table/diagram pages.
-        is_table = 'data-label="Table"' in content
-        is_diagram = any(f'data-label="{label}"' in content for label in _DIAGRAM_LABELS)
+        is_table = bool(_TABLE_LABEL_RE.search(content))
+        is_diagram = bool(_DIAGRAM_LABEL_RE.search(content))
 
         return PageResponse(
             primary_language=None,
