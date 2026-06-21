@@ -17,7 +17,8 @@ It keeps olmOCR's document management, queueing, and CLI 1:1, with two additions
   SOTA 1B Markdown-OCR model — image-only prompt, rendered at 1540px by default;
   `lightonocr2-soup` is the same adapter on the more-robust
   [`-ocr-soup`](https://huggingface.co/lightonai/LightOnOCR-2-1B-ocr-soup)
-  merged checkpoint).
+  merged checkpoint; `glm-ocr`, `qianfan-ocr`, `infinity-parser2-flash`, and
+  `surya2` add four more document-OCR VLMs, documented below).
 - **Opt-out resume** — completed work items are skipped on restart by default
   (olmOCR's done-flag behavior). `--no-resume` wipes prior progress and
   reprocesses the workspace from scratch.
@@ -65,8 +66,8 @@ poetry run paperscale ./workspace \
   flags, `results/*.jsonl`, and (with `--markdown`) `markdown/` live.
 - `--pdfs` — local PDF/image paths, a glob (`'docs/*.pdf'`), `.tar.gz` tarballs,
   or a `.txt` file listing one path per line.
-- `--ocr-model {lightonocr2,lightonocr2-soup,markdown,olmocr}` — which OCR
-  adapter drives prompting/parsing.
+- `--ocr-model {glm-ocr,infinity-parser2-flash,lightonocr2,lightonocr2-soup,markdown,olmocr,qianfan-ocr,surya2}`
+  — which OCR adapter drives prompting/parsing.
 - `--model` — the served model id sent in each request (or a Hugging Face path
   for the internal server).
 
@@ -120,6 +121,77 @@ automatically; forward vLLM's recommended flags as trailing args:
 ```bash
 poetry run paperscale ./workspace --pdfs './docs/*.pdf' --ocr-model lightonocr2 --markdown \
   --mm-processor-cache-gb 0 --no-enable-prefix-caching --limit-mm-per-prompt '{"image": 1}'
+```
+
+### GLM-OCR
+
+`--ocr-model glm-ocr` drives [GLM-OCR](https://huggingface.co/zai-org/GLM-OCR)
+(`zai-org/GLM-OCR`, ~0.9B, Apache-2.0), a GLM-4.1V-derived VLM fine-tuned for
+document transcription. The page image is sent with a full-page instruction and
+the model returns the whole page as Markdown (tables as Markdown, formulas as
+LaTeX) in a single call. vLLM serves it natively via the `glm_ocr` architecture
+(vLLM PR #33005); use a recent vLLM build and upgrade `transformers` alongside it.
+
+```bash
+vllm serve zai-org/GLM-OCR --port 8000 --limit-mm-per-prompt '{"image": 1}'
+
+poetry run paperscale ./workspace --pdfs './docs/*.pdf' \
+  --ocr-model glm-ocr --server http://127.0.0.1:8000/v1 --markdown
+```
+
+### Qianfan-OCR
+
+`--ocr-model qianfan-ocr` drives
+[Qianfan-OCR](https://huggingface.co/baidu/Qianfan-OCR) (`baidu/Qianfan-OCR`,
+~4B), a Qianfan-ViT + Qwen3-4B document model. One image + prompt call returns
+clean reading-ordered Markdown (HTML tables, `$$…$$` LaTeX). vLLM runs it as an
+`InternVLChatModel` via `--hf-overrides`:
+
+```bash
+vllm serve baidu/Qianfan-OCR --port 8000 --trust-remote-code \
+  --hf-overrides '{"architectures": ["InternVLChatModel"]}' --limit-mm-per-prompt '{"image": 1}'
+
+poetry run paperscale ./workspace --pdfs './docs/*.pdf' \
+  --ocr-model qianfan-ocr --server http://127.0.0.1:8000/v1 --markdown
+```
+
+The adapter raises `max_tokens` to 12000 for long pages and defensively strips a
+leading `<think>…</think>` layout block (only emitted when `enable_thinking=True`,
+which paperscale never sets).
+
+### Infinity-Parser2 Flash
+
+`--ocr-model infinity-parser2-flash` drives
+[`infly/Infinity-Parser2-Flash`](https://huggingface.co/infly/Infinity-Parser2-Flash),
+a ~2B Qwen3.5-VL document parser, in **doc2md** mode (Markdown with HTML tables
+and LaTeX) rather than its native bbox-JSON mode. Qwen3 reasoning is disabled via
+the top-level `chat_template_kwargs={"enable_thinking": false}` request key. Serve
+it on vLLM ≥ 0.20 (Python 3.13):
+
+```bash
+vllm serve infly/Infinity-Parser2-Flash --port 8000 --trust-remote-code \
+  --reasoning-parser qwen3 --mm-encoder-tp-mode data --mm-processor-cache-type shm \
+  --enable-prefix-caching --limit-mm-per-prompt '{"image": 1}'
+
+poetry run paperscale ./workspace --pdfs './docs/*.pdf' \
+  --ocr-model infinity-parser2-flash --server http://127.0.0.1:8000/v1 --markdown
+```
+
+### Surya OCR 2
+
+`--ocr-model surya2` drives
+[Surya OCR 2](https://huggingface.co/datalab-to/surya-ocr-2)
+(`datalab-to/surya-ocr-2`, ~0.65B, `Qwen3_5ForConditionalGeneration`). Its
+full-page-OCR mode emits reading-ordered **layout-HTML** (`<div data-label=…>`
+blocks, `<math>` KaTeX, HTML `<table>`); paperscale converts that to Markdown
+(headings, lists, Markdown tables, and `\( … \)` / `\[ … \]` LaTeX). Serve it on a
+recent vLLM with native `qwen3_5` support (v0.20.0+; avoid v0.18.0):
+
+```bash
+vllm serve datalab-to/surya-ocr-2 --port 8000 --limit-mm-per-prompt '{"image": 1}'
+
+poetry run paperscale ./workspace --pdfs './docs/*.pdf' \
+  --ocr-model surya2 --server http://127.0.0.1:8000/v1 --markdown
 ```
 
 ## Outputs
