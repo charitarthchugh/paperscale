@@ -88,6 +88,21 @@ class LeaderboardTest(unittest.TestCase):
         self.assertIn("0.67", a_line)
         self.assertNotIn("0.75", a_line)
 
+    def test_leaderboard_mean_is_doc_weighted_not_page_weighted(self):
+        # d1 has 3 pages @0.9, d2 has 1 page @0.0. Doc-mean = (0.9+0.0)/2 = 0.450,
+        # NOT the page-weighted 0.675 = (0.9*3 + 0.0)/4 -- a big doc must not dominate.
+        with tempfile.TemporaryDirectory() as d:
+            db = EvalDB(Path(d) / "eval.db")
+            db.write_correction_rate([
+                ("a", "d1", 1, 0.9, 0.0), ("a", "d1", 2, 0.9, 0.0), ("a", "d1", 3, 0.9, 0.0),
+                ("a", "d2", 1, 0.0, 0.0),
+            ])
+            out = db.leaderboard()
+            db.close()
+        line = _line_for(out, "a")
+        self.assertIn("0.450", line)
+        self.assertNotIn("0.675", line)
+
     def test_single_model_win_rate_na(self):
         with tempfile.TemporaryDirectory() as d:
             db = EvalDB(Path(d) / "eval.db")

@@ -150,11 +150,11 @@ class EvalDB:
             out.setdefault(model, {})[doc] = mean
         return out
 
-    def _overall_mean(self, table: str, value_expr: str) -> dict[str, float]:
-        cur = self.conn.execute(
-            f"SELECT model, AVG({value_expr}) FROM {table} GROUP BY model"
-        )
-        return {model: mean for model, mean in cur.fetchall()}
+    @staticmethod
+    def _doc_mean(per_doc: dict[str, dict[str, float]]) -> dict[str, float]:
+        """Mean over a model's per-doc means -- each doc weighted equally, matching
+        the win-rate weighting (a 100-page doc must not dominate a 1-page doc)."""
+        return {m: sum(d.values()) / len(d) for m, d in per_doc.items() if d}
 
     @staticmethod
     def _win_rate(per_doc: dict[str, dict[str, float]], higher_better: bool) -> dict[str, str]:
@@ -184,8 +184,8 @@ class EvalDB:
         columns: list[tuple[str, dict[str, str], dict[str, str] | None]] = []
 
         def add_scalar(label: str, table: str, expr: str, higher_better: bool) -> None:
-            overall = self._overall_mean(table, expr)
             per_doc = self._per_doc_means(table, expr)
+            overall = self._doc_mean(per_doc)
             means = {m: (f"{overall[m]:.3f}" if m in overall else "-") for m in models}
             wr = self._win_rate(per_doc, higher_better)
             wins = {m: wr.get(m, "n/a") for m in models}
@@ -194,25 +194,27 @@ class EvalDB:
         # correction_rate: how much the spell checker changed the text (lower better,
         # win-rate on it); uncorrectable_rate: garbage it couldn't fix (mean only).
         add_scalar("corr_rate", "correction_rate", "correction_rate", higher_better=False)
-        uncorr = self._overall_mean("correction_rate", "uncorrectable_rate")
+        uncorr = self._doc_mean(self._per_doc_means("correction_rate", "uncorrectable_rate"))
         columns.append(("uncorr_rate", {m: (f"{uncorr[m]:.3f}" if m in uncorr else "-") for m in models}, None))
         add_scalar("garbage", "garbage_fraction", "score", higher_better=False)
 
         # peer_agreement: two value columns, win-rate on bow_f1.
         for label, expr in (("peer_f1", "bow_f1"), ("peer_ned", "one_minus_ned")):
-            overall = self._overall_mean("peer_agreement", expr)
+            per_doc = self._per_doc_means("peer_agreement", expr)
+            overall = self._doc_mean(per_doc)
             means = {m: (f"{overall[m]:.3f}" if m in overall else "-") for m in models}
             if label == "peer_f1":
-                wr = self._win_rate(self._per_doc_means("peer_agreement", expr), True)
+                wr = self._win_rate(per_doc, True)
                 columns.append((label, means, {m: wr.get(m, "n/a") for m in models}))
             else:
                 columns.append((label, means, None))
 
         for label, expr in (("tl_f1", "bow_f1"), ("tl_ned", "one_minus_ned")):
-            overall = self._overall_mean("textlayer_agreement", expr)
+            per_doc = self._per_doc_means("textlayer_agreement", expr)
+            overall = self._doc_mean(per_doc)
             means = {m: (f"{overall[m]:.3f}" if m in overall else "-") for m in models}
             if label == "tl_f1":
-                wr = self._win_rate(self._per_doc_means("textlayer_agreement", expr), True)
+                wr = self._win_rate(per_doc, True)
                 columns.append((label, means, {m: wr.get(m, "n/a") for m in models}))
             else:
                 columns.append((label, means, None))
