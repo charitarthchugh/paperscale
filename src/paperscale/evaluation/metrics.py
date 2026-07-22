@@ -30,10 +30,10 @@ def _is_garbage(tok: str) -> bool:
     # alpha-digit soup: mixes letters and digits within one token
     if letters and any(c.isdigit() for c in core):
         return True
-    if len(letters) > 2 and letters == core.split("'")[0].replace("-", "") and all(c.isalpha() for c in core):
-        # all-consonant alphabetic word (no vowel)
-        if not any(c in _VOWELS for c in core):
-            return True
+    # vowel-less alphabetic run (OCR garble like "brwn"/"jmps"); skip ALL-CAPS so
+    # real acronyms (PDF, XML, CSV) aren't flagged. _VOWELS includes 'y'.
+    if len(letters) > 2 and not core.isupper() and not any(c in _VOWELS for c in letters):
+        return True
     # mid-word case alternation: >=2 lower->upper transitions inside the token
     transitions = sum(1 for a, b in zip(core, core[1:]) if a.islower() and b.isupper())
     if transitions >= 2:

@@ -24,6 +24,15 @@ class GarbageTest(unittest.TestCase):
     def test_none_on_empty(self):
         self.assertIsNone(garbage_token_fraction("   "))
 
+    def test_vowelless_run_flagged_but_not_acronyms(self):
+        from paperscale.evaluation.metrics import _is_garbage
+
+        self.assertTrue(_is_garbage("brwn"))       # lowercase vowel-less OCR garble
+        self.assertTrue(_is_garbage("brwnjmps"))
+        self.assertFalse(_is_garbage("PDF"))       # all-caps acronym preserved
+        self.assertFalse(_is_garbage("XML"))
+        self.assertFalse(_is_garbage("cat"))       # has a vowel
+
 
 class AgreementTest(unittest.TestCase):
     def test_identical_perfect(self):
