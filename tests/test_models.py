@@ -13,6 +13,7 @@ from paperscale.models import (
     OlmOCRModel,
     QianfanOCRModel,
     Surya2Model,
+    UnlimitedOCRModel,
     build_ocr_model,
 )
 from paperscale.models.glmocr import GLM_OCR_PROMPT
@@ -33,6 +34,7 @@ class RegistryTests(unittest.TestCase):
         self.assertIsInstance(build_ocr_model("qianfan-ocr"), QianfanOCRModel)
         self.assertIsInstance(build_ocr_model("infinity-parser2-flash"), InfinityParser2FlashModel)
         self.assertIsInstance(build_ocr_model("surya2"), Surya2Model)
+        self.assertIsInstance(build_ocr_model("unlimited-ocr"), UnlimitedOCRModel)
 
     def test_registry_contents(self):
         self.assertEqual(
@@ -46,6 +48,7 @@ class RegistryTests(unittest.TestCase):
                 "qianfan-ocr",
                 "infinity-parser2-flash",
                 "surya2",
+                "unlimited-ocr",
             },
         )
 
@@ -420,6 +423,55 @@ class Surya2ModelTests(unittest.TestCase):
         self.assertTrue(self.model.parse(single).is_table)
         spaced = "<div data-label = \"Figure\">fig</div>"
         self.assertTrue(self.model.parse(spaced).is_diagram)
+
+
+class UnlimitedOCRModelTests(unittest.TestCase):
+    def setUp(self):
+        self.model = UnlimitedOCRModel()
+
+    def test_recipe(self):
+        self.assertEqual(self.model.default_model_name, "baidu/Unlimited-OCR")
+        self.assertEqual(self.model.preferred_longest_image_dim, 1024)
+        # skip_special_tokens=false and the ngram anti-loop processor args are
+        # required by the vLLM recipe; temperature stays pipeline-owned.
+        self.assertEqual(
+            self.model.sampling_params(),
+            {"skip_special_tokens": False, "vllm_xargs": {"ngram_size": 35, "window_size": 128}},
+        )
+        self.assertIsNone(self.model.guided_regex())
+
+    def test_build_messages_has_image_prefixed_prompt(self):
+        messages = self.model.build_messages("QUJD")
+        self.assertEqual(len(messages), 1)
+        text_part, image_part = messages[0]["content"]
+        # The literal <image> prefix is mandatory; without it output is empty.
+        self.assertEqual(text_part, {"type": "text", "text": "<image>document parsing."})
+        self.assertEqual(image_part["image_url"]["url"], "data:image/png;base64,QUJD")
+
+    def test_parse_unwraps_ref_and_drops_det(self):
+        raw = (
+            "<|ref|># Heading<|/ref|><|det|>[[10,20,900,60]]<|/det|>\n\n"
+            "Body text with <|ref|>a grounded span<|/ref|><|det|>[[1,2,3,4]]<|/det|> inline."
+        )
+        result = self.model.parse(raw)
+        self.assertEqual(
+            result.natural_text,
+            "# Heading\n\nBody text with a grounded span inline.",
+        )
+        self.assertTrue(result.is_rotation_valid)
+        self.assertEqual(result.rotation_correction, 0)
+
+    def test_parse_strips_leftover_special_tokens(self):
+        # skip_special_tokens=false can leave structural specials in the text.
+        result = self.model.parse("Hello world<｜end▁of▁sentence｜>")
+        self.assertEqual(result.natural_text, "Hello world")
+
+    def test_parse_plain_markdown_passes_through(self):
+        self.assertEqual(self.model.parse("# Title\n\ntext").natural_text, "# Title\n\ntext")
+
+    def test_parse_empty_page_is_none(self):
+        self.assertIsNone(self.model.parse("").natural_text)
+        self.assertIsNone(self.model.parse("<|ref|><|/ref|><|det|>[[0,0,0,0]]<|/det|>").natural_text)
 
 
 if __name__ == "__main__":
