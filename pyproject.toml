@@ -6,7 +6,7 @@ authors = [
     {name = "charitarthchugh",email = "37895518+charitarthchugh@users.noreply.github.com"}
 ]
 license = "MIT"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<4.0"
 dependencies = [
     "httpx (>=0.28.1,<0.29.0)",
     "pillow (>=12.2.0,<13.0.0)",
@@ -18,8 +18,15 @@ dependencies = [
     "pyyaml (>=6.0.0,<7.0.0)",
     "lingua-language-detector (>=2.0.0,<3.0.0)",
     "img2pdf (>=0.5.0,<0.7.0)",
-    "markdownify (>=1.2.0,<2.0.0)"
+    "markdownify (>=1.2.0,<2.0.0)",
+    "wordfreq (>=3.0.0,<4.0.0)",
+    "rapidfuzz (>=3.0.0,<4.0.0)",
+    "symspellpy (>=6.7.0,<7.0.0)"
 ]
+
+[project.optional-dependencies]
+# Only needed for the live progress dashboard (`--tui`).
+tui = ["rich (>=13.0.0,<15.0.0)"]
 
 [tool.poetry]
 packages = [{ include = "paperscale", from = "src" }]
