@@ -1221,6 +1221,10 @@ def _log_final_metrics(args) -> None:
 
 def cli_main():
     """Synchronous entry point for the CLI."""
+    if sys.argv[1:2] == ["evaluate"]:
+        from paperscale.cli import main as evaluate_main
+
+        return evaluate_main(sys.argv[1:])
     return asyncio.run(main())
 
 
