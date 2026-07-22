@@ -1221,6 +1221,9 @@ def _log_final_metrics(args) -> None:
 
 def cli_main():
     """Synchronous entry point for the CLI."""
+    # Route `paperscale evaluate ...` to the subcommand CLI. The pipeline itself takes a
+    # positional workspace path (plus flags), never a subcommand, so this only misroutes if
+    # a workspace were literally named "evaluate" -- not worth guarding against.
     if sys.argv[1:2] == ["evaluate"]:
         from paperscale.cli import main as evaluate_main
 

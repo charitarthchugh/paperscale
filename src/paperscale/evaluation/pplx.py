@@ -28,6 +28,7 @@ would lump its span into the leading offset.)
 from __future__ import annotations
 
 import math
+import warnings
 
 import httpx
 
@@ -116,6 +117,16 @@ def _score_pass(
         plps = _prompt_logprobs(client, url, model, prompt)
         toks = [_pick(e) for e in plps if e is not None]
         decoded_len = sum(len(dec) for _, dec in toks)
+        if decoded_len > len(prompt):
+            # Tokens should tile the prompt exactly (null-token span = len(prompt) - decoded_len >= 0).
+            # A tokenizer whose decoded_token strings carry marker glyphs (SentencePiece "_", BPE "G")
+            # can overrun, making the leading offset negative -> page attribution shifts. Surface it
+            # instead of silently clamping; validate against the real --pplx-model before trusting numbers.
+            warnings.warn(
+                f"pplx: decoded tokens ({decoded_len} chars) overrun the prompt ({len(prompt)} chars); "
+                "per-page perplexity attribution may be miscalibrated for this model's tokenizer.",
+                stacklevel=2,
+            )
         cursor = max(0, len(prompt) - decoded_len)  # span of the skipped null token
         for logprob, dec in toks:
             page = _assign_page(boundaries, cursor)
@@ -133,6 +144,7 @@ def score_run_pplx(
     extra_words: frozenset[str] = frozenset(),
     client: "httpx.Client | None" = None,
     progress=None,
+    sym=None,
 ) -> dict[str, list[tuple]]:
     """Score every page raw and dictionary-corrected; return DB row tuples per doc.
 
@@ -144,7 +156,7 @@ def score_run_pplx(
     own_client = client is None
     if own_client:
         client = httpx.Client(timeout=httpx.Timeout(600.0))
-    sym = None
+    # sym may be supplied by the caller (the correction metric already built one); else built lazily.
     try:
         by_doc: dict[str, list[PageText]] = {}
         for p in pages:

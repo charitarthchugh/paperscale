@@ -171,6 +171,7 @@ def _handle_evaluate(args: argparse.Namespace) -> int:
                         pplx_url=args.pplx_url,
                         pplx_model=args.pplx_model,
                         extra_words=extra_words,
+                        sym=sym,  # reuse the dictionary built for the correction metric
                         progress=lambda doc, label=label: (ph.advance(), rep.log(f"pplx {label}: {doc}")),
                     )
                     db.write_pplx(label, [row for rows in by_doc.values() for row in rows])

@@ -48,6 +48,10 @@ def compute_textlayer_agreement(
 
     skip_docs: set[tuple[str, str]] = set()
     for (model, doc), fb in fallback.items():
+        # Skip the WHOLE doc if any page fell back: fallback pages fill natural_text with
+        # pdftotext output, so comparing them to the text layer is circular (~1.0). This
+        # sacrifices the doc's good pages too -- acceptable since this metric is only a
+        # calibration subset, not full coverage.
         if fb > 0:
             report.docs_with_fallback += 1
             skip_docs.add((model, doc))

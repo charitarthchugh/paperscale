@@ -32,6 +32,18 @@ def _fake_handler(request: httpx.Request) -> httpx.Response:
     return httpx.Response(200, json={"choices": [{"prompt_logprobs": plps}]})
 
 
+def _overrun_handler(request: httpx.Request) -> httpx.Response:
+    """Like _fake_handler but each decoded_token is padded, so the decoded chars
+    overrun the prompt -- the scorer should warn rather than silently misalign."""
+    body = json.loads(request.content)
+    prompt = body["prompt"]
+    chunks = [prompt[i : i + 4] for i in range(0, len(prompt), 4)]
+    plps = [None] + [
+        {"7": {"logprob": _LOGPROB, "decoded_token": ch + "XXXXX", "rank": 0}} for ch in chunks[1:]
+    ]
+    return httpx.Response(200, json={"choices": [{"prompt_logprobs": plps}]})
+
+
 def _client() -> httpx.Client:
     return httpx.Client(transport=httpx.MockTransport(_fake_handler))
 
@@ -65,6 +77,12 @@ class ScoreRunPplxTest(unittest.TestCase):
         self.assertEqual(n_c1, 1)
         self.assertEqual(n_c2, 1)
         self.assertAlmostEqual(s_c1, _LOGPROB)
+
+    def test_warns_when_decoded_tokens_overrun_prompt(self):
+        pages = [PageText("m", "/d.pdf", 1, "hello"), PageText("m", "/d.pdf", 2, "world")]
+        client = httpx.Client(transport=httpx.MockTransport(_overrun_handler))
+        with client, self.assertWarns(UserWarning):
+            pplx.score_run_pplx(pages, pplx_url="http://x", pplx_model="q", client=client)
 
     def test_ppl_is_exp_neg_mean_logprob(self):
         pages = [PageText("m", "/d.pdf", 1, "hello"), PageText("m", "/d.pdf", 2, "world")]
