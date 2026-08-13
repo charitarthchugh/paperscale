@@ -15,6 +15,12 @@ build/
 .idea/
 .vscode/
 
+# Agent tooling state
+.claude/
+# Regenerable knowledge graph (`graphify update .`)
+graphify-out/
+out.svg
+
 # OMX/OMC runtime state
 .omx/state/
 .omx/logs/
