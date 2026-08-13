@@ -14,6 +14,7 @@ from paperscale.models.markdown import MarkdownModel
 from paperscale.models.olmocr import OlmOCRModel
 from paperscale.models.qianfan import QianfanOCRModel
 from paperscale.models.surya import Surya2Model
+from paperscale.models.unlimited_ocr import UnlimitedOCRModel
 
 DEFAULT_MODEL = "markdown"
 
@@ -26,6 +27,7 @@ MODEL_REGISTRY: dict[str, type[OCRModel]] = {
     "qianfan-ocr": QianfanOCRModel,
     "infinity-parser2-flash": InfinityParser2FlashModel,
     "surya2": Surya2Model,
+    "unlimited-ocr": UnlimitedOCRModel,
 }
 
 
@@ -49,6 +51,7 @@ __all__ = [
     "QianfanOCRModel",
     "InfinityParser2FlashModel",
     "Surya2Model",
+    "UnlimitedOCRModel",
     "MODEL_REGISTRY",
     "DEFAULT_MODEL",
     "build_ocr_model",
