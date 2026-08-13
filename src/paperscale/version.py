@@ -1,6 +1,6 @@
 _MAJOR = "0"
-_MINOR = "4"
-_PATCH = "1"
+_MINOR = "6"
+_PATCH = "0"
 
 VERSION_SHORT = f"{_MAJOR}.{_MINOR}"
 VERSION = f"{_MAJOR}.{_MINOR}.{_PATCH}"

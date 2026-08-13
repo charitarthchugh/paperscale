@@ -1,6 +1,6 @@
 [project]
 name = "paperscale"
-version = "0.5.0"
+version = "0.6.0"
 description = "Local, model-agnostic OCR-to-Markdown at scale (an olmOCR-style pipeline)"
 authors = [
     {name = "charitarthchugh",email = "37895518+charitarthchugh@users.noreply.github.com"}
