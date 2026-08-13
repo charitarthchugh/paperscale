@@ -72,3 +72,19 @@ def correction_counts(text: str, sym: SymSpell) -> tuple[int, int, int] | None:
         else:
             uncorrectable += 1
     return len(tokens), corrected, uncorrectable
+
+
+# --- ProcessPoolExecutor seams -------------------------------------------
+# Each worker builds its own dictionary once (initializer) instead of fork-
+# inheriting the parent's: the TUI may have a rich refresh thread alive, and
+# fork-with-threads is deprecated on 3.12+ (default flips off fork in 3.14).
+_POOL_SYM: SymSpell | None = None
+
+
+def _pool_init(extra_words: frozenset[str]) -> None:
+    global _POOL_SYM
+    _POOL_SYM = build_dictionary(extra_words)
+
+
+def pool_correction_counts(text: str) -> tuple[int, int, int] | None:
+    return correction_counts(text, _POOL_SYM)

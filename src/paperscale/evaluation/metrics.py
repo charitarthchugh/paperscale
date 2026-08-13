@@ -82,3 +82,22 @@ def one_minus_ned(a: str, b: str) -> float:
     if not na and not nb:
         return 1.0
     return Levenshtein.normalized_similarity(na, nb)
+
+
+def peer_rows_for_page(item: tuple[tuple[str, int], dict[str, str]]) -> list[tuple]:
+    """Peer-agreement DB rows for one page: ``((doc, page), {model: text})`` ->
+    ``[(model, peer, doc, page, bow_f1, one_minus_ned), ...]``.
+
+    Both metrics are symmetric, so each unordered pair is computed once and
+    emitted in both directions. Top-level so it pickles into worker processes.
+    """
+    (doc, page), by_model = item
+    models = sorted(by_model)
+    rows: list[tuple] = []
+    for i, m in enumerate(models):
+        for peer in models[i + 1:]:
+            f1 = bow_f1(by_model[m], by_model[peer])
+            ned = one_minus_ned(by_model[m], by_model[peer])
+            rows.append((m, peer, doc, page, f1, ned))
+            rows.append((peer, m, doc, page, f1, ned))
+    return rows

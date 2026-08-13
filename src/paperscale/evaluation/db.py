@@ -66,6 +66,16 @@ class EvalDB:
     def register_run(
         self, model: str, input_path: str, pplx_scorer_model: str | None = None
     ) -> None:
+        # Staleness guard: pplx rows scored by a different scorer model are not
+        # comparable -- drop them rather than resume on top of them.
+        row = self.conn.execute(
+            "SELECT pplx_scorer_model FROM runs WHERE model = ?", (model,)
+        ).fetchone()
+        stored = row[0] if row else None
+        if pplx_scorer_model is None:
+            pplx_scorer_model = stored  # not scoring pplx this run; keep the record
+        elif stored is not None and stored != pplx_scorer_model:
+            self.clear_pplx(model)
         self.conn.execute(
             "INSERT OR REPLACE INTO runs (model, input_path, pplx_scorer_model) VALUES (?, ?, ?)",
             (model, input_path, pplx_scorer_model),
@@ -109,18 +119,35 @@ class EvalDB:
             "reject_rate", rows, ("model", "doc", "fallback_pages", "total_pages")
         )
 
-    def write_pplx(self, model: str, rows) -> None:
+    def _ensure_pplx_table(self, model: str) -> str:
         table = _pplx_table(model)
-        cols = ("doc", "page") + _PPLX_COLS
         coldefs = "doc TEXT, page INTEGER, " + ", ".join(f"{c} REAL" for c in _PPLX_COLS)
         # n_tokens columns are integers, but REAL stores them faithfully via sqlite affinity.
-        self.conn.execute(f"DROP TABLE IF EXISTS {table}")
-        self.conn.execute(f"CREATE TABLE {table} ({coldefs})")
+        self.conn.execute(
+            f"CREATE TABLE IF NOT EXISTS {table} ({coldefs}, UNIQUE(doc, page))"
+        )
+        return table
+
+    def write_pplx_doc(self, model: str, rows) -> None:
+        """Streaming write: one call (and one commit) per completed doc, so a
+        crashed long run resumes from what's already scored."""
+        table = self._ensure_pplx_table(model)
+        cols = ("doc", "page") + _PPLX_COLS
         placeholders = ", ".join("?" * len(cols))
         self.conn.executemany(
-            f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders})",
+            f"INSERT OR REPLACE INTO {table} ({', '.join(cols)}) VALUES ({placeholders})",
             list(rows),
         )
+        self.conn.commit()
+
+    def pplx_done_docs(self, model: str) -> set[str]:
+        """Docs already scored for this model (resume support)."""
+        table = self._ensure_pplx_table(model)
+        cur = self.conn.execute(f"SELECT DISTINCT doc FROM {table}")
+        return {r[0] for r in cur.fetchall()}
+
+    def clear_pplx(self, model: str) -> None:
+        self.conn.execute(f"DROP TABLE IF EXISTS {_pplx_table(model)}")
         self.conn.commit()
 
     # --- leaderboard -----------------------------------------------------

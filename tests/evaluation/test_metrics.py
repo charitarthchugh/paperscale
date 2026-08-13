@@ -7,6 +7,7 @@ from paperscale.evaluation.metrics import (
     garbage_token_fraction,
     normalize_markdown,
     one_minus_ned,
+    peer_rows_for_page,
 )
 
 CLEAN = "The quick brown fox jumps over the lazy dog every morning."
@@ -54,6 +55,19 @@ class AgreementTest(unittest.TestCase):
 
     def test_normalize_strips_markdown(self):
         self.assertEqual(normalize_markdown("# **Hello** [world](http://x)  `code`"), "Hello world code")
+
+
+class PeerRowsTest(unittest.TestCase):
+    def test_emits_both_directions_with_equal_scores(self):
+        rows = peer_rows_for_page((("d1", 3), {"a": CLEAN, "b": GARBLED, "c": CLEAN}))
+        # 3 models -> 3 unordered pairs -> 6 directed rows.
+        self.assertEqual(len(rows), 6)
+        by_pair = {(r[0], r[1]): r for r in rows}
+        for m, peer in [("a", "b"), ("a", "c"), ("b", "c")]:
+            fwd, rev = by_pair[(m, peer)], by_pair[(peer, m)]
+            self.assertEqual(fwd[2:], rev[2:])  # doc, page, f1, ned identical
+            self.assertEqual(fwd[2:4], ("d1", 3))
+        self.assertEqual(by_pair[("a", "c")][4], 1.0)  # identical texts -> perfect f1
 
 
 if __name__ == "__main__":

@@ -119,7 +119,7 @@ class PplxTest(unittest.TestCase):
             db = EvalDB(path)
             db.write_correction_rate([("my-model", "d1", 1, 0.5, 0.0)])
             # rows: (doc, page, n_tok_raw, sum_lp_raw, ppl_raw, n_tok_c, sum_lp_c, ppl_c)
-            db.write_pplx("my-model", [
+            db.write_pplx_doc("my-model", [
                 ("d1", 1, 10, -5.0, 4.0, 10, -4.0, 2.0),
                 ("d1", 2, 10, -5.0, 6.0, 10, -4.0, 4.0),
             ])
@@ -136,11 +136,38 @@ class PplxTest(unittest.TestCase):
     def test_pplx_rewrite_replaces(self):
         with tempfile.TemporaryDirectory() as d:
             db = EvalDB(Path(d) / "eval.db")
-            db.write_pplx("m", [("d1", 1, 1, -1.0, 2.0, 1, -1.0, 2.0)])
-            db.write_pplx("m", [("d1", 1, 1, -1.0, 9.0, 1, -1.0, 9.0)])
+            db.write_pplx_doc("m", [("d1", 1, 1, -1.0, 2.0, 1, -1.0, 2.0)])
+            db.write_pplx_doc("m", [("d1", 1, 1, -1.0, 9.0, 1, -1.0, 9.0)])
             n = db.conn.execute("SELECT COUNT(*) FROM pplx_m").fetchone()[0]
             db.close()
         self.assertEqual(n, 1)
+
+    def test_resume_tracks_done_docs_and_clear(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = EvalDB(Path(d) / "eval.db")
+            self.assertEqual(db.pplx_done_docs("m"), set())
+            db.write_pplx_doc("m", [("d1", 1, 1, -1.0, 2.0, 1, -1.0, 2.0)])
+            db.write_pplx_doc("m", [("d2", 1, 1, -1.0, 2.0, 1, -1.0, 2.0)])
+            self.assertEqual(db.pplx_done_docs("m"), {"d1", "d2"})
+            db.clear_pplx("m")
+            self.assertEqual(db.pplx_done_docs("m"), set())
+            db.close()
+
+    def test_scorer_model_change_drops_pplx_table(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = EvalDB(Path(d) / "eval.db")
+            db.register_run("m", "/in", "scorer-a")
+            db.write_pplx_doc("m", [("d1", 1, 1, -1.0, 2.0, 1, -1.0, 2.0)])
+            # No --pplx this run: stored scorer (and scores) survive.
+            db.register_run("m", "/in", None)
+            self.assertEqual(db.pplx_done_docs("m"), {"d1"})
+            # Same scorer: scores survive (resume).
+            db.register_run("m", "/in", "scorer-a")
+            self.assertEqual(db.pplx_done_docs("m"), {"d1"})
+            # Different scorer: stale scores dropped.
+            db.register_run("m", "/in", "scorer-b")
+            self.assertEqual(db.pplx_done_docs("m"), set())
+            db.close()
 
 
 if __name__ == "__main__":

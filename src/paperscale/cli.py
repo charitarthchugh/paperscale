@@ -9,6 +9,7 @@ stays cheap.
 from __future__ import annotations
 
 import argparse
+import os
 from collections import defaultdict
 from pathlib import Path
 from typing import Sequence
@@ -36,6 +37,9 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--pplx-url", default="http://localhost:8000", help="base URL of the vLLM OpenAI-compatible server")
     ev.add_argument("--pplx-model", default=None, help="model id served by --pplx-url (required with --pplx)")
     ev.add_argument("--tui", action="store_true", help="show a live progress dashboard (needs the 'tui' extra)")
+    ev.add_argument("--jobs", type=int, default=os.cpu_count() or 4, help="worker count for CPU-bound metrics and pdftotext (default: cpu count)")
+    ev.add_argument("--pplx-concurrency", type=int, default=8, help="docs scored in flight against the vLLM server (default 8)")
+    ev.add_argument("--no-resume", action="store_true", help="rescore pplx from scratch instead of resuming already-scored docs")
     ev.set_defaults(handler=_handle_evaluate)
     return parser
 
@@ -71,10 +75,12 @@ def _load_dictionary(paths: list[Path]) -> frozenset[str]:
 
 
 def _handle_evaluate(args: argparse.Namespace) -> int:
+    from concurrent.futures import ProcessPoolExecutor
+
     from paperscale.evaluation.db import EvalDB
-    from paperscale.evaluation.metrics import bow_f1, garbage_token_fraction, one_minus_ned
+    from paperscale.evaluation.metrics import garbage_token_fraction, peer_rows_for_page
     from paperscale.evaluation.runs import load_run
-    from paperscale.evaluation.spell import build_dictionary, correction_counts
+    from paperscale.evaluation.spell import _pool_init, build_dictionary, pool_correction_counts
     from paperscale.evaluation.textlayer import compute_textlayer_agreement
 
     if args.pplx and not args.pplx_model:
@@ -108,47 +114,51 @@ def _handle_evaluate(args: argparse.Namespace) -> int:
                 ph.advance()
             ph.done()
 
-            # Corrections — how much a spell checker must change the text (correctable)
-            # and how much it cannot fix (uncorrectable). Shares pplx's dictionary.
+            # CPU-bound metrics (symspell corrections, peer agreement) share one
+            # process pool: pure Python => GIL-bound, threads would not help.
+            # Workers build their own dictionary via the initializer; the main
+            # thread keeps its own copy for pplx. All DB writes and Phase.advance()
+            # stay on this thread -- workers only return plain tuples.
             sym = build_dictionary(extra_words)
-            ph = rep.phase("corrections", total=len(all_pages))
-            correction_rows = []
-            for p in all_pages:
-                ph.advance()
-                counts = correction_counts(p.text, sym)
-                if counts is None:
-                    continue
-                n, corrected, uncorrectable = counts
-                correction_rows.append((p.model, p.doc, p.page, corrected / n, uncorrectable / n))
-            db.write_correction_rate(correction_rows)
-            ph.done()
+            n_workers = max(1, min(args.jobs, len(all_pages) or 1))
+            with ProcessPoolExecutor(
+                max_workers=n_workers, initializer=_pool_init, initargs=(extra_words,)
+            ) as pool:
+                # Corrections — how much a spell checker must change the text
+                # (correctable) and how much it cannot fix (uncorrectable).
+                ph = rep.phase("corrections", total=len(all_pages))
+                correction_rows = []
+                counts_iter = pool.map(pool_correction_counts, [p.text for p in all_pages], chunksize=32)
+                for p, counts in zip(all_pages, counts_iter):
+                    ph.advance()
+                    if counts is None:
+                        continue
+                    n, corrected, uncorrectable = counts
+                    correction_rows.append((p.model, p.doc, p.page, corrected / n, uncorrectable / n))
+                db.write_correction_rate(correction_rows)
+                ph.done()
 
-            # Garbage-token fraction + peer agreement.
-            ph = rep.phase("token & peer metrics", total=2)
-            garbage_rows = [(p.model, p.doc, p.page, s) for p in all_pages if (s := garbage_token_fraction(p.text)) is not None]
-            db.write_garbage_fraction(garbage_rows)
-            ph.advance()
-            page_texts: dict[tuple[str, int], dict[str, str]] = defaultdict(dict)
-            for p in all_pages:
-                page_texts[(p.doc, p.page)][p.model] = p.text
-            peer_rows = []
-            for (doc, page), mt in page_texts.items():
-                models_here = sorted(mt)
-                if len(models_here) < 2:
-                    continue
-                for m in models_here:
-                    for peer in models_here:
-                        if m != peer:
-                            peer_rows.append((m, peer, doc, page, bow_f1(mt[m], mt[peer]), one_minus_ned(mt[m], mt[peer])))
-            if len(pages_by_model) < 2:
-                rep.log("only one model run — peer agreement skipped (needs >=2 runs).")
-            db.write_peer_agreement(peer_rows)
-            ph.advance()
-            ph.done()
+                # Garbage-token fraction + peer agreement.
+                ph = rep.phase("token & peer metrics", total=2)
+                garbage_rows = [(p.model, p.doc, p.page, s) for p in all_pages if (s := garbage_token_fraction(p.text)) is not None]
+                db.write_garbage_fraction(garbage_rows)
+                ph.advance()
+                page_texts: dict[tuple[str, int], dict[str, str]] = defaultdict(dict)
+                for p in all_pages:
+                    page_texts[(p.doc, p.page)][p.model] = p.text
+                items = [it for it in page_texts.items() if len(it[1]) >= 2]
+                peer_rows = [r for rows in pool.map(peer_rows_for_page, items, chunksize=32) for r in rows]
+                if len(pages_by_model) < 2:
+                    rep.log("only one model run — peer agreement skipped (needs >=2 runs).")
+                db.write_peer_agreement(peer_rows)
+                ph.advance()
+                ph.done()
 
             # Metric 4 — text-layer agreement (calibration subset).
             ph = rep.phase("text-layer", total=len(all_pages))
-            textlayer_rows, skip = compute_textlayer_agreement(all_pages, all_metas, progress=lambda note: ph.advance())
+            textlayer_rows, skip = compute_textlayer_agreement(
+                all_pages, all_metas, progress=lambda note: ph.advance(), jobs=args.jobs
+            )
             ph.done()
             db.write_textlayer_agreement(textlayer_rows)
             rep.log(
@@ -159,22 +169,34 @@ def _handle_evaluate(args: argparse.Namespace) -> int:
             # Metric 5 — quality-reject rate (doc-level).
             db.write_reject_rate([(m.model, m.doc, m.fallback_pages, m.total_pages) for m in all_metas])
 
-            # Optional — perplexity.
+            # Optional — perplexity. Resumes by default: docs already scored (and
+            # committed doc-by-doc via on_doc) are skipped on re-run; --no-resume
+            # drops prior scores. A scorer-model change invalidates them automatically
+            # (see EvalDB.register_run).
             if args.pplx:
                 from paperscale.evaluation.pplx import score_run_pplx
 
-                total_docs = sum(len({p.doc for p in pages}) for pages in pages_by_model.values())
-                ph = rep.phase("perplexity", total=total_docs)
+                todo: dict[str, list] = {}
                 for label, pages in pages_by_model.items():
-                    by_doc = score_run_pplx(
+                    if args.no_resume:
+                        db.clear_pplx(label)
+                    done = db.pplx_done_docs(label)
+                    todo[label] = [p for p in pages if p.doc not in done]
+                    if done:
+                        rep.log(f"pplx {label}: resuming — {len(done)} docs already scored, {len({p.doc for p in todo[label]})} to go.")
+                total_docs = sum(len({p.doc for p in pages}) for pages in todo.values())
+                ph = rep.phase("perplexity", total=total_docs)
+                for label, pages in todo.items():
+                    score_run_pplx(
                         pages,
                         pplx_url=args.pplx_url,
                         pplx_model=args.pplx_model,
                         extra_words=extra_words,
                         sym=sym,  # reuse the dictionary built for the correction metric
+                        concurrency=args.pplx_concurrency,
+                        on_doc=lambda doc, rows, label=label: db.write_pplx_doc(label, rows),
                         progress=lambda doc, label=label: (ph.advance(), rep.log(f"pplx {label}: {doc}")),
                     )
-                    db.write_pplx(label, [row for rows in by_doc.values() for row in rows])
                 ph.done()
 
         leaderboard = db.leaderboard()

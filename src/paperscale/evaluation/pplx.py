@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import math
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import httpx
 
@@ -145,6 +146,8 @@ def score_run_pplx(
     client: "httpx.Client | None" = None,
     progress=None,
     sym=None,
+    concurrency: int = 8,
+    on_doc=None,
 ) -> dict[str, list[tuple]]:
     """Score every page raw and dictionary-corrected; return DB row tuples per doc.
 
@@ -152,27 +155,32 @@ def score_run_pplx(
 
         (doc, page, n_tokens_raw, sum_logprob_raw, ppl_raw,
          n_tokens_corrected, sum_logprob_corrected, ppl_corrected)
+
+    ``concurrency``: docs scored in flight at once (network-bound; the vLLM server
+    batches). ``on_doc``: optional callable(doc, rows) fired as each doc completes --
+    the streaming-write sink. Both ``on_doc`` and ``progress`` are invoked only from
+    the calling thread (the ``as_completed`` drain), never from workers, so DB
+    handles and TUI state stay single-threaded.
     """
     own_client = client is None
     if own_client:
         client = httpx.Client(timeout=httpx.Timeout(600.0))
-    # sym may be supplied by the caller (the correction metric already built one); else built lazily.
+    # sym may be supplied by the caller (the correction metric already built one).
+    if sym is None:
+        sym = build_dictionary(extra_words)
     try:
         by_doc: dict[str, list[PageText]] = {}
         for p in pages:
             by_doc.setdefault(p.doc, []).append(p)
 
-        result: dict[str, list[tuple]] = {}
-        for doc, plist in by_doc.items():
+        def _score_doc(doc: str, plist: list[PageText]) -> list[tuple]:
             plist = sorted(plist, key=lambda p: p.page)
+            # ponytail: raw + corrected passes run sequentially per doc; doc-level
+            # parallelism already fills the concurrency cap whenever docs >= cap.
             raw = _score_pass([(p.page, p.text) for p in plist], client, pplx_url, pplx_model)
-
-            if sym is None:
-                sym = build_dictionary(extra_words)
             corr = _score_pass(
                 [(p.page, correct_text(p.text, sym)) for p in plist], client, pplx_url, pplx_model
             )
-
             rows = []
             for p in plist:
                 n_r, s_r = raw[p.page]
@@ -180,9 +188,19 @@ def score_run_pplx(
                 rows.append(
                     (doc, p.page, n_r, s_r, _ppl(n_r, s_r), n_c, s_c, _ppl(n_c, s_c))
                 )
-            result[doc] = rows
-            if progress is not None:
-                progress(doc)
+            return rows
+
+        result: dict[str, list[tuple]] = {}
+        # httpx.Client is thread-safe; SymSpell lookups are read-only.
+        with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
+            futs = {ex.submit(_score_doc, doc, plist): doc for doc, plist in by_doc.items()}
+            for fut in as_completed(futs):
+                doc = futs[fut]
+                result[doc] = fut.result()
+                if on_doc is not None:
+                    on_doc(doc, result[doc])
+                if progress is not None:
+                    progress(doc)
         return result
     finally:
         if own_client:
