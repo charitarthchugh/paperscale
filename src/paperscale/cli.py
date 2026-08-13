@@ -38,7 +38,8 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--pplx-model", default=None, help="model id served by --pplx-url (required with --pplx)")
     ev.add_argument("--tui", action="store_true", help="show a live progress dashboard (needs the 'tui' extra)")
     ev.add_argument("--jobs", type=int, default=os.cpu_count() or 4, help="worker count for CPU-bound metrics and pdftotext (default: cpu count)")
-    ev.add_argument("--pplx-concurrency", type=int, default=8, help="docs scored in flight against the vLLM server (default 8)")
+    ev.add_argument("--pplx-concurrency", type=int, default=64, help="chunk requests in flight against the vLLM server (default 64)")
+    ev.add_argument("--pplx-chunk-tokens", type=int, default=None, help="approx token cap per pplx request (default 32000); smaller prompts let vLLM batch far more of them, at the cost of cross-page conditioning at each chunk boundary")
     ev.add_argument("--no-resume", action="store_true", help="rescore pplx from scratch instead of resuming already-scored docs")
     ev.set_defaults(handler=_handle_evaluate)
     return parser
@@ -194,6 +195,7 @@ def _handle_evaluate(args: argparse.Namespace) -> int:
                         extra_words=extra_words,
                         sym=sym,  # reuse the dictionary built for the correction metric
                         concurrency=args.pplx_concurrency,
+                        chunk_tokens=args.pplx_chunk_tokens,
                         on_doc=lambda doc, rows, label=label: db.write_pplx_doc(label, rows),
                         progress=lambda doc, label=label: (ph.advance(), rep.log(f"pplx {label}: {doc}")),
                     )
