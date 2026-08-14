@@ -12,11 +12,15 @@ end a twelve-hour OCR run.
 
 from __future__ import annotations
 
+import logging
 import math
 import re
+import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
+
+logger = logging.getLogger(__name__)
 
 # name{label="value",...} 123.0   -- the label block is optional
 _SAMPLE = re.compile(
@@ -221,3 +225,91 @@ class VLLMStats:
             waiting=newest.waiting,
             kv_usage=newest.kv_usage,
         )
+
+
+class VLLMStatsPoller:
+    """Poll ``/metrics`` on a daemon thread and feed a VLLMStats.
+
+    A thread rather than an asyncio task on purpose: the pipeline saturates its
+    event loop with concurrent workers, and an async poller would go stale exactly
+    when throughput matters most. It also lets evaluate's largely synchronous flow
+    reuse this unchanged.
+
+    Every failure is silent by contract. ``available`` goes False and the panel
+    renders as unavailable; nothing propagates to the caller.
+    """
+
+    def __init__(self, url: str, stats: VLLMStats, interval: float = 5.0, fetch=None) -> None:
+        self._url = url
+        self._stats = stats
+        self._interval = interval
+        self._fetch = fetch or _http_fetch
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._warned = False
+        self.available = False
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._run, name="vllm-stats", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self._tick()
+            self._stop.wait(self._interval)
+
+    def _tick(self) -> bool:
+        """One scrape. Returns True on success. Never raises."""
+        try:
+            parsed = parse_metrics(self._fetch(self._url))
+            snap = snapshot_from(parsed)
+            if all(getattr(snap, f.name) is None for f in fields(snap)):
+                raise ValueError("no vllm metrics in response")
+            self._stats.add(snap)
+        except Exception as exc:
+            if not self._warned:
+                logger.warning("vLLM statistics unavailable at %s: %s", self._url, exc)
+                self._warned = True
+            else:
+                logger.debug("vLLM statistics still unavailable at %s: %s", self._url, exc)
+            self.available = False
+            return False
+        self.available = True
+        return True
+
+
+def _http_fetch(url: str) -> str:
+    import httpx
+
+    response = httpx.get(url, timeout=5.0)
+    response.raise_for_status()
+    return response.text
+
+
+def format_rate(value: float | None) -> str:
+    """Render a token rate. Absent is `-`, never `0` -- zero is a measurement."""
+    if value is None:
+        return "-"
+    return f"{value / 1000:.1f}k" if value >= 1000 else f"{value:.0f}"
+
+
+def push_vllm_stats(rep, stats: "VLLMStats | None", poller: "VLLMStatsPoller | None") -> None:
+    """Fill the reporter's `vllm` column. Shared by the pipeline and evaluate."""
+    if stats is None:
+        return
+    if poller is not None and not poller.available:
+        rep.set_stat("status", "unavailable", group="vllm")
+        return
+    rates = stats.rates()
+    rep.set_stat("gen", f"{format_rate(rates.gen_tps)} tok/s  (avg {format_rate(rates.gen_tps_avg)})", group="vllm")
+    rep.set_stat("prompt", f"{format_rate(rates.prompt_tps)} tok/s  (avg {format_rate(rates.prompt_tps_avg)})", group="vllm")
+    rep.set_stat("kv hit", "-" if rates.kv_hit is None else f"{rates.kv_hit:.0%}", group="vllm")
+    rep.set_stat("running", f"{rates.running or 0:.0f}   wait {rates.waiting or 0:.0f}", group="vllm")

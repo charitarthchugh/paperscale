@@ -2,8 +2,9 @@
 
 import pathlib
 import unittest
+from unittest import mock
 
-from paperscale.vllm_stats import Rates, Snapshot, VLLMStats, metrics_url, parse_metrics, snapshot_from  # noqa: F401
+from paperscale.vllm_stats import Rates, Snapshot, VLLMStats, VLLMStatsPoller, format_rate, metrics_url, parse_metrics, push_vllm_stats, snapshot_from  # noqa: F401
 
 FIXTURE = pathlib.Path(__file__).parent / "fixtures" / "vllm_metrics.txt"
 
@@ -210,6 +211,116 @@ class VLLMStatsTest(unittest.TestCase):
         for value in (rates.gen_tps, rates.gen_tps_avg, rates.prompt_tps, rates.prompt_tps_avg, rates.kv_hit, rates.kv_hit_avg):
             if value is not None:
                 self.assertGreaterEqual(value, 0.0)
+
+
+class VLLMStatsPollerTest(unittest.TestCase):
+    def setUp(self):
+        self.stats = VLLMStats(clock=_FakeClock())
+
+    def test_tick_feeds_stats(self):
+        poller = VLLMStatsPoller("http://x/metrics", self.stats, fetch=lambda url: FIXTURE.read_text())
+        self.assertTrue(poller._tick())
+        self.assertTrue(poller.available)
+        self.assertEqual(self.stats.rates().running, 8.0)
+
+    def test_connection_error_marks_unavailable_without_raising(self):
+        def boom(url):
+            raise OSError("connection refused")
+
+        poller = VLLMStatsPoller("http://x/metrics", self.stats, fetch=boom)
+        self.assertFalse(poller._tick())  # must not raise
+        self.assertFalse(poller.available)
+
+    def test_http_error_marks_unavailable(self):
+        # A backend with no /metrics (qianfan, surya) 404s. Not fatal.
+        def not_found(url):
+            raise RuntimeError("404")
+
+        poller = VLLMStatsPoller("http://x/metrics", self.stats, fetch=not_found)
+        self.assertFalse(poller._tick())
+        self.assertFalse(poller.available)
+
+    def test_malformed_body_marks_unavailable(self):
+        poller = VLLMStatsPoller("http://x/metrics", self.stats, fetch=lambda url: "<html>not prometheus</html>")
+        self.assertFalse(poller._tick())
+        self.assertFalse(poller.available)
+
+    def test_warns_once_then_debug(self):
+        def boom(url):
+            raise OSError("nope")
+
+        poller = VLLMStatsPoller("http://x/metrics", self.stats, fetch=boom)
+        with mock.patch("paperscale.vllm_stats.logger") as log:
+            poller._tick()
+            poller._tick()
+            poller._tick()
+        self.assertEqual(log.warning.call_count, 1)
+        self.assertEqual(log.debug.call_count, 2)
+
+    def test_recovers_after_failure(self):
+        calls = {"n": 0}
+
+        def flaky(url):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("nope")
+            return FIXTURE.read_text()
+
+        poller = VLLMStatsPoller("http://x/metrics", self.stats, fetch=flaky)
+        self.assertFalse(poller._tick())
+        self.assertTrue(poller._tick())
+        self.assertTrue(poller.available)
+
+    def test_stop_is_safe_before_start(self):
+        poller = VLLMStatsPoller("http://x/metrics", self.stats, fetch=lambda url: "")
+        poller.stop()  # must not raise
+
+
+class _RecordingRep:
+    def __init__(self):
+        self.stats = {}
+
+    def set_stat(self, name, value, *, group="run"):
+        self.stats.setdefault(group, {})[name] = value
+
+
+class FormatRateTest(unittest.TestCase):
+    def test_none_renders_as_dash_not_zero(self):
+        self.assertEqual(format_rate(None), "-")
+
+    def test_zero_is_a_real_measurement(self):
+        self.assertEqual(format_rate(0.0), "0")
+
+    def test_thousands_are_abbreviated(self):
+        self.assertEqual(format_rate(6100.0), "6.1k")
+
+
+class PushVllmStatsTest(unittest.TestCase):
+    def test_unavailable_poller_shows_status_only(self):
+        rep = _RecordingRep()
+        poller = VLLMStatsPoller("http://x/metrics", self.stats_obj(), fetch=lambda url: "")
+        poller.available = False
+        push_vllm_stats(rep, self.stats_obj(), poller)
+        self.assertEqual(rep.stats["vllm"], {"status": "unavailable"})
+
+    def test_populates_all_rows_when_available(self):
+        clock = _FakeClock()
+        stats = VLLMStats(clock=clock)
+        stats.add(Snapshot(generation_tokens=0.0, prompt_tokens=0.0, cache_hits=0.0, cache_queries=0.0, running=8.0, waiting=2.0))
+        clock.tick(10.0)
+        stats.add(Snapshot(generation_tokens=4120.0, prompt_tokens=100.0, cache_hits=93.0, cache_queries=100.0, running=8.0, waiting=2.0))
+        rep = _RecordingRep()
+        push_vllm_stats(rep, stats, None)
+        self.assertIn("412 tok/s", rep.stats["vllm"]["gen"])
+        self.assertEqual(rep.stats["vllm"]["kv hit"], "93%")
+
+    def test_no_stats_is_a_noop(self):
+        rep = _RecordingRep()
+        push_vllm_stats(rep, None, None)
+        self.assertEqual(rep.stats, {})
+
+    def stats_obj(self):
+        return VLLMStats(clock=_FakeClock())
 
 
 if __name__ == "__main__":
