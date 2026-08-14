@@ -43,6 +43,7 @@ import ssl
 import sys
 import tarfile
 import tempfile
+import time
 from dataclasses import dataclass, replace
 from functools import cache
 from urllib.parse import urlparse
@@ -61,6 +62,10 @@ from paperscale.prompts import PageResponse
 from paperscale.quality.verifier import DeterministicQualityVerifier
 from paperscale.renderpdf import png_dark_fraction, render_pdf_to_base64png
 from paperscale.version import VERSION
+
+# The dashboard's vLLM column is rendered by push_vllm_stats, shared verbatim with
+# evaluate so both panels read identically. Never reimplement it here.
+from paperscale.vllm_stats import push_vllm_stats
 from paperscale.work_queue import DONE_FLAGS_DIR, WORKER_LOCKS_DIR, LocalBackend, WorkQueue
 
 # Initialize logger
@@ -721,7 +726,7 @@ def export_markdown_from_results(args) -> int:
     return written
 
 
-async def worker(args, work_queue: WorkQueue, worker_id):
+async def worker(args, work_queue: WorkQueue, worker_id, phase=None):
     while True:
         work_item = await work_queue.get_work()
 
@@ -785,6 +790,8 @@ async def worker(args, work_queue: WorkQueue, worker_id):
             )
 
             await work_queue.mark_done(work_item)
+            if phase is not None:
+                phase.advance()
         except Exception as e:
             logger.exception(f"Exception occurred while processing work_hash {work_item.hash}: {e}")
 
@@ -951,12 +958,50 @@ async def download_model(model_name_or_path: str, max_retries: int = 5):
             await asyncio.sleep(random.randrange(10, 30) * 2**retry)
 
 
-async def metrics_reporter(work_queue):
+async def metrics_reporter(work_queue, rep=None, stats=None, poller=None):
     while True:
-        logger.info(f"Queue remaining: {work_queue.size}")
-        logger.info("\n" + str(metrics))
-        logger.info("\n" + str(await tracker.get_status_table()))
+        if rep is None:
+            logger.info(f"Queue remaining: {work_queue.size}")
+            logger.info("\n" + str(metrics))
+            logger.info("\n" + str(await tracker.get_status_table()))
+        else:
+            totals = metrics.get_total_metrics()
+            rep.set_stat("queue", work_queue.size)
+            rep.set_stat("pages", f"{totals.get('completed_pages', 0):,}")
+            rep.set_stat("tokens", f"{totals.get('server_output_tokens', 0):,}")
+            rep.set_stat("retries", f"{count_retries(totals):,}")
+            _push_issue_stats(rep, totals)
+            push_vllm_stats(rep, stats, poller)
         await asyncio.sleep(10)
+
+
+def count_retries(totals: dict) -> int:
+    """Pages that needed more than one attempt.
+
+    MetricsKeeper records one dynamically-named counter per attempt index
+    (`finished_on_attempt_0`, `_1`, ...). That family is unbounded, so it is
+    collapsed into a single row here rather than given panel rows of its own.
+    """
+    retried = 0
+    for key, value in totals.items():
+        if key.startswith("finished_on_attempt_"):
+            suffix = key[len("finished_on_attempt_") :]
+            if suffix.isdigit() and int(suffix) > 0:
+                retried += value
+    return retried + totals.get("finished_on_parallel_retry", 0)
+
+
+def _push_issue_stats(rep, totals) -> None:
+    for key in ("docs_partial", "docs_discarded", "docs_crashed", "docs_missing", "blank_pages"):
+        rep.set_stat(key.replace("docs_", ""), f"{totals.get(key, 0):,}", group="issues")
+    # quality_reject_* is dynamically keyed -- one counter per verifier finding
+    # kind, unbounded at runtime. It must never drive panel height, so only the
+    # worst three get rows; the log file keeps the full breakdown.
+    rejects = sorted(((k, v) for k, v in totals.items() if k.startswith("quality_reject_")), key=lambda kv: -kv[1])
+    for key, value in rejects[:3]:
+        rep.set_stat(key.replace("quality_reject_", "rj "), f"{value:,}", group="issues")
+    if len(rejects) > 3:
+        rep.set_stat("rj +more", len(rejects) - 3, group="issues")
 
 
 def print_stats(args):
@@ -1120,6 +1165,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Write logs to disk, optionally specify a filename.",
     )
+    parser.add_argument("--tui", action="store_true", help="show a live progress dashboard (needs the 'tui' extra)")
+    parser.add_argument("--tui-poll-interval", type=float, default=5.0, help="seconds between vLLM /metrics scrapes for the dashboard")
 
     server_group = parser.add_argument_group("Server arguments")
     server_group.add_argument(
@@ -1135,6 +1182,87 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     vllm_group.add_argument("--port", type=int, default=30024, help="Port for the internal vLLM server.")
 
     return parser
+
+
+def _tui_log_path(workspace: str) -> str:
+    """Where logs go when the dashboard owns the screen."""
+    return os.path.join(workspace, "logs", f"run-{os.getpid()}.log")
+
+
+class _ReporterLogHandler(logging.Handler):
+    """Forward warnings and errors into the dashboard's event pane."""
+
+    def __init__(self, reporter) -> None:
+        super().__init__(level=logging.WARNING)
+        self._reporter = reporter
+        # Handlers this one displaced, restored verbatim by
+        # _restore_console_logging. They live here because the handler is the one
+        # object install and restore already share.
+        self.displaced: list[tuple[logging.Logger, logging.Handler]] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        # Logger.callHandlers already screens on self.level, but emit() is the
+        # public entry point a handler is judged on and it does no filtering of
+        # its own. The event pane holds a handful of rows; one INFO line that
+        # slipped in that way costs a warning the user needed to see.
+        if record.levelno < self.level:
+            return
+        try:
+            stamp = time.strftime("%H:%M:%S", time.localtime(record.created))
+            self._reporter.log(f"{stamp}  {record.levelname:<5} {record.getMessage()}")
+        except Exception:  # pragma: no cover - a logging handler must never raise
+            pass
+
+
+def _install_tui_logging(reporter, log_path: str | None) -> _ReporterLogHandler:
+    """Take stderr away from the loggers and give the pane the important lines.
+
+    Nothing may write to stderr underneath a live frame. Everything still lands in
+    the log file, because the alternate screen has no scrollback to recover from.
+
+    The root logger is handled too, and that is not belt-and-braces. `logger` and
+    `server_logger` are the only two carrying `console_handler`, but work_queue,
+    check, front_matter, filter and vllm_stats each own a handler-less module
+    logger that propagates to root -- and `paperscale.filter` calls
+    `logging.basicConfig()` at import, which puts a stderr StreamHandler there.
+    Left alone it prints straight through the frame. (vllm_stats is the sharpest
+    case: its "statistics unavailable" warning would corrupt the very panel it
+    feeds.) Root also has to keep at least one handler afterwards, or
+    `logging.lastResort` takes over and writes to stderr in its place.
+    """
+    root = logging.getLogger()
+    handler = _ReporterLogHandler(reporter)
+    for target, existing in [(logger, console_handler), (server_logger, console_handler), *((root, h) for h in list(root.handlers))]:
+        target.removeHandler(existing)
+        handler.displaced.append((target, existing))
+
+    # `logger` and `server_logger` both set propagate=False, so handlers on root
+    # cannot double-log their records.
+    targets = (logger, server_logger, root)
+    if log_path is not None:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        file_handler = logging.FileHandler(log_path, mode="a")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+        for target in targets:
+            target.addHandler(file_handler)
+    for target in targets:
+        target.addHandler(handler)
+    return handler
+
+
+def _restore_console_logging(tui_handler: _ReporterLogHandler) -> None:
+    """Undo _install_tui_logging's rewiring. Must run even when the run crashed.
+
+    The reporter handler comes off every logger it was added to, root included:
+    past the `with rep` block the reporter is dead, and anything still routed into
+    it is lost rather than printed. The file handler stays, matching how
+    --disk_logging behaves for the life of the process.
+    """
+    for target in (logger, server_logger, logging.getLogger()):
+        target.removeHandler(tui_handler)
+    for target, displaced in tui_handler.displaced:
+        target.addHandler(displaced)
 
 
 async def main():
@@ -1216,21 +1344,55 @@ async def main():
 
     await vllm_server_ready(args)
 
-    metrics_task = asyncio.create_task(metrics_reporter(work_queue))
+    from paperscale.tui import NullReporter, make_reporter
+    from paperscale.vllm_stats import VLLMStats, VLLMStatsPoller, metrics_url
 
-    worker_tasks = [asyncio.create_task(worker(args, work_queue, worker_id=i)) for i in range(args.workers)]
-    await asyncio.gather(*worker_tasks)
+    rep = make_reporter(args.tui, title=f"paperscale · {args.ocr_model_name}")
+    live = not isinstance(rep, NullReporter)
 
-    if vllm_server is not None:
-        vllm_server.cancel()
-    metrics_task.cancel()
+    stats = poller = tui_handler = None
+    if live:
+        if not args.disk_logging:
+            args.disk_logging = _tui_log_path(args.workspace)
+        tui_handler = _install_tui_logging(rep, args.disk_logging)
+        stats = VLLMStats()
+        poller = VLLMStatsPoller(metrics_url(args.server), stats, interval=args.tui_poll_interval)
+        poller.start()
 
-    tasks_to_wait: list[asyncio.Task] = [metrics_task]
-    if vllm_server is not None:
-        tasks_to_wait.append(vllm_server)
-    await asyncio.gather(*tasks_to_wait, return_exceptions=True)
+    try:
+        with rep:
+            rep.set_stat("workspace", args.workspace)
+            rep.set_stat("docs", f"0/{qsize}")
+            # Only the live reporter is asked for a phase. NullReporter.phase()
+            # prints a `[name]` header to stderr -- right for evaluate, which
+            # always printed one, but brand-new output here. --tui has to be
+            # invisible when off, so the phase stays None and both the worker
+            # advance and the done() below are guarded on it.
+            work_phase = rep.phase("work items", total=qsize) if live else None
+            metrics_task = asyncio.create_task(metrics_reporter(work_queue, rep if live else None, stats, poller))
+            worker_tasks = [asyncio.create_task(worker(args, work_queue, worker_id=i, phase=work_phase)) for i in range(args.workers)]
+            await asyncio.gather(*worker_tasks)
 
+            if vllm_server is not None:
+                vllm_server.cancel()
+            metrics_task.cancel()
+            tasks_to_wait: list[asyncio.Task] = [metrics_task]
+            if vllm_server is not None:
+                tasks_to_wait.append(vllm_server)
+            await asyncio.gather(*tasks_to_wait, return_exceptions=True)
+            if work_phase is not None:
+                work_phase.done()
+    finally:
+        if poller is not None:
+            poller.stop()
+        if tui_handler is not None:
+            _restore_console_logging(tui_handler)
+
+    # The alternate screen is gone by now, so the summary lands on the real
+    # screen. Without this a finished run leaves a bare prompt and no numbers.
     _log_final_metrics(args)
+    if live and args.disk_logging:
+        logger.info(f"Full log: {args.disk_logging}")
     logger.info("Work done")
 
 

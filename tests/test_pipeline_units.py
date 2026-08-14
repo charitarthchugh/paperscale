@@ -1,6 +1,7 @@
 """Tests for pure pipeline helpers (no server, no rendering)."""
 
 import errno
+import logging
 import os
 import tempfile
 import unittest
@@ -9,7 +10,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from paperscale import pipeline
-from paperscale.pipeline import PageResult, classify_document
+from paperscale.pipeline import PageResult, _build_arg_parser, _install_tui_logging, _tui_log_path, classify_document, count_retries
 from paperscale.prompts import PageResponse
 
 
@@ -222,6 +223,240 @@ class ClassifyDocumentTest(unittest.TestCase):
 
     def test_zero_pages_does_not_divide_by_zero(self):
         self.assertEqual(classify_document(0, 0, 0.004), "ok")
+
+
+class TuiLoggingTest(unittest.TestCase):
+    def setUp(self):
+        # _install_tui_logging rewires process-global loggers: it strips
+        # console_handler off two of them and attaches its own to three, root
+        # included. Left in place, every later test in the run would execute
+        # against a logger with no stderr handler -- and the resulting failure
+        # would surface somewhere unrelated, since pytest decides the ordering.
+        # Snapshot every handler list here and restore them exactly in tearDown.
+        self._saved_handlers = [(log, list(log.handlers)) for log in (pipeline.logger, pipeline.server_logger, logging.getLogger())]
+
+    def tearDown(self):
+        for log, handlers in self._saved_handlers:
+            log.handlers[:] = handlers
+
+    def test_log_path_lives_under_the_workspace(self):
+        path = _tui_log_path("/tmp/ws")
+        self.assertTrue(path.startswith("/tmp/ws/logs/run-"))
+        self.assertTrue(path.endswith(".log"))
+
+    def test_handler_forwards_warnings_to_the_reporter(self):
+        seen = []
+
+        class _Rep:
+            def log(self, message):
+                seen.append(message)
+
+        handler = _install_tui_logging(_Rep(), None)
+        record = logging.LogRecord("x", logging.WARNING, "f", 1, "disk is full", None, None)
+        handler.emit(record)
+        self.assertEqual(len(seen), 1)
+        self.assertIn("disk is full", seen[0])
+
+    def test_handler_ignores_info(self):
+        seen = []
+
+        class _Rep:
+            def log(self, message):
+                seen.append(message)
+
+        handler = _install_tui_logging(_Rep(), None)
+        handler.emit(logging.LogRecord("x", logging.INFO, "f", 1, "chatter", None, None))
+        self.assertEqual(seen, [])
+
+    def test_other_module_loggers_reach_the_pane_not_stderr(self):
+        """work_queue, check, filter and vllm_stats own no handlers of their own.
+
+        They propagate to root, where paperscale.filter's import-time
+        logging.basicConfig() left a stderr StreamHandler -- which prints straight
+        through the live frame. Root has to be taken over as well, and it must
+        keep a handler afterwards so logging.lastResort does not step in and write
+        to stderr instead.
+        """
+        seen = []
+
+        class _Rep:
+            def log(self, message):
+                seen.append(message)
+
+        root = logging.getLogger()
+        stderr_handler = logging.StreamHandler()
+        root.addHandler(stderr_handler)
+
+        _install_tui_logging(_Rep(), None)
+        self.assertNotIn(stderr_handler, root.handlers)
+        with mock.patch.object(logging, "lastResort") as last_resort:
+            logging.getLogger("paperscale.work_queue").warning("done flag failed")
+        self.assertEqual(len(seen), 1)
+        self.assertIn("done flag failed", seen[0])
+        last_resort.handle.assert_not_called()
+
+    def test_restore_puts_console_logging_back_everywhere(self):
+        root = logging.getLogger()
+        stderr_handler = logging.StreamHandler()
+        root.addHandler(stderr_handler)
+        root_before = list(root.handlers)
+
+        handler = _install_tui_logging(mock.Mock(), None)
+        pipeline._restore_console_logging(handler)
+
+        for log in (pipeline.logger, pipeline.server_logger):
+            self.assertIn(pipeline.console_handler, log.handlers)
+            self.assertNotIn(handler, log.handlers)
+        self.assertNotIn(handler, root.handlers)
+        self.assertEqual(sorted(map(id, root.handlers)), sorted(map(id, root_before)))
+
+
+class TuiFlagTest(unittest.TestCase):
+    def test_tui_defaults_off(self):
+        args = _build_arg_parser().parse_args(["/tmp/ws"])
+        self.assertFalse(args.tui)
+
+    def test_tui_flag_parses(self):
+        args = _build_arg_parser().parse_args(["/tmp/ws", "--tui"])
+        self.assertTrue(args.tui)
+
+    def test_poll_interval_default(self):
+        args = _build_arg_parser().parse_args(["/tmp/ws"])
+        self.assertEqual(args.tui_poll_interval, 5.0)
+
+
+class CountRetriesTest(unittest.TestCase):
+    def test_first_attempt_successes_are_not_retries(self):
+        self.assertEqual(count_retries({"finished_on_attempt_0": 500}), 0)
+
+    def test_later_attempts_count(self):
+        self.assertEqual(count_retries({"finished_on_attempt_0": 500, "finished_on_attempt_1": 30, "finished_on_attempt_2": 8}), 38)
+
+    def test_parallel_retries_included(self):
+        self.assertEqual(count_retries({"finished_on_attempt_1": 2, "finished_on_parallel_retry": 5}), 7)
+
+    def test_unrelated_metrics_ignored(self):
+        self.assertEqual(count_retries({"completed_pages": 900, "blank_pages": 3}), 0)
+
+    def test_non_numeric_suffix_ignored(self):
+        self.assertEqual(count_retries({"finished_on_attempt_parallel": 4}), 0)
+
+
+class NoTuiIsInvisibleTest(unittest.IsolatedAsyncioTestCase):
+    """Without --tui the run must behave exactly as it did before the dashboard.
+
+    Two things could leak. `NullReporter.phase()` prints a `[name]` header
+    straight to `sys.stderr` -- correct for evaluate, which always printed one,
+    but output this pipeline never produced. And `_install_tui_logging` strips
+    `console_handler`, which would silence stderr logging entirely. Neither may
+    happen on the default path, so this drives `main()` end to end with the
+    inference parts stubbed and asserts nothing reached `sys.stderr` directly and
+    both loggers still hold their original handlers.
+    """
+
+    async def test_default_run_writes_nothing_direct_to_stderr(self):
+        import contextlib
+        import io
+
+        before = [(log, list(log.handlers)) for log in (pipeline.logger, pipeline.server_logger)]
+        queue = mock.Mock()
+        queue.initialize_queue = mock.AsyncMock(return_value=3)
+        queue.size = 3
+
+        with tempfile.TemporaryDirectory() as ws:
+            argv = ["paperscale", ws, "--server", "http://example.invalid/v1", "--workers", "2"]
+            with (
+                mock.patch.object(pipeline.sys, "argv", argv),
+                mock.patch.object(pipeline, "check_poppler_version"),
+                mock.patch.object(pipeline, "WorkQueue", return_value=queue),
+                mock.patch.object(pipeline, "vllm_server_ready", new=mock.AsyncMock()),
+                mock.patch.object(pipeline, "worker", new=mock.AsyncMock()) as fake_worker,
+                mock.patch.object(pipeline, "metrics_reporter", new=mock.AsyncMock()) as fake_reporter,
+            ):
+                buf = io.StringIO()
+                with contextlib.redirect_stderr(buf):
+                    await pipeline.main()
+
+        # `[work items]` (or anything else) reaching sys.stderr means the reporter
+        # spoke on a path that used to be silent.
+        self.assertEqual(buf.getvalue(), "")
+        # The old-shaped call: no live reporter, so metrics_reporter keeps logging.
+        self.assertEqual(fake_reporter.await_args.args[1:], (None, None, None))
+        # worker() must be handed no phase, so it stays byte-identical to before.
+        self.assertEqual(fake_worker.await_count, 2)
+        for call in fake_worker.await_args_list:
+            self.assertIsNone(call.kwargs["phase"])
+        # stderr logging survived: console_handler never left either logger.
+        for log, handlers in before:
+            self.assertEqual(log.handlers, handlers)
+            self.assertIn(pipeline.console_handler, log.handlers)
+        # No log directory was conjured under the workspace either.
+        self.assertFalse(os.path.exists(os.path.join(ws, "logs")))
+
+
+class _FakeLiveReporter:
+    """A reporter that is not a NullReporter, so main() takes the live path."""
+
+    def __init__(self):
+        self.stats = {}
+        self.logs = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def phase(self, name, total=None):
+        return mock.Mock()
+
+    def log(self, message):
+        self.logs.append(message)
+
+    def set_stat(self, name, value, *, group="run"):
+        self.stats[(group, name)] = value
+
+
+class TuiCleanupTest(unittest.IsolatedAsyncioTestCase):
+    """A crash mid-run must not leave the process with no stderr logging."""
+
+    async def test_crash_still_stops_the_poller_and_restores_logging(self):
+        before = [(log, list(log.handlers)) for log in (pipeline.logger, pipeline.server_logger, logging.getLogger())]
+        self.addCleanup(lambda: [log.handlers.__setitem__(slice(None), h) for log, h in before])
+
+        queue = mock.Mock()
+        queue.initialize_queue = mock.AsyncMock(return_value=1)
+        queue.size = 1
+        poller = mock.Mock()
+        poller.available = False
+
+        async def boom(*a, **kw):
+            raise RuntimeError("worker exploded")
+
+        with tempfile.TemporaryDirectory() as ws:
+            argv = ["paperscale", ws, "--server", "http://example.invalid/v1", "--workers", "1", "--tui"]
+            with (
+                mock.patch.object(pipeline.sys, "argv", argv),
+                mock.patch.object(pipeline, "check_poppler_version"),
+                mock.patch.object(pipeline, "WorkQueue", return_value=queue),
+                mock.patch.object(pipeline, "vllm_server_ready", new=mock.AsyncMock()),
+                mock.patch.object(pipeline, "worker", new=boom),
+                mock.patch("paperscale.tui.make_reporter", return_value=_FakeLiveReporter()),
+                mock.patch("paperscale.vllm_stats.VLLMStatsPoller", return_value=poller),
+            ):
+                with self.assertRaises(RuntimeError):
+                    await pipeline.main()
+
+            log_dir = os.path.join(ws, "logs")
+            self.assertTrue(os.path.isdir(log_dir))
+            self.assertTrue(os.listdir(log_dir))
+
+        poller.start.assert_called_once()
+        poller.stop.assert_called_once()
+        # Every displaced handler is back, so a crashed run still logs to stderr.
+        for log, handlers in before:
+            for handler in handlers:
+                self.assertIn(handler, log.handlers)
 
 
 if __name__ == "__main__":
