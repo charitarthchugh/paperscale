@@ -35,7 +35,20 @@ CREATE TABLE IF NOT EXISTS textlayer_agreement (
 CREATE TABLE IF NOT EXISTS reject_rate (
     model TEXT, doc TEXT, fallback_pages INTEGER, total_pages INTEGER
 );
+CREATE TABLE IF NOT EXISTS eval_doc (
+    model TEXT, doc TEXT, phase TEXT, text_sha1 TEXT,
+    UNIQUE(model, doc, phase)
+);
 """
+
+# Resume phases -> (table, columns). The phase name is what `eval_doc` records and
+# what the CLI passes to done_docs(); keeping the mapping here is what lets one
+# generic per-doc writer serve every metric.
+_PHASE_TABLES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "corrections": ("correction_rate", ("model", "doc", "page", "correction_rate", "uncorrectable_rate")),
+    "garbage": ("garbage_fraction", ("model", "doc", "page", "score")),
+    "textlayer": ("textlayer_agreement", ("model", "doc", "page", "bow_f1", "one_minus_ned")),
+}
 
 _PPLX_COLS = (
     "n_tokens_raw",
@@ -118,6 +131,156 @@ class EvalDB:
         self._replace(
             "reject_rate", rows, ("model", "doc", "fallback_pages", "total_pages")
         )
+
+    # --- resume bookkeeping ----------------------------------------------
+    #
+    # Which (model, doc, phase) triples are complete. Row presence in a metric
+    # table cannot answer this: textlayer legitimately writes zero rows for a
+    # blank-layer or fallback doc after already paying for its pdftotext calls.
+    # The checksum is over the doc's page texts, so re-OCR'ing a run under the
+    # same label invalidates exactly the docs whose output changed.
+
+    def mark_doc_done(self, model: str, doc: str, phase: str, text_sha1: str) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO eval_doc (model, doc, phase, text_sha1) VALUES (?, ?, ?, ?)",
+            (model, doc, phase, text_sha1),
+        )
+        self.conn.commit()
+
+    def write_doc(self, phase: str, model: str, doc: str, rows, text_sha1: str) -> None:
+        """Replace one doc's rows for ``phase`` and mark it done -- atomically.
+
+        The row write and the done-mark share one transaction on purpose: a doc
+        marked done with no rows behind it would make the next run skip work that
+        never happened. ``rows`` may be empty (a doc whose pages were all skipped).
+        Commits per doc, so an interrupted phase keeps every doc that finished.
+        """
+        table, cols = _PHASE_TABLES[phase]
+        placeholders = ", ".join("?" * len(cols))
+        with self.conn:  # commit on success, roll back on any exception
+            self.conn.execute(f"DELETE FROM {table} WHERE model = ? AND doc = ?", (model, doc))
+            self.conn.executemany(
+                f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders})", list(rows)
+            )
+            self.conn.execute(
+                "INSERT OR REPLACE INTO eval_doc (model, doc, phase, text_sha1) VALUES (?, ?, ?, ?)",
+                (model, doc, phase, text_sha1),
+            )
+
+    def done_docs(self, model: str, phase: str, checksums: dict[str, str]) -> set[str]:
+        """Docs of ``model`` whose ``phase`` is complete AND whose text is unchanged.
+
+        ``checksums`` maps doc -> checksum for the run as just loaded; a doc absent
+        from it (deleted PDF) is never reported done.
+        """
+        cur = self.conn.execute(
+            "SELECT doc, text_sha1 FROM eval_doc WHERE model = ? AND phase = ?",
+            (model, phase),
+        )
+        return {doc for doc, sha in cur.fetchall() if checksums.get(doc) == sha}
+
+    # Metric tables keyed by a plain `model` column. peer_agreement is handled
+    # separately everywhere below: it also has a `peer` column, and a row is stale
+    # if EITHER side of the pair is rescored.
+    _MODEL_TABLES = ("correction_rate", "garbage_fraction", "textlayer_agreement",
+                     "reject_rate", "eval_doc")
+
+    def clear_model(self, model: str) -> None:
+        """Forget everything cached for one label (backs ``--no-resume``)."""
+        with self.conn:
+            for table in self._MODEL_TABLES:
+                self.conn.execute(f"DELETE FROM {table} WHERE model = ?", (model,))
+            self.conn.execute(
+                "DELETE FROM peer_agreement WHERE model = ? OR peer = ?", (model, model)
+            )
+        self.clear_pplx(model)
+
+    def prune_missing_docs(self, model: str, keep: set[str]) -> None:
+        """Drop rows for docs no longer present in this model's run.
+
+        Without this a PDF you deleted from the workspace keeps contributing to the
+        leaderboard's per-doc means forever.
+        """
+        placeholders = ", ".join("?" * len(keep))
+        keep_list = list(keep)
+        # "NOT IN ()" is invalid SQL, so an empty keep-set means delete everything.
+        cond = f"doc NOT IN ({placeholders})" if keep else "1"
+        with self.conn:
+            for table in self._MODEL_TABLES:
+                self.conn.execute(f"DELETE FROM {table} WHERE model = ? AND {cond}", (model, *keep_list))
+            self.conn.execute(
+                f"DELETE FROM peer_agreement WHERE (model = ? OR peer = ?) AND {cond}",
+                (model, model, *keep_list),
+            )
+
+    def mark_docs_done(self, rows) -> None:
+        """Batch form of `mark_doc_done` -- ``[(model, doc, phase, text_sha1), ...]``
+        in one transaction. The peer phase re-marks every doc on every run, so a
+        commit per doc would cost one fsync per doc even on a pure no-op."""
+        rows = list(rows)
+        if not rows:
+            return
+        with self.conn:
+            self.conn.executemany(
+                "INSERT OR REPLACE INTO eval_doc (model, doc, phase, text_sha1) VALUES (?, ?, ?, ?)",
+                rows,
+            )
+
+    def clear_peer_docs(self, pairs) -> None:
+        """Drop every peer row touching ``model`` on ``doc``, for each ``(model, doc)``.
+
+        Both directions go: a pair scored against the old text is stale whether this
+        model is the row's ``model`` or its ``peer``. One transaction for the batch --
+        this runs over every doc on every run, so per-doc commits would cost one
+        fsync per doc even when nothing changed.
+        """
+        pairs = list(pairs)
+        if not pairs:
+            return
+        with self.conn:
+            self.conn.executemany(
+                "DELETE FROM peer_agreement WHERE doc = ? AND (model = ? OR peer = ?)",
+                [(doc, model, model) for model, doc in pairs],
+            )
+
+    def marked_docs(self, model: str, phase: str) -> set[str]:
+        """Docs with any checksum record for ``phase``, matching or not.
+
+        Unlike `done_docs` this ignores the checksum value; it exists to spot rows
+        written before eval_doc did (see the pplx adoption in the CLI).
+        """
+        cur = self.conn.execute(
+            "SELECT doc FROM eval_doc WHERE model = ? AND phase = ?", (model, phase)
+        )
+        return {r[0] for r in cur.fetchall()}
+
+    def append_peer_agreement(self, rows) -> None:
+        """Insert peer rows WITHOUT deleting existing ones.
+
+        Resume computes only the missing pairs, so `_replace`'s delete-by-model
+        would destroy exactly the pairs being reused.
+        """
+        rows = list(rows)
+        if not rows:
+            return
+        with self.conn:
+            self.conn.executemany(
+                "INSERT INTO peer_agreement (model, peer, doc, page, bow_f1, one_minus_ned)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+
+    def stored_peer_pairs(self) -> dict[tuple[str, int], set[tuple[str, str]]]:
+        """``{(doc, page): {(model, peer), ...}}`` for every peer row on disk.
+
+        Peer agreement resumes off these rows rather than off eval_doc: it always
+        writes a row for what it scores, so row presence is a truthful record.
+        """
+        out: dict[tuple[str, int], set[tuple[str, str]]] = {}
+        cur = self.conn.execute("SELECT doc, page, model, peer FROM peer_agreement")
+        for doc, page, model, peer in cur.fetchall():
+            out.setdefault((doc, page), set()).add((model, peer))
+        return out
 
     def _ensure_pplx_table(self, model: str) -> str:
         table = _pplx_table(model)

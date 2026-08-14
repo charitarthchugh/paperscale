@@ -84,20 +84,51 @@ def one_minus_ned(a: str, b: str) -> float:
     return Levenshtein.normalized_similarity(na, nb)
 
 
-def peer_rows_for_page(item: tuple[tuple[str, int], dict[str, str]]) -> list[tuple]:
-    """Peer-agreement DB rows for one page: ``((doc, page), {model: text})`` ->
+def missing_peer_pairs(
+    models: list[str], stored: set[tuple[str, str]]
+) -> list[tuple[str, str]]:
+    """Which unordered model pairs on one page still need scoring.
+
+    Peer agreement is the one metric that resumes on the *pair* rather than the
+    doc: adding a third run leaves a-b valid but needs a-c and b-c. The stored
+    peer_agreement rows are their own bookkeeping here (no eval_doc entry) --
+    unlike textlayer, this metric always writes rows for what it computes, so
+    row presence is a truthful record of what is done.
+
+    ``models``  models present on this page, in any order.
+    ``stored``  directed ``(model, peer)`` pairs already in the DB for this page.
+    Returns sorted ``(m, peer)`` tuples with ``m < peer``, so the caller gets a
+    deterministic work list and each unordered pair appears at most once.
+    """
+    ordered = sorted(models)
+    missing: list[tuple[str, str]] = []
+    for i, m in enumerate(ordered):
+        for peer in ordered[i + 1:]:
+            # Both directions must be present. A half-written pair would let the
+            # leaderboard average m's score against peer while peer has no matching
+            # row, skewing peer's mean; recomputing re-emits both and self-heals.
+            if (m, peer) not in stored or (peer, m) not in stored:
+                missing.append((m, peer))
+    return missing
+
+
+def peer_rows_for_page(
+    item: tuple[tuple[str, int], dict[str, str], list[tuple[str, str]]],
+) -> list[tuple]:
+    """Peer-agreement DB rows for one page:
+    ``((doc, page), {model: text}, [(m, peer), ...])`` ->
     ``[(model, peer, doc, page, bow_f1, one_minus_ned), ...]``.
 
-    Both metrics are symmetric, so each unordered pair is computed once and
-    emitted in both directions. Top-level so it pickles into worker processes.
+    The caller supplies the pairs to score (see `missing_peer_pairs`) so a resumed
+    run recomputes only what is absent. Both metrics are symmetric, so each pair is
+    computed once and emitted in both directions. Top-level so it pickles into
+    worker processes.
     """
-    (doc, page), by_model = item
-    models = sorted(by_model)
+    (doc, page), by_model, pairs = item
     rows: list[tuple] = []
-    for i, m in enumerate(models):
-        for peer in models[i + 1:]:
-            f1 = bow_f1(by_model[m], by_model[peer])
-            ned = one_minus_ned(by_model[m], by_model[peer])
-            rows.append((m, peer, doc, page, f1, ned))
-            rows.append((peer, m, doc, page, f1, ned))
+    for m, peer in pairs:
+        f1 = bow_f1(by_model[m], by_model[peer])
+        ned = one_minus_ned(by_model[m], by_model[peer])
+        rows.append((m, peer, doc, page, f1, ned))
+        rows.append((peer, m, doc, page, f1, ned))
     return rows

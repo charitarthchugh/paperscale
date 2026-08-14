@@ -30,6 +30,30 @@ class TextLayerTest(unittest.TestCase):
         textlayer._pdf_exists = self._orig_exists
         textlayer.get_anchor_text = self._orig_anchor
 
+    def test_on_doc_fires_once_per_doc_with_that_docs_rows(self):
+        # Per-doc commits: the caller persists each doc as it finishes, so an
+        # interrupted text-layer phase keeps the docs already extracted.
+        pages = [
+            _page(doc="/x/a.pdf", page=1), _page(doc="/x/a.pdf", page=2),
+            _page(doc="/x/b.pdf", page=1),
+        ]
+        metas = [_meta(doc="/x/a.pdf"), _meta(doc="/x/b.pdf")]
+        seen = []
+        textlayer.compute_textlayer_agreement(
+            pages, metas, on_doc=lambda model, doc, rows: seen.append((model, doc, len(rows)))
+        )
+        self.assertEqual(seen, [("m", "/x/a.pdf", 2), ("m", "/x/b.pdf", 1)])
+
+    def test_on_doc_fires_for_a_skipped_doc_with_no_rows(self):
+        # A doc whose PDF is missing produces no rows but IS complete -- the caller
+        # must still record it, or it gets re-attempted on every run.
+        textlayer._pdf_exists = lambda p: False
+        seen = []
+        textlayer.compute_textlayer_agreement(
+            [_page()], [_meta()], on_doc=lambda model, doc, rows: seen.append((model, doc, len(rows)))
+        )
+        self.assertEqual(seen, [("m", "/x/a.pdf", 0)])
+
     def test_fallback_doc_skipped(self):
         rows, rep = textlayer.compute_textlayer_agreement([_page()], [_meta(fallback=3)])
         self.assertEqual(rows, [])
