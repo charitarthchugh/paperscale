@@ -310,7 +310,17 @@ def format_rate(value: float | None) -> str:
 # pipeline's first tick fires before the poller's first scrape completes, and
 # nothing ever overwrote that row again. A fixed row set makes the panel
 # self-consistent in both directions by construction rather than by care.
-_VLLM_ROWS = ("status", "gen", "prompt", "kv hit", "running")
+#
+# Values are also kept short on purpose, and the reason is a width budget rather
+# than taste. At 80 columns -- the commonest pane, and the default -- the three
+# stat groups split the pane three ways, leaving each panel 22 cells of content.
+# The key column takes the widest label (`running`, 7) plus 2 of padding, so a
+# value has 13 cells. The original single-row form, `6.1k tok/s  (avg 5.9k)`, is
+# 22 and starved the key column down to 3: every label rendered as `st...`,
+# `gen`, `pr...`, `kv...`, `ru...`, which surfaced neither the throughput nor the
+# hit rate the panel exists for. Splitting the averages onto one shared row costs
+# a single extra row of height and keeps every value inside 13 cells.
+_VLLM_ROWS = ("status", "gen", "prompt", "avg g/p", "kv hit", "running")
 
 
 def push_vllm_stats(rep, stats: "VLLMStats | None", poller: "VLLMStatsPoller | None") -> None:
@@ -330,10 +340,12 @@ def push_vllm_stats(rep, stats: "VLLMStats | None", poller: "VLLMStatsPoller | N
         rates = stats.rates()
         values = {
             "status": "live",
-            "gen": f"{format_rate(rates.gen_tps)} tok/s  (avg {format_rate(rates.gen_tps_avg)})",
-            "prompt": f"{format_rate(rates.prompt_tps)} tok/s  (avg {format_rate(rates.prompt_tps_avg)})",
+            "gen": f"{format_rate(rates.gen_tps)} tok/s",
+            "prompt": f"{format_rate(rates.prompt_tps)} tok/s",
+            # gen / prompt, in the order of the two rows immediately above.
+            "avg g/p": f"{format_rate(rates.gen_tps_avg)} / {format_rate(rates.prompt_tps_avg)}",
             "kv hit": "-" if rates.kv_hit is None else f"{rates.kv_hit:.0%}",
-            "running": f"{rates.running or 0:.0f}   wait {rates.waiting or 0:.0f}",
+            "running": f"{rates.running or 0:.0f}  wait {rates.waiting or 0:.0f}",
         }
     for row in _VLLM_ROWS:
         rep.set_stat(row, values[row], group="vllm")

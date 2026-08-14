@@ -419,6 +419,52 @@ class CountDocumentsTest(unittest.TestCase):
         self.assertEqual(count_documents({}), 0)
 
 
+class FinalMetricsSummaryTest(unittest.TestCase):
+    """The document outcomes have to survive the run, and only this prints them.
+
+    Under `--tui`, `metrics_reporter` takes the reporter branch and never logs
+    `str(metrics)`, so the periodic table never reaches the log file either, and
+    the alternate screen takes the dashboard down on exit. The summary is the last
+    place the partial-vs-discarded split -- the number that says whether
+    `--max_page_error_rate` suits a corpus -- can be recovered from.
+    """
+
+    def _summary_lines(self, total_metrics):
+        with mock.patch.object(pipeline, "metrics") as metrics:
+            metrics.get_metrics_summary.return_value = {
+                "elapsed_time_seconds": 42.5,
+                "rates": {},
+                "total_metrics": total_metrics,
+            }
+            with self.assertLogs(pipeline.logger, level="INFO") as caught:
+                pipeline._log_final_metrics(SimpleNamespace())
+        return "\n".join(caught.output)
+
+    def test_every_document_outcome_is_reported(self):
+        text = self._summary_lines(
+            {
+                "docs_ok": 1108,
+                "docs_partial": 74,
+                "docs_discarded": 19,
+                "docs_crashed": 3,
+                "docs_missing": 2,
+                "completed_pages": 12048,
+                "failed_pages": 31,
+            }
+        )
+        self.assertIn("Documents ok: 1,108", text)
+        self.assertIn("Documents partial: 74", text)
+        self.assertIn("Documents discarded: 19", text)
+        self.assertIn("Documents crashed: 3", text)
+        self.assertIn("Documents missing: 2", text)
+
+    def test_absent_counters_report_zero_rather_than_vanishing(self):
+        # A missing row reads as "not measured"; the counters are always measured.
+        text = self._summary_lines({"completed_pages": 10})
+        for key in pipeline._DOC_OUTCOMES:
+            self.assertIn(f"Documents {key.replace('docs_', '')}: 0", text)
+
+
 class _FakeLiveReporter:
     """A reporter that is not a NullReporter, so main() takes the live path."""
 

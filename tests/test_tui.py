@@ -10,19 +10,21 @@ from unittest import mock
 
 from paperscale.evaluation.runs import DocMeta, PageText
 from paperscale.evaluation.textlayer import compute_textlayer_agreement
-from paperscale.tui import (  # noqa: F401
+from paperscale.pipeline import _push_issue_stats
+from paperscale.tui import (
     MAX_EVENT_ROWS,
     MAX_LOG_HISTORY,
-    Budget,
     NullReporter,
     RenderStyle,
     RichReporter,
+    _elapsed,
     _layout_budget,
     install_tui_logging,
     make_reporter,
     restore_console_logging,
     terminal_profile,
 )
+from paperscale.vllm_stats import _VLLM_ROWS, Snapshot, VLLMStats, push_vllm_stats
 
 
 class _FakeTTY(io.StringIO):
@@ -211,13 +213,95 @@ def _frame_lines(rep, console) -> list[str]:
     return _ANSI.sub("", cap.get()).rstrip("\n").split("\n")
 
 
+def _panel_slice(lines: list[str], title: str) -> str:
+    """Just the named stat panel's own columns, as text.
+
+    The stat row is three panels side by side, so a whole-frame `assertIn` would
+    pass on a `gen` that had been crushed to `ge` as long as some neighbouring
+    panel happened to contain the substring. Slicing to the panel's column range
+    keeps the assertion about the panel it names.
+    """
+    for top, line in enumerate(lines):
+        start = line.find(f"╭─ {title} ")
+        if start == -1:
+            continue
+        end = line.index("╮", start) + 1
+        rows = []
+        for row in lines[top:]:
+            rows.append(row[start:end])
+            if rows[-1].startswith("╰"):
+                break
+        return "\n".join(rows)
+    raise AssertionError(f"no {title!r} panel in frame:\n" + "\n".join(lines))
+
+
+class _StepClock:
+    """Deterministic monotonic clock for VLLMStats. Advance with `tick`."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def tick(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _live_vllm_stats() -> VLLMStats:
+    """A `VLLMStats` whose `rates()` are the size a real vLLM server produces.
+
+    Built from Snapshots and read back through the production code rather than
+    hand-written, so nothing here can drift from what `push_vllm_stats` formats.
+    Windowed: 6120 gen tok/s, 6210 prompt tok/s, 93% cache hits, 12 running.
+    Since-start: 5900 and 5850.
+    """
+    clock = _StepClock()
+    stats = VLLMStats(clock=clock)
+    stats.add(Snapshot(generation_tokens=0.0, prompt_tokens=0.0, cache_hits=0.0, cache_queries=0.0, running=0.0, waiting=0.0))
+    clock.tick(100.0)
+    stats.add(Snapshot(generation_tokens=587_800.0, prompt_tokens=581_400.0, cache_hits=92_000.0, cache_queries=100_000.0, running=12.0, waiting=3.0))
+    clock.tick(10.0)
+    stats.add(Snapshot(generation_tokens=649_000.0, prompt_tokens=643_500.0, cache_hits=92_930.0, cache_queries=101_000.0, running=12.0, waiting=3.0))
+    return stats
+
+
+# A plausible end-of-run MetricsKeeper total. The `quality_reject_*` keys are the
+# real verifier finding kinds -- `truncation_indicator` and friends are long, and
+# a fixture with short ones would understate how wide the issues column gets.
+_PIPELINE_TOTALS = {
+    "docs_ok": 1108,
+    "docs_partial": 74,
+    "docs_discarded": 19,
+    "docs_crashed": 3,
+    "docs_missing": 0,
+    "blank_pages": 1288,
+    "quality_reject_repeated_ngram": 412,
+    "quality_reject_truncation_indicator": 96,
+    "quality_reject_repeated_character": 51,
+    "quality_reject_malformed_frontmatter": 7,
+}
+
+
 class FixedHeightRenderTest(unittest.TestCase):
     def _populate(self, rep):
-        rep.set_stat("docs", "142/500")
-        rep.set_stat("pages", "1204/2900")
-        rep.set_stat("gen", "412 tok/s", group="vllm")
-        rep.set_stat("kv hit", "93%", group="vllm")
-        rep.set_stat("partial", 7, group="issues")
+        """The panel the pipeline actually draws, pushed by the pipeline's own code.
+
+        Every render assertion below is only worth the width of the values it is
+        given. The vllm column was previously seeded with `"412 tok/s"` and
+        `"93%"` while `push_vllm_stats` shipped 22-character values, so the tests
+        exercised a panel about a third of its real width and never saw the key
+        column starve. Both group writers are therefore called here rather than
+        imitated: a fixture that cannot be written by hand cannot drift.
+        """
+        rep.set_stat("workspace", "/mnt/data/paperscale/legal-corpus-2026")
+        rep.set_stat("docs", "1,204")
+        rep.set_stat("queue", 88)
+        rep.set_stat("pages", "12,048")
+        rep.set_stat("tokens", "9,412,003")
+        rep.set_stat("retries", "31")
+        push_vllm_stats(rep, _live_vllm_stats(), None)
+        _push_issue_stats(rep, _PIPELINE_TOTALS)
         for name in ("register runs", "corrections", "text-layer", "perplexity"):
             rep.phase(name, total=10)
         for i in range(20):
@@ -233,6 +317,61 @@ class FixedHeightRenderTest(unittest.TestCase):
             self.assertLessEqual(len(lines), height, f"{width}x{height} too tall")
             for line in lines:
                 self.assertLessEqual(len(line), width, f"{width}x{height} line too wide: {line!r}")
+
+    def test_frame_fits_every_pane_across_the_size_range(self):
+        # Three sample sizes cannot stand in for the invariant. Panel counts change
+        # at width 60, the stat/bar/event sections drop out one at a time as height
+        # falls, and the widths where a column starts truncating differ per section
+        # -- so the sweep is over both axes, at every height a section changes at.
+        for width in (20, 39, 40, 59, 60, 61, 80, 100, 132, 200):
+            for height in range(1, 41):
+                console, _ = _SizedConsole.make(width, height)
+                rep = RichReporter("paperscale", console=console)
+                self._populate(rep)
+                lines = _frame_lines(rep, console)
+                self.assertLessEqual(len(lines), height, f"{width}x{height} too tall")
+                self.assertLessEqual(max(len(line) for line in lines), width, f"{width}x{height} too wide")
+
+    def test_vllm_panel_is_legible_at_eighty_columns(self):
+        """80 columns is the default pane, and the panel has to be readable there.
+
+        It was not: `push_vllm_stats` emitted 22-character values, which left the
+        key column about 3 cells and rendered every label as `st...`, `gen`,
+        `pr...`, `kv...`, `ru...`. The feature exists to surface live throughput
+        and the prefix-cache hit rate, so the assertion is on the numbers being
+        whole, not merely on the frame fitting.
+        """
+        console, _ = _SizedConsole.make(80, 24)
+        rep = RichReporter("paperscale", console=console)
+        self._populate(rep)
+        panel = _panel_slice(_frame_lines(rep, console), "vllm")
+        for label in _VLLM_ROWS:
+            self.assertIn(label, panel, f"vllm label {label!r} truncated at 80 columns")
+        for value in ("live", "6.1k tok/s", "6.2k tok/s", "5.9k / 5.8k", "93%", "12  wait 3"):
+            self.assertIn(value, panel, f"vllm value {value!r} truncated at 80 columns")
+        self.assertNotIn("…", panel, "the vllm panel still truncates at 80 columns")
+
+    def test_header_shows_elapsed_time_on_the_title_row(self):
+        console, _ = _SizedConsole.make(80, 24)
+        rep = RichReporter("paperscale", console=console)
+        rep._start -= 3725.0  # 01:02:05 ago
+        self._populate(rep)
+        header = _frame_lines(rep, console)[0]
+        self.assertTrue(header.startswith("paperscale"), header)
+        self.assertTrue(header.rstrip().endswith("elapsed 01:02:05"), header)
+        self.assertEqual(len(header), 80)
+
+    def test_header_stays_one_row_when_the_title_outgrows_the_pane(self):
+        # HEADER_ROWS is 1 and every other section is budgeted around that, so a
+        # title that wrapped would push the frame a row past the pane.
+        long_title = "paperscale - " + "allenai/olmOCR-2-7B-1025-FP8-preview " * 4
+        for width in (20, 40, 80, 200):
+            console, _ = _SizedConsole.make(width, 24)
+            rep = RichReporter(long_title, console=console)
+            self._populate(rep)
+            lines = _frame_lines(rep, console)
+            self.assertLessEqual(len(lines[0]), width, f"width {width}: header too wide")
+            self.assertLessEqual(len(lines), 24, f"width {width}: header wrapped")
 
     def test_budget_recomputed_between_renders(self):
         # Regression test for pane zoom and detach/reattach.
@@ -262,14 +401,18 @@ class FixedHeightRenderTest(unittest.TestCase):
         # The reporter is pure instrumentation: it must never take down the run
         # it reports on. Against a genuinely ascii-encoded stderr a stray U+2026
         # raises UnicodeEncodeError out of console.print, into the caller.
+        # 80x24 is in the sweep on purpose: the escape that reached a user was a
+        # plain default-sized pane, where the *key* column -- the one that had no
+        # `overflow` -- was the only thing narrow enough to ellipsize.
         from rich.console import Console
 
-        stream = io.TextIOWrapper(io.BytesIO(), encoding="ascii", newline="")
-        console = Console(file=stream, force_terminal=True, width=20, height=24)
-        rep = RichReporter("paperscale", console=console)
-        self._populate(rep)
-        console.print(rep.__rich__())  # must not raise UnicodeEncodeError
-        stream.flush()
+        for width in (20, 30, 40, 60, 80, 120):
+            stream = io.TextIOWrapper(io.BytesIO(), encoding="ascii", newline="")
+            console = Console(file=stream, force_terminal=True, width=width, height=24)
+            rep = RichReporter("paperscale", console=console)
+            self._populate(rep)
+            console.print(rep.__rich__())  # must not raise UnicodeEncodeError
+            stream.flush()
 
     def test_grouped_stats_render_under_their_own_heading(self):
         console, _ = _SizedConsole.make(120, 30)
@@ -278,7 +421,7 @@ class FixedHeightRenderTest(unittest.TestCase):
         text = "\n".join(_frame_lines(rep, console))
         self.assertIn("vllm", text)
         self.assertIn("issues", text)
-        self.assertIn("412 tok/s", text)
+        self.assertIn("6.1k tok/s", text)
 
     def test_long_stat_values_keep_the_group_panels_on_one_row(self):
         # rich.columns.Columns re-flows panels onto extra rows as soon as their
@@ -289,8 +432,7 @@ class FixedHeightRenderTest(unittest.TestCase):
             console, _ = _SizedConsole.make(width, 24)
             rep = RichReporter("paperscale", console=console)
             rep.set_stat("documents", "1204/2900")
-            rep.set_stat("gen", "6210 tok/s  (avg 5900)", group="vllm")
-            rep.set_stat("prompt", "6210 tok/s  (avg 5900)", group="vllm")
+            push_vllm_stats(rep, _live_vllm_stats(), None)
             rep.set_stat("partial", "7 of 500 pages", group="issues")
             rep.phase("scoring", total=10)
             rep.log("an event")
@@ -340,6 +482,21 @@ class FixedHeightRenderTest(unittest.TestCase):
                     console.print(rep._bars(bar_rows))
                 lines = _ANSI.sub("", cap.get()).rstrip("\n").split("\n")
                 self.assertEqual(len(lines), bar_rows, f"w={width} bar_rows={bar_rows}: {lines!r}")
+
+
+class ElapsedTest(unittest.TestCase):
+    def test_formats_hours_minutes_seconds(self):
+        self.assertEqual(_elapsed(0), "00:00:00")
+        self.assertEqual(_elapsed(59.9), "00:00:59")
+        self.assertEqual(_elapsed(3725), "01:02:05")
+
+    def test_hours_keep_counting_past_a_day(self):
+        # `time.gmtime` would wrap here and restart an overnight run's clock at
+        # 00:00:00, which is inside the range an OCR run reaches.
+        self.assertEqual(_elapsed(26 * 3600 + 61), "26:01:01")
+
+    def test_negative_clock_drift_is_clamped(self):
+        self.assertEqual(_elapsed(-5), "00:00:00")
 
 
 class SetStatGroupTest(unittest.TestCase):

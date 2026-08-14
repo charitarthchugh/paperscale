@@ -5,7 +5,7 @@ import unittest
 from unittest import mock
 
 from paperscale.vllm_stats import (
-    Rates,  # noqa: F401
+    _VLLM_ROWS,
     Snapshot,
     VLLMStats,
     VLLMStatsPoller,
@@ -339,13 +339,18 @@ class FormatRateTest(unittest.TestCase):
         self.assertEqual(format_rate(6100.0), "6.1k")
 
 
+# The unavailable branch, derived from `_VLLM_ROWS` rather than restated: a row
+# added to the panel must show up here as `-` without anyone remembering to.
+_ALL_BLANK = dict.fromkeys(_VLLM_ROWS, "-") | {"status": "unavailable"}
+
+
 class PushVllmStatsTest(unittest.TestCase):
     def test_unavailable_poller_blanks_the_rates(self):
         rep = _RecordingRep()
         poller = VLLMStatsPoller("http://x/metrics", self.stats_obj(), fetch=lambda url: "")
         poller.available = False
         push_vllm_stats(rep, self.stats_obj(), poller)
-        self.assertEqual(rep.stats["vllm"], {"status": "unavailable", "gen": "-", "prompt": "-", "kv hit": "-", "running": "-"})
+        self.assertEqual(rep.stats["vllm"], _ALL_BLANK)
 
     def test_transitions_leave_no_stale_rows(self):
         """unavailable -> available -> unavailable, with nothing surviving a step.
@@ -379,10 +384,10 @@ class PushVllmStatsTest(unittest.TestCase):
         # 3. Down again. The rates must not linger as though they were current.
         poller.available = False
         push_vllm_stats(rep, stats, poller)
-        self.assertEqual(rep.stats["vllm"], {"status": "unavailable", "gen": "-", "prompt": "-", "kv hit": "-", "running": "-"})
+        self.assertEqual(rep.stats["vllm"], _ALL_BLANK)
 
         # The row set is identical at every step, so no key can outlive a change.
-        self.assertEqual(set(rep.stats["vllm"]), {"status", "gen", "prompt", "kv hit", "running"})
+        self.assertEqual(set(rep.stats["vllm"]), set(_VLLM_ROWS))
 
     def test_populates_all_rows_when_available(self):
         clock = _FakeClock()

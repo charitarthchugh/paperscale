@@ -90,6 +90,19 @@ def _one_line(text) -> str:
     return " ".join(str(text).splitlines())
 
 
+def _elapsed(seconds: float) -> str:
+    """`HH:MM:SS` for the header clock, hand-rolled rather than via ``strftime``.
+
+    ``time.gmtime`` wraps at 24 hours, which is inside the range this reports on:
+    an overnight OCR run would restart the clock at 00:00:00 and read as though it
+    had just begun. Hours simply keep counting here.
+    """
+    whole = max(int(seconds), 0)
+    hours, rest = divmod(whole, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
 class _RichPhase:
     def __init__(self, reporter: "RichReporter", task_id: int, total: int | None) -> None:
         self._reporter = reporter
@@ -126,6 +139,9 @@ class RichReporter:
         self._overflow = "crop" if self._style.ascii_only else "ellipsis"
         self._stats: dict[str, dict[str, object]] = {}
         self._log: list[str] = []
+        # Wall-clock start for the header's elapsed counter. Monotonic, so a
+        # daylight-saving jump or an ntp step cannot make the run look shorter.
+        self._start = time.monotonic()
         self._progress = Progress(
             SpinnerColumn(self._style.spinner),
             # TextColumn normally supplies its own Column(no_wrap=True); handing it a
@@ -192,13 +208,12 @@ class RichReporter:
         from rich.console import Group
         from rich.panel import Panel
         from rich.table import Table
-        from rich.text import Text
 
         width, height = self._console.size.width, self._console.size.height
         n_stats = max((len(v) for v in self._stats.values()), default=0)
         budget = _layout_budget(height, n_stats, len(self._progress.tasks))
 
-        rows = [Text(self._title, style="bold", no_wrap=True, overflow=self._overflow)]
+        rows = [self._header()]
 
         if budget.stat_rows and self._stats:
             rows.append(self._stat_columns(budget.stat_rows, width))
@@ -211,6 +226,26 @@ class RichReporter:
                 body.add_row(line)
             rows.append(Panel(body, title="events", title_align="left", box=self._style.box, height=budget.event_rows + PANEL_CHROME))
         return Group(*rows)
+
+    def _header(self):
+        """Title on the left, elapsed time on the right, in exactly HEADER_ROWS rows.
+
+        A grid rather than one padded ``Text``: the clock has to stay pinned to the
+        last column of the pane as it resizes, and `justify="right"` on an expanding
+        column does that without measuring anything. Both columns are ``no_wrap``
+        with an explicit overflow, so a title longer than the pane truncates instead
+        of wrapping the clock onto a second row -- the header budget is one row and
+        the whole frame is sized around it.
+        """
+        from rich.table import Table
+        from rich.text import Text
+
+        grid = Table.grid(expand=True)
+        grid.add_column(no_wrap=True, overflow=self._overflow)
+        grid.add_column(no_wrap=True, overflow=self._overflow, justify="right")
+        clock = f"elapsed {_elapsed(time.monotonic() - self._start)}"
+        grid.add_row(Text(self._title, style="bold"), Text(clock, style="dim"))
+        return grid
 
     def _stat_columns(self, stat_rows: int, width: int):
         """Render each stat group as its own column.
@@ -234,7 +269,14 @@ class RichReporter:
         panels = []
         for group in order:
             grid = Table.grid(padding=(0, 2))
-            grid.add_column(style="cyan", justify="right", no_wrap=True)
+            # Both columns, not just the value: rich's per-column default is
+            # `ellipsis`, which truncates with U+2026 whatever the console encoding
+            # says. A key column left on the default raised UnicodeEncodeError out
+            # of console.print on an ascii-encoded stderr at 80x24 -- the pipeline's
+            # own default stat rows crush `status` to `st...` there. Every
+            # `add_column`/`Column(...)` in this module carries `overflow` for that
+            # reason; treat one without it as a bug.
+            grid.add_column(style="cyan", justify="right", no_wrap=True, overflow=self._overflow)
             grid.add_column(style="bold white", no_wrap=True, overflow=self._overflow)
             for key, value in list(self._stats[group].items())[:stat_rows]:
                 grid.add_row(_one_line(key), _one_line(value))
@@ -244,7 +286,7 @@ class RichReporter:
             panels = panels[:1]
         row = Table.grid(expand=True)
         for _ in panels:
-            row.add_column(ratio=1)
+            row.add_column(ratio=1, overflow=self._overflow)
         row.add_row(*panels)
         return row
 

@@ -110,12 +110,14 @@ file and only warnings appear in the event pane:
 The path is printed once the frame is gone, since the alternate screen keeps no
 scrollback.
 
-- `PAPERSCALE_TUI_ASCII=1` — force ASCII borders, bars, and spinner. Use this if
-  your terminal font renders box-drawing or braille characters as blanks or
-  boxes. Font coverage cannot be detected: a UTF-8 locale says nothing about
-  whether the rendering font has a braille block, and under tmux `TERM`
-  describes tmux rather than the outer terminal, so the font actually drawing
-  the glyphs is invisible from inside.
+- `PAPERSCALE_TUI_ASCII=1` — force ASCII panel borders, spinner, and truncation
+  marker. Use this if your terminal font renders box-drawing or braille
+  characters as blanks or boxes. Font coverage cannot be detected: a UTF-8 locale
+  says nothing about whether the rendering font has a braille block, and under
+  tmux `TERM` describes tmux rather than the outer terminal, so the font actually
+  drawing the glyphs is invisible from inside. The progress bar is the one thing
+  this does not reach — `rich` picks its bar glyphs from the stream's own
+  encoding, so the bar goes ASCII only when stderr is not a UTF-8 stream.
 - `PAPERSCALE_TUI_ASCII=0` — force rich glyphs when detection is over-cautious
   (an ASCII-declared stream on a terminal that draws them fine).
 - `--tui-poll-interval` — seconds between `/metrics` scrapes (default 5).

@@ -1022,8 +1022,12 @@ def count_retries(totals: dict) -> int:
 
 
 def _push_issue_stats(rep, totals) -> None:
+    # Labels are the metric key with its `docs_` prefix dropped and any remaining
+    # underscore spelled as a space, so `blank_pages` reads like its siblings
+    # rather than as a raw counter name. Every value is a formatted string; a bare
+    # int would render unpunctuated next to thousands-separated neighbours.
     for key in ("docs_partial", "docs_discarded", "docs_crashed", "docs_missing", "blank_pages"):
-        rep.set_stat(key.replace("docs_", ""), f"{totals.get(key, 0):,}", group="issues")
+        rep.set_stat(key.replace("docs_", "").replace("_", " "), f"{totals.get(key, 0):,}", group="issues")
     # quality_reject_* is dynamically keyed -- one counter per verifier finding
     # kind, unbounded at runtime. It must never drive panel height, so only the
     # worst three get rows; the log file keeps the full breakdown.
@@ -1031,7 +1035,7 @@ def _push_issue_stats(rep, totals) -> None:
     for key, value in rejects[:3]:
         rep.set_stat(key.replace("quality_reject_", "rj "), f"{value:,}", group="issues")
     if len(rejects) > 3:
-        rep.set_stat("rj +more", len(rejects) - 3, group="issues")
+        rep.set_stat("rj +more", f"{len(rejects) - 3:,}", group="issues")
 
 
 def print_stats(args):
@@ -1371,6 +1375,14 @@ def _log_final_metrics(args) -> None:
     logger.info(f"Total Server Output tokens: {total_metrics.get('server_output_tokens', 0):,}")
     logger.info(f"Completed pages: {total_metrics.get('completed_pages', 0):,}")
     logger.info(f"Failed pages: {total_metrics.get('failed_pages', 0):,}")
+    # The document outcomes, and this is their only surviving record. Under --tui
+    # `metrics_reporter` takes the reporter branch and never logs `str(metrics)`,
+    # so the periodic table is absent from the log file, and the alternate screen
+    # takes the dashboard with it on exit. Without these lines the partial-vs-
+    # discarded split -- the number that says whether --max_page_error_rate suits
+    # a corpus -- is unrecoverable once the run ends.
+    for key in _DOC_OUTCOMES:
+        logger.info(f"{key.replace('docs_', 'Documents ')}: {total_metrics.get(key, 0):,}")
 
     completed = total_metrics.get("completed_pages", 0)
     failed = total_metrics.get("failed_pages", 0)
