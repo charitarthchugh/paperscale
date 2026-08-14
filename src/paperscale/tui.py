@@ -16,6 +16,7 @@ driving them must never change a caller's output.
 from __future__ import annotations
 
 import sys
+from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 
@@ -182,3 +183,77 @@ def make_reporter(tui: bool, *, title: str, stream=None) -> ProgressReporter:
     except ImportError as exc:  # pragma: no cover - env-dependent
         raise SystemExit("--tui requires the 'tui' extra: poetry install --extras tui") from exc
     return RichReporter(title)
+
+
+# --------------------------------------------------------------------------- #
+# Height budget
+# --------------------------------------------------------------------------- #
+# The original renderer never measured the terminal: _render() referenced
+# console.size nowhere, so frame height tracked run state instead of the pane it
+# was drawn into, and Rich fell back to re-emitting whole frames that scrolled.
+# Everything below exists to make height a measured input.
+HEADER_ROWS = 1
+PANEL_CHROME = 2  # top and bottom border of a bordered panel
+MIN_STAT_ROWS, MIN_BAR_ROWS, MIN_EVENT_ROWS = 3, 1, 2
+MAX_EVENT_ROWS = 8
+
+
+@dataclass(frozen=True)
+class Budget:
+    stat_rows: int
+    bar_rows: int
+    event_rows: int
+
+    def total_rows(self) -> int:
+        return HEADER_ROWS + _cost(self.stat_rows, self.bar_rows, self.event_rows)
+
+
+def _cost(stat_rows: int, bar_rows: int, event_rows: int) -> int:
+    stats = stat_rows + PANEL_CHROME if stat_rows else 0
+    events = event_rows + PANEL_CHROME if event_rows else 0
+    return stats + bar_rows + events
+
+
+def _layout_budget(height: int, n_stats: int, n_phases: int) -> Budget:
+    """Split `height` rows so the frame is exactly the height of the terminal.
+
+    Recomputed on every render, never cached: tmux panes change size on split,
+    zoom, and detach/reattach, and a cached budget would reintroduce the original
+    overflow the first time a pane was zoomed.
+
+    Starvation order: events go first, then stats. Bars never go -- a dashboard
+    with no progress indicator tells you nothing.
+    """
+    available = max(int(height), 1) - HEADER_ROWS
+    if available < MIN_BAR_ROWS:
+        return Budget(0, max(available, 0), 0)
+
+    stat_rows, bar_rows, event_rows = MIN_STAT_ROWS, MIN_BAR_ROWS, MIN_EVENT_ROWS
+    if _cost(stat_rows, bar_rows, event_rows) > available:
+        event_rows = 0
+    if _cost(stat_rows, bar_rows, event_rows) > available:
+        stat_rows = 0
+    if _cost(stat_rows, bar_rows, event_rows) > available:
+        return Budget(0, available, 0)
+
+    surplus = available - _cost(stat_rows, bar_rows, event_rows)
+    grown = min(surplus, max(n_phases - bar_rows, 0))
+    bar_rows += grown
+    surplus -= grown
+    if event_rows:
+        grown = min(surplus, MAX_EVENT_ROWS - event_rows)
+        event_rows += grown
+        surplus -= grown
+    if stat_rows:
+        grown = min(surplus, max(n_stats - stat_rows, 0))
+        stat_rows += grown
+        surplus -= grown
+
+    # Whatever is left pads a section so the frame fills the pane exactly.
+    if event_rows:
+        event_rows += surplus
+    elif stat_rows:
+        stat_rows += surplus
+    else:
+        bar_rows += surplus
+    return Budget(stat_rows, bar_rows, event_rows)
