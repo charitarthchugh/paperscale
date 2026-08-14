@@ -4,8 +4,10 @@ Two implementations back the same tiny interface:
 
 - ``NullReporter`` — the default. Emits phase headers and ``log`` lines to
   stderr as plain text (matching pre-TUI behaviour) and does nothing fancy.
-- ``RichReporter`` — an immich-go-style live dashboard (header + stats table +
-  per-phase progress bars + a scrolling log tail), rendered with ``rich.Live``.
+- ``RichReporter`` — an immich-go-style live dashboard (header + grouped stat
+  columns + per-phase progress bars + an event tail), rendered with
+  ``rich.Live``. Its frame is sized to the terminal on every tick, so it never
+  outgrows the pane and forces ``Live`` to scroll instead of overwrite.
 
 Use ``make_reporter`` to pick one. Both are context managers and expose the
 same ``phase`` / ``log`` / ``set_stat`` surface, so callers (evaluate today, the
@@ -33,7 +35,7 @@ class ProgressReporter(Protocol):
     def __exit__(self, *exc) -> None: ...
     def phase(self, name: str, total: int | None = None) -> Phase: ...
     def log(self, message: str) -> None: ...
-    def set_stat(self, name: str, value) -> None: ...
+    def set_stat(self, name: str, value, *, group: str = "run") -> None: ...
 
 
 # --------------------------------------------------------------------------- #
@@ -63,13 +65,24 @@ class NullReporter:
     def log(self, message: str) -> None:
         print(message, file=sys.stderr)
 
-    def set_stat(self, name: str, value) -> None:
+    def set_stat(self, name: str, value, *, group: str = "run") -> None:
         pass
 
 
 # --------------------------------------------------------------------------- #
 # Rich implementation (immich-go style dashboard)
 # --------------------------------------------------------------------------- #
+def _one_line(text) -> str:
+    """Flatten a caller-supplied string to one display row.
+
+    ``no_wrap`` stops rich wrapping, but an embedded newline still splits a cell
+    into two rows. The stat and event panels are height-clamped so they only lose
+    content, but the bar region has no panel around it and would push the frame
+    past the pane -- the exact failure this renderer exists to prevent.
+    """
+    return " ".join(str(text).splitlines())
+
+
 class _RichPhase:
     def __init__(self, reporter: "RichReporter", task_id: int, total: int | None) -> None:
         self._reporter = reporter
@@ -77,8 +90,9 @@ class _RichPhase:
         self._total = total
 
     def advance(self, n: int = 1) -> None:
+        # No refresh here. The old code re-rendered on every page, which on a
+        # multi-thousand-page run meant thousands of forced frames fighting Live.
         self._reporter._progress.advance(self._task_id, n)
-        self._reporter._refresh()
 
     def done(self) -> None:
         if self._total is None:
@@ -86,24 +100,35 @@ class _RichPhase:
             self._reporter._progress.update(self._task_id, total=1, completed=1)
         else:
             self._reporter._progress.update(self._task_id, completed=self._total)
-        self._reporter._refresh()
 
 
 class RichReporter:
-    """Live dashboard: header + stats table + phase bars + log tail."""
+    """Fixed-height live dashboard: header, stat columns, phase bars, event tail."""
 
-    def __init__(self, title: str, *, console=None, max_log: int = 8) -> None:
+    def __init__(self, title: str, *, console=None, style: "RenderStyle | None" = None) -> None:
+        import os
+
         from rich.console import Console
         from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+        from rich.table import Column
 
         self._title = title
         self._console = console or Console(stderr=True)
-        self._max_log = max_log
-        self._stats: dict[str, object] = {}
+        encoding = getattr(self._console.file, "encoding", "utf-8")
+        self._style = style or terminal_profile(encoding, dict(os.environ))
+        # Rich truncates with U+2026 regardless of console.options.ascii_only, so
+        # the fallback has to be chosen here rather than left to rich.
+        self._overflow = "crop" if self._style.ascii_only else "ellipsis"
+        self._stats: dict[str, dict[str, object]] = {}
         self._log: list[str] = []
         self._progress = Progress(
-            SpinnerColumn(),
-            TextColumn("[bold]{task.description}"),
+            SpinnerColumn(self._style.spinner),
+            # TextColumn normally supplies its own Column(no_wrap=True); handing it a
+            # table_column to set `overflow` replaces that default wholesale, so
+            # no_wrap has to be restated. Omitting it wraps two long phase names into
+            # nine rows at width 40 and blows the budget -- and rich wraps rather than
+            # overflows, so only a row count catches it, never a width assertion.
+            TextColumn("[bold]{task.description}", table_column=Column(no_wrap=True, overflow=self._overflow)),
             BarColumn(),
             MofNCompleteColumn(),
             TimeElapsedColumn(),
@@ -115,69 +140,135 @@ class RichReporter:
     def __enter__(self) -> "RichReporter":
         from rich.live import Live
 
-        self._live = Live(self._render(), console=self._console, refresh_per_second=12, transient=False)
+        # Passing `self` (not a snapshot) means __rich__ runs on every tick, so the
+        # budget is recomputed per frame -- required for tmux pane resizes.
+        self._live = Live(
+            self,
+            console=self._console,
+            screen=self._style.use_screen,
+            auto_refresh=True,
+            refresh_per_second=self._style.refresh_per_second,
+            transient=False,
+        )
         self._live.__enter__()
         return self
 
     def __exit__(self, *exc) -> None:
         if self._live is not None:
-            self._refresh()
             self._live.__exit__(*exc)
             self._live = None
 
     # -- reporter surface ---------------------------------------------------- #
     def phase(self, name: str, total: int | None = None) -> Phase:
-        task_id = self._progress.add_task(name, total=total)
-        self._refresh()
-        return _RichPhase(self, task_id, total)
+        return _RichPhase(self, self._progress.add_task(_one_line(name), total=total), total)
 
     def log(self, message: str) -> None:
-        self._log.append(message)
-        if len(self._log) > self._max_log:
-            self._log = self._log[-self._max_log :]
-        self._refresh()
+        # Retention is deliberately larger than MAX_EVENT_ROWS: that constant is a
+        # growth target for the budget, not a cap, so a tall pane asks for far more
+        # rows than 8 and would otherwise get blank ones.
+        self._log.append(_one_line(message))
+        if len(self._log) > MAX_LOG_HISTORY:
+            self._log = self._log[-MAX_LOG_HISTORY:]
 
-    def set_stat(self, name: str, value) -> None:
-        self._stats[name] = value
-        self._refresh()
+    def set_stat(self, name: str, value, *, group: str = "run") -> None:
+        self._stats.setdefault(group, {})[name] = value
 
     # -- rendering ----------------------------------------------------------- #
-    def _refresh(self) -> None:
-        if self._live is not None:
-            self._live.update(self._render())
+    def __rich__(self):
+        return self._render()
 
     def _render(self):
+        from rich.console import Group
+        from rich.panel import Panel
+        from rich.table import Table
+        from rich.text import Text
+
+        width, height = self._console.size.width, self._console.size.height
+        n_stats = max((len(v) for v in self._stats.values()), default=0)
+        budget = _layout_budget(height, n_stats, len(self._progress.tasks))
+
+        rows = [Text(self._title, style="bold", no_wrap=True, overflow=self._overflow)]
+
+        if budget.stat_rows and self._stats:
+            rows.append(self._stat_columns(budget.stat_rows, width))
+        if budget.bar_rows:
+            rows.append(self._bars(budget.bar_rows))
+        if budget.event_rows:
+            body = Table.grid()
+            body.add_column(no_wrap=True, overflow=self._overflow)
+            for line in self._log[-budget.event_rows :]:
+                body.add_row(line)
+            rows.append(Panel(body, title="events", title_align="left", box=self._style.box, height=budget.event_rows + PANEL_CHROME))
+        return Group(*rows)
+
+    def _stat_columns(self, stat_rows: int, width: int):
+        """Render each stat group as its own column.
+
+        Columns are cheap and rows are scarce, which is the whole reason the
+        layout is horizontal. Below 60 columns there is no width left to divide,
+        so only the first group is drawn.
+
+        The row is a grid rather than ``rich.columns.Columns``: Columns re-flows
+        panels onto extra rows once their combined minimum width exceeds the pane
+        (15 rows instead of 5 at width 60 with realistic vLLM values), which is
+        precisely the overflow this renderer exists to prevent. A grid keeps one
+        row and crushes the columns instead.
+        """
         from rich.panel import Panel
         from rich.table import Table
 
-        stats = Table.grid(padding=(0, 2))
-        stats.add_column(style="cyan", justify="right")
-        stats.add_column(style="bold white")
-        for k, v in self._stats.items():
-            stats.add_row(str(k), str(v))
+        order = [g for g in ("run", "vllm", "issues") if g in self._stats]
+        order += [g for g in self._stats if g not in order]
 
-        log_body = "\n".join(self._log) if self._log else "…"
+        panels = []
+        for group in order:
+            grid = Table.grid(padding=(0, 2))
+            grid.add_column(style="cyan", justify="right", no_wrap=True)
+            grid.add_column(style="bold white", no_wrap=True, overflow=self._overflow)
+            for key, value in list(self._stats[group].items())[:stat_rows]:
+                grid.add_row(_one_line(key), _one_line(value))
+            panels.append(Panel(grid, title=group, title_align="left", box=self._style.box, height=stat_rows + PANEL_CHROME))
 
-        outer = Table.grid(expand=True)
-        outer.add_row(Panel(stats, title=self._title, title_align="left"))
-        outer.add_row(self._progress)
-        outer.add_row(Panel(log_body, title="events", title_align="left", height=self._max_log + 2))
-        return outer
+        if width < 60:
+            panels = panels[:1]
+        row = Table.grid(expand=True)
+        for _ in panels:
+            row.add_column(ratio=1)
+        row.add_row(*panels)
+        return row
+
+    def _bars(self, bar_rows: int):
+        """Show the most recent `bar_rows` phases, noting anything hidden."""
+        from rich.console import Group
+        from rich.text import Text
+
+        tasks = self._progress.tasks
+        if len(tasks) <= bar_rows:
+            return self._progress.make_tasks_table(tasks)
+        shown = tasks[-(bar_rows - 1) :] if bar_rows > 1 else []
+        more = Text(f" +{len(tasks) - len(shown)} more", style="dim", no_wrap=True, overflow=self._overflow)
+        if not shown:
+            return more
+        return Group(self._progress.make_tasks_table(shown), more)
 
 
 # --------------------------------------------------------------------------- #
 # Factory
 # --------------------------------------------------------------------------- #
 def make_reporter(tui: bool, *, title: str, stream=None) -> ProgressReporter:
-    """Pick a reporter. RichReporter only when --tui is on AND output is a TTY.
+    """Pick a reporter. RichReporter only when --tui is on AND output is a usable TTY.
 
     Raises a clear error if --tui is requested but ``rich`` isn't installed.
     """
+    import os
+
     stream = stream if stream is not None else sys.stderr
     if not tui:
         return NullReporter()
     if not getattr(stream, "isatty", lambda: False)():
         return NullReporter()  # piped/redirected — keep output clean
+    if (os.environ.get("TERM") or "").lower() == "dumb":
+        return NullReporter()  # no cursor control to drive a live frame
     try:
         import rich  # noqa: F401
     except ImportError as exc:  # pragma: no cover - env-dependent
@@ -196,6 +287,11 @@ HEADER_ROWS = 1
 PANEL_CHROME = 2  # top and bottom border of a bordered panel
 MIN_STAT_ROWS, MIN_BAR_ROWS, MIN_EVENT_ROWS = 3, 1, 2
 MAX_EVENT_ROWS = 8
+# `_layout_budget` treats MAX_EVENT_ROWS as a growth target, not a cap: events
+# absorb the leftover surplus, so a 60-row pane hands the panel ~48 rows.
+# Retention has to be decoupled from that target, or a tall pane would draw a
+# few log lines padded out with blank rows.
+MAX_LOG_HISTORY = 200
 
 
 @dataclass(frozen=True)
