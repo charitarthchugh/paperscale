@@ -225,10 +225,14 @@ class EvaluatePplxPanelTest(unittest.TestCase):
 
     def test_panel_and_issues_are_pushed_as_docs_complete(self):
         def fake_score(pages, *, on_doc=None, progress=None, **kwargs):
+            # Faithful to production: score_run_pplx returns the docs it scored.
+            # Returning {} here would look like every doc had failed.
+            scored = {}
             for doc in sorted({p.doc for p in pages}):
                 on_doc(doc, [])
                 progress(doc)
-            return {}
+                scored[doc] = []
+            return scored
 
         rep = _FakeLiveReporter()
         poller = mock.Mock(available=False)
@@ -262,6 +266,54 @@ class EvaluatePplxPanelTest(unittest.TestCase):
         self.assertEqual(rep.stats[("vllm", "status")], "unavailable")
         self.assertEqual(rep.stats[("vllm", "gen")], "-")
         self.assertEqual(rep.stats[("issues", "skipped")], 0)
+        # Every doc scored, so the failure row exists and reads zero.
+        self.assertEqual(rep.stats[("issues", "failed")], 0)
+
+    def test_docs_that_exhaust_their_retries_reach_the_issues_column(self):
+        """A doc that gives up in _handle_doc_failure is simply absent from the
+        returned mapping -- it is never written, so a later run retries it. The
+        issues column is the only place that absence becomes visible during a run."""
+
+        def fake_score(pages, *, on_doc=None, progress=None, **kwargs):
+            docs = sorted({p.doc for p in pages})
+            scored = {}
+            for i, doc in enumerate(docs):
+                # First doc exhausts its retry budget: pplx still advances progress
+                # (the phase total counted it) but never calls on_doc for it.
+                if i == 0:
+                    progress(doc)
+                    continue
+                on_doc(doc, [])
+                progress(doc)
+                scored[doc] = []
+            return scored
+
+        rep = _FakeLiveReporter()
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            run = write_run(
+                base / "good",
+                [make_dolma_record("/docs/a.pdf", CLEAN), make_dolma_record("/docs/b.pdf", CLEAN)],
+            )
+            argv = [
+                "evaluate",
+                "--run",
+                f"good={run}",
+                "--db",
+                str(base / "eval.sqlite"),
+                "--tui",
+                "--pplx",
+                "--pplx-model",
+                "scorer",
+            ]
+            with (
+                mock.patch("paperscale.tui.make_reporter", return_value=rep),
+                mock.patch("paperscale.evaluation.pplx.score_run_pplx", fake_score),
+                mock.patch("paperscale.vllm_stats.VLLMStatsPoller", return_value=mock.Mock(available=False)),
+            ):
+                self.assertEqual(main(argv), 0)
+
+        self.assertEqual(rep.stats[("issues", "failed")], 1)
 
     def test_no_poller_without_pplx(self):
         rep = _FakeLiveReporter()

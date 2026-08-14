@@ -366,13 +366,18 @@ def _handle_evaluate(args: argparse.Namespace) -> int:
                 # can take minutes, and an empty vllm column reads as a broken one.
                 push_vllm_stats(rep, stats, poller)
 
+                # Seeded before the loop so the row exists from the first frame: a
+                # column that grows a new row mid-run reads as something breaking.
+                failed_docs = 0
+                rep.set_stat("failed", failed_docs, group="issues")
+
                 def scored(doc: str, label: str, ph=ph) -> None:
                     ph.advance()
                     rep.log(f"pplx {label}: {doc}")
                     push_vllm_stats(rep, stats, poller)
 
                 for label, pages in pplx_todo.items():
-                    score_run_pplx(
+                    scored_docs = score_run_pplx(
                         pages,
                         pplx_url=args.pplx_url,
                         pplx_model=args.pplx_model,
@@ -389,6 +394,12 @@ def _handle_evaluate(args: argparse.Namespace) -> int:
                         # dashboard's callback wins here over the plain one.
                         progress=lambda doc, label=label: scored(doc, label),
                     )
+                    # score_run_pplx returns only the docs it managed to score. A doc
+                    # that exhausted its retry budget is dropped by _handle_doc_failure
+                    # and deliberately left unwritten so a later run retries it -- its
+                    # absence here is the only in-run signal that it happened.
+                    failed_docs += len({p.doc for p in pages}) - len(scored_docs)
+                    rep.set_stat("failed", failed_docs, group="issues")
                 ph.done()
 
         leaderboard = db.leaderboard()
