@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from paperscale import pipeline
-from paperscale.pipeline import PageResult
+from paperscale.pipeline import PageResult, classify_document
 from paperscale.prompts import PageResponse
 
 
@@ -133,9 +133,7 @@ class FdExhaustionBackoffTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(pipeline, "try_single_page", fake_try),
             mock.patch.object(pipeline.asyncio, "sleep", new=mock.AsyncMock()) as sleep,
         ):
-            result = await pipeline.try_single_page_with_backoff(
-                SimpleNamespace(), "doc.pdf", 1, attempt=0, image_base64="x", render_is_blank=False
-            )
+            result = await pipeline.try_single_page_with_backoff(SimpleNamespace(), "doc.pdf", 1, attempt=0, image_base64="x", render_is_blank=False)
 
         # The page recovers without ever returning a failure (None) to the caller,
         # so process_page's per-page retry budget is untouched.
@@ -152,9 +150,31 @@ class FdExhaustionBackoffTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(pipeline.asyncio, "sleep", new=mock.AsyncMock()),
         ):
             with self.assertRaises(SystemExit):
-                await pipeline.try_single_page_with_backoff(
-                    SimpleNamespace(), "doc.pdf", 1, attempt=0, image_base64="x", render_is_blank=False
-                )
+                await pipeline.try_single_page_with_backoff(SimpleNamespace(), "doc.pdf", 1, attempt=0, image_base64="x", render_is_blank=False)
+
+
+class ClassifyDocumentTest(unittest.TestCase):
+    def test_no_fallback_pages_is_ok(self):
+        self.assertEqual(classify_document(10, 0, 0.004), "ok")
+
+    def test_some_fallback_under_threshold_is_partial(self):
+        # 1/1000 = 0.001 <= 0.004: ships degraded.
+        self.assertEqual(classify_document(1000, 1, 0.004), "partial")
+
+    def test_fallback_over_threshold_is_discarded(self):
+        # 9/12 = 0.75 > 0.004: dropped.
+        self.assertEqual(classify_document(12, 9, 0.004), "discarded")
+
+    def test_boundary_is_inclusive_of_partial(self):
+        # Exactly at the rate is not "exceeding", matching the original
+        # `> max_page_error_rate` comparison.
+        self.assertEqual(classify_document(1000, 4, 0.004), "partial")
+
+    def test_permissive_rate_keeps_everything(self):
+        self.assertEqual(classify_document(10, 10, 1.0), "partial")
+
+    def test_zero_pages_does_not_divide_by_zero(self):
+        self.assertEqual(classify_document(0, 0, 0.004), "ok")
 
 
 if __name__ == "__main__":

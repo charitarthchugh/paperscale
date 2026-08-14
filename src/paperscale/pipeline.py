@@ -347,9 +347,7 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
     # Render the page once; the same image is sent on every retry attempt.
     try:
         async with pdf_render_max_workers_limit:
-            image_base64 = await asyncio.to_thread(
-                render_pdf_to_base64png, pdf_local_path, page_num, target_longest_image_dim=args.target_longest_image_dim
-            )
+            image_base64 = await asyncio.to_thread(render_pdf_to_base64png, pdf_local_path, page_num, target_longest_image_dim=args.target_longest_image_dim)
     except Exception:
         logger.exception(f"Failed to render {pdf_orig_path}-{page_num}, using fallback")
         metrics.add_metrics(failed_pages=1)
@@ -375,10 +373,7 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
         remaining = list(range(i + 1, MAX_RETRIES))
         if remaining and vllm_queued_requests == 0:
             logger.info(f"Queue empty, firing {len(remaining)} parallel retries for {pdf_orig_path}-{page_num}")
-            tasks = [
-                asyncio.create_task(try_single_page_with_backoff(args, pdf_orig_path, page_num, a, image_base64, render_is_blank))
-                for a in remaining
-            ]
+            tasks = [asyncio.create_task(try_single_page_with_backoff(args, pdf_orig_path, page_num, a, image_base64, render_is_blank)) for a in remaining]
             for coro in asyncio.as_completed(tasks):
                 try:
                     parallel_result = await coro
@@ -522,6 +517,20 @@ async def process_tarball(args, worker_id: int, tarball_path: str) -> list:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def classify_document(num_pages: int, num_fallback_pages: int, max_page_error_rate: float) -> str:
+    """Classify a document's outcome from its fallback-page count.
+
+    Returns "ok" (clean), "partial" (ships with degraded pages), or "discarded"
+    (over the error rate, dropped). The partial/discarded split is what tells you
+    whether --max_page_error_rate suits a corpus.
+    """
+    if num_pages <= 0:
+        return "ok"
+    if num_fallback_pages / num_pages > max_page_error_rate:
+        return "discarded"
+    return "partial" if num_fallback_pages > 0 else "ok"
+
+
 async def process_single_pdf(args, worker_id: int, pdf_orig_path: str, local_pdf_path: str):
     """Process a single PDF that's already on disk. Returns a Dolma document or None."""
     try:
@@ -549,20 +558,23 @@ async def process_single_pdf(args, worker_id: int, pdf_orig_path: str, local_pdf
         assert all(page_result.is_valid for page_result in page_results)
 
         num_fallback_pages = sum(page_result.is_fallback for page_result in page_results)
+        outcome = classify_document(num_pages, num_fallback_pages, args.max_page_error_rate)
+        metrics.add_metrics(**{f"docs_{outcome}": 1})
 
-        if num_fallback_pages / num_pages > args.max_page_error_rate:
+        if outcome == "discarded":
             logger.error(
                 f"Document {pdf_orig_path} has {num_fallback_pages} fallback pages out of {num_pages} exceeding "
                 f"max_page_error_rate of {args.max_page_error_rate}, discarding document."
             )
             return None
-        elif num_fallback_pages > 0:
+        if outcome == "partial":
             logger.warning(
                 f"Document {pdf_orig_path} processed with {num_fallback_pages} fallback pages out of {num_pages}, proceeding to build Dolma document."
             )
 
         return build_dolma_document(pdf_orig_path, page_results)
     except Exception as e:
+        metrics.add_metrics(docs_crashed=1)
         logger.exception(f"Exception in process_single_pdf for {pdf_orig_path}: {e}")
         return None
 
@@ -570,6 +582,7 @@ async def process_single_pdf(args, worker_id: int, pdf_orig_path: str, local_pdf
 async def process_pdf(args, worker_id: int, pdf_orig_path: str):
     """Process a single local PDF/image path and return a Dolma document."""
     if not os.path.exists(pdf_orig_path):
+        metrics.add_metrics(docs_missing=1)
         logger.info(f"File not found, skipping it completely {pdf_orig_path}")
         return None
 
@@ -971,18 +984,18 @@ Result files: {len(result_files):,}
 
 Results:
 Total documents processed: {d:,}
-Total pages on fallback: {totals['fallback_pages']:,}
+Total pages on fallback: {totals["fallback_pages"]:,}
 Total pages processed: {p:,}
 
-Total input tokens: {totals['input_tokens']:,}
+Total input tokens: {totals["input_tokens"]:,}
 Total output tokens: {o:,}
 
 Average pages per doc: {p / max(1, d):,.1f}
 Average output tokens per doc: {o / max(1, d):,.1f}
 Average output tokens per page: {o / max(1, p):,.1f}
 
-Long Context Documents (>{LONG_CONTEXT_THRESHOLD} tokens): {totals['long_docs']:,}
-Total tokens in long context documents: {totals['long_tokens']:,}"""
+Long Context Documents (>{LONG_CONTEXT_THRESHOLD} tokens): {totals["long_docs"]:,}
+Total tokens in long context documents: {totals["long_tokens"]:,}"""
     )
 
 
@@ -1069,8 +1082,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--apply_filter", action="store_true", help="Apply basic English/non-spam/non-form PDF filtering.")
     parser.add_argument("--stats", action="store_true", help="Report workspace statistics instead of running any job.")
     parser.add_argument("--markdown", action="store_true", help="Also write per-document Markdown mirroring the input folder structure.")
-    parser.add_argument("--export-markdown", dest="export_markdown", action="store_true", help="Regenerate Markdown from existing results/*.jsonl (no inference) and exit. Use to recover Markdown from an already-processed workspace.")
-    parser.add_argument("--target_longest_image_dim", type=int, default=None, help="Longest-side dimension for rendered page images (default: per-model — 1288 for markdown/olmocr, 1540 for lightonocr2).")
+    parser.add_argument(
+        "--export-markdown",
+        dest="export_markdown",
+        action="store_true",
+        help="Regenerate Markdown from existing results/*.jsonl (no inference) and exit. Use to recover Markdown from an already-processed workspace.",
+    )
+    parser.add_argument(
+        "--target_longest_image_dim",
+        type=int,
+        default=None,
+        help="Longest-side dimension for rendered page images (default: per-model — 1288 for markdown/olmocr, 1540 for lightonocr2).",
+    )
     parser.add_argument("--guided_decoding", action="store_true", help="Enable guided decoding when the model adapter provides a regex.")
 
     resume_group = parser.add_mutually_exclusive_group()
@@ -1087,7 +1110,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
 
     server_group = parser.add_argument_group("Server arguments")
-    server_group.add_argument("--server", type=str, help="URL of an external OpenAI-compatible server (e.g. http://host:port/v1). Skips the internal vLLM server.")
+    server_group.add_argument(
+        "--server", type=str, help="URL of an external OpenAI-compatible server (e.g. http://host:port/v1). Skips the internal vLLM server."
+    )
     server_group.add_argument("--api_key", type=str, default=None, help="API key for an authenticated remote server.")
 
     vllm_group = parser.add_argument_group("VLLM arguments", "Used only for the internal server. Unrecognized args are forwarded to vLLM.")
