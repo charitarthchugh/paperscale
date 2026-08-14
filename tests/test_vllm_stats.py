@@ -3,7 +3,7 @@
 import pathlib
 import unittest
 
-from paperscale.vllm_stats import parse_metrics
+from paperscale.vllm_stats import Snapshot, metrics_url, parse_metrics, snapshot_from  # noqa: F401
 
 FIXTURE = pathlib.Path(__file__).parent / "fixtures" / "vllm_metrics.txt"
 
@@ -50,6 +50,48 @@ class ParseMetricsTest(unittest.TestCase):
         parsed = parse_metrics("a_metric NaN\nb_metric 1.0\n")
         self.assertNotIn("a_metric", parsed)
         self.assertIn("b_metric", parsed)
+
+
+class SnapshotTest(unittest.TestCase):
+    def setUp(self):
+        self.snap = snapshot_from(parse_metrics(FIXTURE.read_text()))
+
+    def test_counters_summed_across_engines(self):
+        self.assertEqual(self.snap.generation_tokens, 300.0)  # 200 + 100
+        self.assertEqual(self.snap.prompt_tokens, 1500.0)  # 1000 + 500
+        self.assertEqual(self.snap.cache_hits, 1200.0)  # 900 + 300
+        self.assertEqual(self.snap.cache_queries, 1500.0)  # 1000 + 500
+
+    def test_request_gauges_summed(self):
+        self.assertEqual(self.snap.running, 8.0)  # 5 + 3
+        self.assertEqual(self.snap.waiting, 2.0)  # 2 + 0
+
+    def test_kv_usage_averaged_not_summed(self):
+        # A fraction summed across engines would read 1.0 and look like a full cache.
+        self.assertAlmostEqual(self.snap.kv_usage, 0.5)  # mean(0.4, 0.6)
+
+    def test_absent_metric_is_none_not_zero(self):
+        snap = snapshot_from(parse_metrics('vllm:num_requests_running{engine="0"} 1.0\n'))
+        self.assertIsNone(snap.generation_tokens)
+        self.assertEqual(snap.running, 1.0)
+
+    def test_falls_back_to_alternate_names(self):
+        text = 'vllm:prompt_tokens_total{engine="0"} 100.0\nvllm:prompt_tokens_cached_total{engine="0"} 60.0\nvllm:gpu_cache_usage_perc{engine="0"} 0.25\n'
+        snap = snapshot_from(parse_metrics(text))
+        self.assertEqual(snap.cache_hits, 60.0)  # prefix_cache_hits_total absent
+        self.assertEqual(snap.cache_queries, 100.0)  # prefix_cache_queries_total absent
+        self.assertEqual(snap.kv_usage, 0.25)  # kv_cache_usage_perc absent
+
+
+class MetricsUrlTest(unittest.TestCase):
+    def test_strips_v1_suffix(self):
+        self.assertEqual(metrics_url("http://localhost:8000/v1"), "http://localhost:8000/metrics")
+
+    def test_handles_trailing_slash(self):
+        self.assertEqual(metrics_url("http://localhost:8000/v1/"), "http://localhost:8000/metrics")
+
+    def test_bare_base_url(self):
+        self.assertEqual(metrics_url("http://gigaspark:8000"), "http://gigaspark:8000/metrics")
 
 
 if __name__ == "__main__":

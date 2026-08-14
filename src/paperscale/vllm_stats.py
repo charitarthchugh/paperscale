@@ -55,3 +55,56 @@ def parse_metrics(text: str) -> dict[str, list[Sample]]:
         labels = {m.group("key"): m.group("value") for m in _LABEL.finditer(match.group("labels") or "")}
         out.setdefault(match.group("name"), []).append(Sample(labels, value))
     return out
+
+
+# Each logical metric resolves against an ordered candidate list, first name wins.
+# This is what lets one scraper survive vLLM version drift.
+_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "generation_tokens": ("vllm:generation_tokens_total",),
+    "prompt_tokens": ("vllm:prompt_tokens_total",),
+    "cache_hits": ("vllm:prefix_cache_hits_total", "vllm:prompt_tokens_cached_total"),
+    "cache_queries": ("vllm:prefix_cache_queries_total", "vllm:prompt_tokens_total"),
+    "running": ("vllm:num_requests_running",),
+    "waiting": ("vllm:num_requests_waiting",),
+    "kv_usage": ("vllm:kv_cache_usage_perc", "vllm:gpu_cache_usage_perc"),
+}
+# kv usage is already a fraction; summing it across engines would read as a full cache.
+_AVERAGED = frozenset({"kv_usage"})
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    generation_tokens: float | None = None
+    prompt_tokens: float | None = None
+    cache_hits: float | None = None
+    cache_queries: float | None = None
+    running: float | None = None
+    waiting: float | None = None
+    kv_usage: float | None = None
+
+
+def snapshot_from(parsed: dict[str, list[Sample]]) -> Snapshot:
+    """Aggregate a parsed scrape into one Snapshot, summing across engines.
+
+    With ``--data-parallel-size > 1`` there is one series per engine. Counters and
+    request gauges add up; fractions are averaged. An unresolvable metric stays
+    ``None`` -- zero is a measurement, absence is not.
+    """
+    values: dict[str, float | None] = {}
+    for field, names in _CANDIDATES.items():
+        samples = next((parsed[n] for n in names if n in parsed), None)
+        if not samples:
+            values[field] = None
+        elif field in _AVERAGED:
+            values[field] = sum(s.value for s in samples) / len(samples)
+        else:
+            values[field] = sum(s.value for s in samples)
+    return Snapshot(**values)
+
+
+def metrics_url(server: str) -> str:
+    """Derive the /metrics URL from an OpenAI-compatible base URL."""
+    base = server.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[: -len("/v1")].rstrip("/")
+    return f"{base}/metrics"
