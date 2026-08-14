@@ -194,6 +194,23 @@ class VLLMStatsTest(unittest.TestCase):
         self.assertIsNone(rates.gen_tps)
         self.assertAlmostEqual(rates.prompt_tps, 10.0)
 
+    def test_none_masked_regression_across_window_is_still_a_reset(self):
+        # A transient partial scrape (generation_tokens missing) sits between
+        # the pre-restart sample and the post-restart sample. `_is_reset` must
+        # not be fooled just because the immediately-preceding sample can't
+        # prove the regression itself.
+        self.stats.add(Snapshot(generation_tokens=1000.0, prompt_tokens=0.0))
+        self.clock.tick(10.0)
+        self.stats.add(Snapshot(generation_tokens=None, prompt_tokens=50.0))
+        self.clock.tick(10.0)
+        self.stats.add(Snapshot(generation_tokens=5.0, prompt_tokens=100.0))
+        rates = self.stats.rates()
+        self.assertIsNone(rates.gen_tps)
+        self.assertIsNone(rates.gen_tps_avg)
+        for value in (rates.gen_tps, rates.gen_tps_avg, rates.prompt_tps, rates.prompt_tps_avg, rates.kv_hit, rates.kv_hit_avg):
+            if value is not None:
+                self.assertGreaterEqual(value, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

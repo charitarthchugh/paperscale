@@ -166,6 +166,14 @@ class VLLMStats:
         self._clock = clock
         self._samples: deque[tuple[float, Snapshot]] = deque()
         self._first: tuple[float, Snapshot] | None = None
+        # Highest value ever observed per monotonic field, since the last reset.
+        # Tracked independently of `_samples`/`_first` because both can retain
+        # (or evict) a different subset of history: `rates()` diffs against the
+        # window's oldest sample *and* the since-first sample, either of which
+        # may sit behind an intervening scrape that reported `None` for a
+        # field. Comparing only against the latest sample would let that
+        # `None` mask a real regression across either reference point.
+        self._high_water: dict[str, float] = {}
 
     def add(self, snap: Snapshot) -> None:
         now = self._clock()
@@ -174,17 +182,23 @@ class VLLMStats:
             # lineage and differencing across the boundary is meaningless.
             self._samples.clear()
             self._first = None
+            self._high_water.clear()
         self._samples.append((now, snap))
         if self._first is None:
             self._first = (now, snap)
+        for field in _MONOTONIC:
+            value = getattr(snap, field)
+            if value is not None:
+                self._high_water[field] = max(self._high_water.get(field, value), value)
         while len(self._samples) > 2 and self._samples[0][0] < now - self._window:
             self._samples.popleft()
 
     def _is_reset(self, snap: Snapshot) -> bool:
-        if not self._samples:
-            return False
-        _, latest = self._samples[-1]
-        return any(getattr(snap, f) is not None and getattr(latest, f) is not None and getattr(snap, f) < getattr(latest, f) for f in _MONOTONIC)
+        # Compare against the high-water mark, not just the most recent
+        # sample: a decrease anywhere relative to everything retained so far
+        # is a genuine counter regression, even if it is invisible sample to
+        # sample because of an intervening `None`.
+        return any(getattr(snap, f) is not None and f in self._high_water and getattr(snap, f) < self._high_water[f] for f in _MONOTONIC)
 
     def rates(self) -> Rates:
         if not self._samples:
