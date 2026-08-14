@@ -3,6 +3,7 @@
 import unittest
 
 from paperscale.evaluation.metrics import (
+    missing_peer_pairs,
     bow_f1,
     garbage_token_fraction,
     normalize_markdown,
@@ -59,8 +60,12 @@ class AgreementTest(unittest.TestCase):
 
 class PeerRowsTest(unittest.TestCase):
     def test_emits_both_directions_with_equal_scores(self):
-        rows = peer_rows_for_page((("d1", 3), {"a": CLEAN, "b": GARBLED, "c": CLEAN}))
-        # 3 models -> 3 unordered pairs -> 6 directed rows.
+        rows = peer_rows_for_page((
+            ("d1", 3),
+            {"a": CLEAN, "b": GARBLED, "c": CLEAN},
+            [("a", "b"), ("a", "c"), ("b", "c")],
+        ))
+        # 3 unordered pairs -> 6 directed rows.
         self.assertEqual(len(rows), 6)
         by_pair = {(r[0], r[1]): r for r in rows}
         for m, peer in [("a", "b"), ("a", "c"), ("b", "c")]:
@@ -68,6 +73,57 @@ class PeerRowsTest(unittest.TestCase):
             self.assertEqual(fwd[2:], rev[2:])  # doc, page, f1, ned identical
             self.assertEqual(fwd[2:4], ("d1", 3))
         self.assertEqual(by_pair[("a", "c")][4], 1.0)  # identical texts -> perfect f1
+
+    def test_scores_only_the_requested_pairs(self):
+        # Resume: a-b was already on disk, so only a-c and b-c are asked for.
+        rows = peer_rows_for_page((
+            ("d1", 3),
+            {"a": CLEAN, "b": GARBLED, "c": CLEAN},
+            [("a", "c"), ("b", "c")],
+        ))
+        self.assertEqual(len(rows), 4)  # 2 pairs, both directions
+        self.assertEqual(
+            {(r[0], r[1]) for r in rows},
+            {("a", "c"), ("c", "a"), ("b", "c"), ("c", "b")},
+        )
+
+    def test_no_requested_pairs_yields_no_rows(self):
+        rows = peer_rows_for_page((("d1", 3), {"a": CLEAN, "b": GARBLED}, []))
+        self.assertEqual(rows, [])
+
+
+class MissingPeerPairsTest(unittest.TestCase):
+    """Peer agreement resumes per model pair, so adding a run scores only new pairs."""
+
+    def test_all_pairs_when_nothing_is_stored(self):
+        self.assertEqual(
+            missing_peer_pairs(["a", "b", "c"], set()),
+            [("a", "b"), ("a", "c"), ("b", "c")],
+        )
+
+    def test_no_pairs_when_everything_is_stored(self):
+        self.assertEqual(missing_peer_pairs(["a", "b"], {("a", "b"), ("b", "a")}), [])
+
+    def test_adding_a_third_model_scores_only_its_new_pairs(self):
+        # a-b was scored on an earlier run and must NOT be recomputed.
+        self.assertEqual(
+            missing_peer_pairs(["a", "b", "c"], {("a", "b"), ("b", "a")}),
+            [("a", "c"), ("b", "c")],
+        )
+
+    def test_a_single_model_has_no_pairs(self):
+        self.assertEqual(missing_peer_pairs(["a"], set()), [])
+
+    def test_a_half_written_pair_is_recomputed(self):
+        # Only one direction on disk (interrupted write, or a pre-resume DB). Trusting
+        # it would leave b with no row against a, skewing b's leaderboard mean.
+        self.assertEqual(missing_peer_pairs(["a", "b"], {("a", "b")}), [("a", "b")])
+
+    def test_input_order_does_not_matter(self):
+        self.assertEqual(
+            missing_peer_pairs(["c", "a", "b"], {("b", "a"), ("a", "b")}),
+            [("a", "c"), ("b", "c")],
+        )
 
 
 if __name__ == "__main__":

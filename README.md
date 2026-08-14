@@ -23,6 +23,9 @@ It keeps olmOCR's document management, queueing, and CLI 1:1, with two additions
   (olmOCR's done-flag behavior). `--no-resume` wipes prior progress and
   reprocesses the workspace from scratch.
 
+A separate `paperscale evaluate` subcommand ranks several models against each
+other from their run outputs, without ground truth — see [Evaluate](#evaluate).
+
 S3 and beaker support from upstream olmOCR are intentionally omitted; workspaces
 and inputs are local.
 
@@ -200,6 +203,124 @@ For each work item, paperscale writes `workspace/results/output_<hash>.jsonl` �
 one Dolma document per source file, with the extracted `text` and per-page
 metadata/attributes. With `--markdown`, it also writes
 `workspace/markdown/<input structure>/<doc>.md` containing just the page text.
+
+## Evaluate
+
+`paperscale evaluate` ranks OCR models against each other **without ground
+truth**. It reads the `results/*.jsonl` that ordinary runs already produce,
+scores every page on a handful of reference-free signals, writes them to SQLite,
+and prints a leaderboard:
+
+```bash
+poetry run paperscale evaluate \
+  --run lightonocr2=./ws-lighton \
+  --run surya2=./ws-surya \
+  --db ./evaluation.sqlite
+```
+
+```
+model        corr_rate  corr_rate_win  uncorr_rate  garbage  garbage_win  peer_f1  peer_f1_win  peer_ned  tl_f1  tl_f1_win  tl_ned  reject_rate  reject_rate_win
+-----------  ---------  -------------  -----------  -------  -----------  -------  -----------  --------  -----  ---------  ------  -----------  ---------------
+lightonocr2  0.000      1.00           0.000        0.000    1.00         0.557    1.00         0.307     0.912  1.00       0.804   0.000        1.00
+surya2       0.152      0.00           0.000        0.100    0.00         0.557    1.00         0.307     0.881  0.00       0.771   0.000        1.00
+```
+
+Each `--run` is `LABEL=PATH`, where `PATH` is a workspace dir, a bare dir of
+`.jsonl`, or a single `.jsonl` file. The label is yours to choose — the model
+name is not recorded in the JSONL. Documents join across runs by
+`metadata["Source-File"]`, so the same PDFs must be fed to every model you
+compare.
+
+### Metrics
+
+A single run scores every column except `peer_*`, which compares models against
+each other and is skipped below two runs.
+
+| Column | Meaning | Better |
+|---|---|---|
+| `corr_rate` | Fraction of tokens a spell checker had to change | lower |
+| `uncorr_rate` | Fraction it could **not** fix — garbage beyond repair | lower |
+| `garbage` | Fraction of tokens that look like OCR noise: repeated characters, alpha-digit soup, vowel-less runs, mid-word case flips | lower |
+| `peer_f1` / `peer_ned` | Agreement with the *other* models on the same page (bag-of-words F1, and 1 − normalized edit distance) | higher |
+| `tl_f1` / `tl_ned` | Agreement with the PDF's own embedded text layer (`pdftotext`) | higher |
+| `reject_rate` | Fallback pages ÷ total pages — how often the quality gate rejected the model's output | lower |
+| `ppl_raw` / `ppl_corr` | Perplexity under an external LM, before and after spell correction (`--pplx` only) | lower |
+
+A `*_win` column is the fraction of documents where that model scored best,
+restricted to documents **all** models produced — so an extra PDF in one run
+cannot inflate its win rate. It reads `n/a` with fewer than two runs.
+
+With exactly **two** runs the `peer_*` columns are necessarily identical for both
+models — agreement is symmetric, so `f1(a, b)` is `f1(b, a)` — and both win every
+document. The column only starts discriminating at three or more runs, where a
+model can agree with the consensus more than its rivals do. It is a
+majority-vote signal, not a correctness one: three models sharing a systematic
+error will all score well on it.
+
+Means are **doc-weighted, not page-weighted**: each document contributes its own
+mean, so a 400-page report does not drown out a 1-page invoice.
+
+`tl_*` is a calibration signal on a subset, not full coverage. A document is
+skipped entirely if any of its pages fell back (those pages are *filled* with
+`pdftotext` output, so comparing them to the text layer would be circular), if
+its PDF is no longer on disk, or — per page — if the text layer is effectively
+blank, which is what a scanned image looks like. The run logs how many of each
+it skipped. Expect `-` in these columns when evaluating scanned corpora.
+
+`--dictionary words.txt` adds domain vocabulary (one word per line, repeatable)
+to the spell checker, which matters on legal, medical, or technical corpora
+where real jargon would otherwise be counted as a correction.
+
+### Resume
+
+Re-running the same command **resumes**: any document whose text is unchanged
+keeps its cached scores, and only new or modified work is computed. This is
+tracked per document via a checksum of its page text, so:
+
+- Interrupting a long evaluation loses at most the documents in flight.
+- Re-running OCR under the same label rescores exactly the documents whose
+  output actually changed.
+- Adding a third `--run` scores the new model and fills in only the peer pairs
+  that involve it — the existing models are not re-scored against each other.
+- Deleting a PDF from a run drops its rows, so it stops affecting the means.
+
+`--no-resume` discards every cached score for the listed runs and starts clean.
+
+### Perplexity (optional)
+
+`--pplx` adds a language-model perplexity column, scored against a separate
+OpenAI-compatible server. Each page is sent to `/v1/completions` with
+`prompt_logprobs: 0` and `max_tokens: 1` — prefill only, no generation — and
+scored twice: as-is, and after spell correction. The gap between `ppl_raw` and
+`ppl_corr` separates "this model produced unusual text" from "this model
+produced misspelled text".
+
+```bash
+vllm serve Qwen/Qwen3-8B --port 8000 --no-enable-prefix-caching
+
+poetry run paperscale evaluate \
+  --run lightonocr2=./ws-lighton --run surya2=./ws-surya \
+  --pplx --pplx-url http://localhost:8000 --pplx-model Qwen/Qwen3-8B
+```
+
+Serve the scorer with prefix caching **off** — a cached prefill can skip the
+`prompt_logprobs` this depends on.
+Scoring is GPU-bound, so raise `--pplx-concurrency` only until the server's
+reported prefill throughput stops climbing. `--pplx-chunk-tokens` caps the
+tokens per request (default 32000); smaller chunks let vLLM batch far more of
+them, at the cost of cross-page conditioning at each boundary. Changing
+`--pplx-model` invalidates stored perplexity scores automatically — they are not
+comparable across scorers.
+
+Every metric also lands in the SQLite file (one table per metric, keyed by
+model/doc/page), so you can dig past the leaderboard:
+
+```bash
+sqlite3 evaluation.sqlite \
+  "SELECT doc, page, score FROM garbage_fraction WHERE model='surya2' ORDER BY score DESC LIMIT 10;"
+```
+
+See `poetry run paperscale evaluate --help` for every flag.
 
 ## Development
 
