@@ -153,6 +153,53 @@ class FdExhaustionBackoffTests(unittest.IsolatedAsyncioTestCase):
                 await pipeline.try_single_page_with_backoff(SimpleNamespace(), "doc.pdf", 1, attempt=0, image_base64="x", render_is_blank=False)
 
 
+class ZeroPageDocumentOutcomeTest(unittest.IsolatedAsyncioTestCase):
+    """A document that yielded no pages produced nothing; that's a failure, not "ok"."""
+
+    async def test_zero_page_document_counts_as_discarded_not_ok(self):
+        reader = mock.Mock()
+        reader.get_num_pages.return_value = 0
+        args = SimpleNamespace(apply_filter=False, max_page_error_rate=0.004)
+
+        with (
+            mock.patch.object(pipeline, "PdfReader", return_value=reader),
+            mock.patch.object(pipeline, "metrics") as metrics,
+            mock.patch.object(pipeline.logger, "warning") as warning,
+        ):
+            result = await pipeline.process_single_pdf(args, 0, "doc.pdf", "/tmp/doc.pdf")
+
+        self.assertIsNone(result)
+        metrics.add_metrics.assert_called_once_with(docs_discarded=1)
+        warning.assert_called_once()
+        message = warning.call_args[0][0]
+        self.assertIn("doc.pdf", message)
+        self.assertIn("no pages", message.lower())
+
+
+class DocumentOutcomeSingleCountTest(unittest.IsolatedAsyncioTestCase):
+    """Exactly one outcome counter must fire per document: never zero, never two."""
+
+    async def test_build_dolma_document_failure_counts_only_crashed(self):
+        reader = mock.Mock()
+        reader.get_num_pages.return_value = 2
+        args = SimpleNamespace(apply_filter=False, max_page_error_rate=0.004)
+
+        async def fake_process_page(args, worker_id, pdf_orig_path, local_pdf_path, page_num):
+            return _page(page_num, "text", is_fallback=False)
+
+        with (
+            mock.patch.object(pipeline, "PdfReader", return_value=reader),
+            mock.patch.object(pipeline, "process_page", fake_process_page),
+            mock.patch.object(pipeline, "build_dolma_document", side_effect=RuntimeError("boom")),
+            mock.patch.object(pipeline, "metrics") as metrics,
+        ):
+            result = await pipeline.process_single_pdf(args, 0, "doc.pdf", "/tmp/doc.pdf")
+
+        self.assertIsNone(result)
+        # Not docs_ok *and* docs_crashed -- exactly the one call, for docs_crashed alone.
+        metrics.add_metrics.assert_called_once_with(docs_crashed=1)
+
+
 class ClassifyDocumentTest(unittest.TestCase):
     def test_no_fallback_pages_is_ok(self):
         self.assertEqual(classify_document(10, 0, 0.004), "ok")

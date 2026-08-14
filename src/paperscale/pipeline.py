@@ -547,6 +547,14 @@ async def process_single_pdf(args, worker_id: int, pdf_orig_path: str, local_pdf
             logger.info(f"Filtering out pdf {pdf_orig_path}")
             return None
 
+        # A document with no pages produced nothing; that is a failure, not a clean "ok" run.
+        # classify_document treats zero pages as "ok" arithmetic (0/0 is not "exceeding"), so the
+        # judgement belongs here, at the call site, before classification.
+        if num_pages <= 0:
+            metrics.add_metrics(docs_discarded=1)
+            logger.warning(f"Document {pdf_orig_path} has no pages, discarding document.")
+            return None
+
         page_tasks = []
 
         async with asyncio.TaskGroup() as tg:
@@ -559,9 +567,9 @@ async def process_single_pdf(args, worker_id: int, pdf_orig_path: str, local_pdf
 
         num_fallback_pages = sum(page_result.is_fallback for page_result in page_results)
         outcome = classify_document(num_pages, num_fallback_pages, args.max_page_error_rate)
-        metrics.add_metrics(**{f"docs_{outcome}": 1})
 
         if outcome == "discarded":
+            metrics.add_metrics(docs_discarded=1)
             logger.error(
                 f"Document {pdf_orig_path} has {num_fallback_pages} fallback pages out of {num_pages} exceeding "
                 f"max_page_error_rate of {args.max_page_error_rate}, discarding document."
@@ -572,7 +580,11 @@ async def process_single_pdf(args, worker_id: int, pdf_orig_path: str, local_pdf
                 f"Document {pdf_orig_path} processed with {num_fallback_pages} fallback pages out of {num_pages}, proceeding to build Dolma document."
             )
 
-        return build_dolma_document(pdf_orig_path, page_results)
+        # Count only after build_dolma_document succeeds, so a raise here lands the document in
+        # docs_crashed alone rather than double-counting it in docs_ok/docs_partial too.
+        document = build_dolma_document(pdf_orig_path, page_results)
+        metrics.add_metrics(**{f"docs_{outcome}": 1})
+        return document
     except Exception as e:
         metrics.add_metrics(docs_crashed=1)
         logger.exception(f"Exception in process_single_pdf for {pdf_orig_path}: {e}")
