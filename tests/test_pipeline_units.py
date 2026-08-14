@@ -432,6 +432,93 @@ class _FakeLiveReporter:
         self.stats[(group, name)] = value
 
 
+class TuiDiskLoggingTest(unittest.IsolatedAsyncioTestCase):
+    """--tui combined with --disk_logging: must not crash, must not double-write.
+
+    `--disk_logging`'s const is a bare filename, so `os.path.dirname` is `""` and
+    `os.makedirs("")` raised FileNotFoundError. Worse than the crash was where it
+    happened: after the handler-displacement loop but before `main` entered the
+    try that calls `_restore_console_logging`, leaving all three loggers with zero
+    handlers and nothing left to put them back.
+    """
+
+    def setUp(self):
+        self._saved_handlers = [(log, list(log.handlers)) for log in (pipeline.logger, pipeline.server_logger, logging.getLogger())]
+
+    def tearDown(self):
+        for log, handlers in self._saved_handlers:
+            for handler in log.handlers:
+                if handler not in handlers and isinstance(handler, logging.FileHandler):
+                    handler.close()
+            log.handlers[:] = handlers
+
+    def _all_handlers(self):
+        return [h for log in (pipeline.logger, pipeline.server_logger, logging.getLogger()) for h in log.handlers]
+
+    async def _run_main(self, ws, extra_argv):
+        queue = mock.Mock()
+        queue.initialize_queue = mock.AsyncMock(return_value=1)
+        queue.size = 1
+        argv = ["paperscale", ws, "--server", "http://example.invalid/v1", "--workers", "1", "--tui", *extra_argv]
+        with (
+            mock.patch.object(pipeline.sys, "argv", argv),
+            mock.patch.object(pipeline, "check_poppler_version"),
+            mock.patch.object(pipeline, "WorkQueue", return_value=queue),
+            mock.patch.object(pipeline, "vllm_server_ready", new=mock.AsyncMock()),
+            mock.patch.object(pipeline, "worker", new=mock.AsyncMock()),
+            mock.patch("paperscale.tui.make_reporter", return_value=_FakeLiveReporter()),
+            mock.patch("paperscale.vllm_stats.VLLMStatsPoller", return_value=mock.Mock(available=False)),
+        ):
+            await pipeline.main()
+
+    async def test_bare_filename_disk_logging_does_not_crash_the_run(self):
+        with tempfile.TemporaryDirectory() as ws:
+            self.addCleanup(os.chdir, os.getcwd())
+            os.chdir(ws)  # a bare filename lands in cwd; keep it out of the repo
+            await self._run_main(ws, ["--disk_logging"])  # const = "paperscale-pipeline-debug.log"
+            self.assertTrue(os.path.exists(os.path.join(ws, "paperscale-pipeline-debug.log")))
+
+        # The whole point: stderr logging survives.
+        self.assertTrue(pipeline.logger.handlers)
+        self.assertIn(pipeline.console_handler, pipeline.logger.handlers)
+
+    async def test_explicit_disk_logging_opens_exactly_one_handler(self):
+        with tempfile.TemporaryDirectory() as ws:
+            log_path = os.path.join(ws, "explicit.log")
+            await self._run_main(ws, ["--disk_logging", log_path])
+
+            # main already opened one at the top; _install_tui_logging must not
+            # open a second on the same file or every record is written twice.
+            pointing_at_it = {id(h) for h in self._all_handlers() if isinstance(h, logging.FileHandler) and h.baseFilename == os.path.abspath(log_path)}
+            self.assertEqual(len(pointing_at_it), 1)
+            # And the dashboard must not have invented a logs/ dir alongside it.
+            self.assertFalse(os.path.exists(os.path.join(ws, "logs")))
+
+    def test_install_accepts_a_bare_filename(self):
+        with tempfile.TemporaryDirectory() as ws:
+            self.addCleanup(os.chdir, os.getcwd())
+            os.chdir(ws)
+            handler = pipeline._install_tui_logging(mock.Mock(), "bare.log")
+            self.assertIsNotNone(handler)
+            self.assertTrue(os.path.exists(os.path.join(ws, "bare.log")))
+
+    def test_a_failure_opening_the_log_leaves_every_logger_untouched(self):
+        """The ordering guarantee: fallible work happens before any global mutation."""
+        with tempfile.TemporaryDirectory() as ws:
+            blocker = os.path.join(ws, "not-a-dir")
+            with open(blocker, "w") as f:
+                f.write("x")
+            before = {log: list(log.handlers) for log in (pipeline.logger, pipeline.server_logger, logging.getLogger())}
+
+            with self.assertRaises(OSError):
+                pipeline._install_tui_logging(mock.Mock(), os.path.join(blocker, "sub", "run.log"))
+
+            for log, handlers in before.items():
+                self.assertEqual(log.handlers, handlers)
+            self.assertIn(pipeline.console_handler, pipeline.logger.handlers)
+            self.assertIn(pipeline.console_handler, pipeline.server_logger.handlers)
+
+
 class DocsStatTest(unittest.IsolatedAsyncioTestCase):
     """The `docs` row must track the outcome counters, not a value fixed at startup."""
 

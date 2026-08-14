@@ -976,14 +976,22 @@ async def metrics_reporter(work_queue, rep=None, stats=None, poller=None):
         await asyncio.sleep(10)
 
 
-# Every document reaches exactly one of these, and process_single_pdf / process_pdf
-# guarantee it fires exactly once (see the docs_crashed comment at their call site).
-# Summing them is therefore a document count, not an approximation.
+# The five terminal outcome counters. A document reaches at most one of them --
+# process_single_pdf counts docs_crashed instead of, never as well as, an outcome
+# (see the comment above its build_dolma_document call) -- so summing them cannot
+# double-count. It is not the number of documents seen, though: two paths in
+# process_single_pdf return None without counting anything, the --apply_filter
+# reject and a PdfReader page-count failure, the latter caught inside the outer
+# try so docs_crashed never fires for it. Both are deliberate and both are logged.
 _DOC_OUTCOMES = ("docs_ok", "docs_partial", "docs_discarded", "docs_crashed", "docs_missing")
 
 
 def count_documents(totals: dict) -> int:
-    """Documents that have reached an outcome, of any kind.
+    """Documents that reached one of the counted outcomes.
+
+    Not every document reaches one -- see `_DOC_OUTCOMES` for the two paths that
+    return uncounted -- so this trails the number of documents attempted rather
+    than matching it.
 
     Deliberately reported without a denominator. The queue is measured in work
     items -- page groups sized by `--pages_per_group` -- so the queue length is
@@ -1249,6 +1257,14 @@ def _install_tui_logging(reporter, log_path: str | None) -> _ReporterLogHandler:
     feeds.) Root also has to keep at least one handler afterwards, or
     `logging.lastResort` takes over and writes to stderr in its place.
     """
+    # Every fallible step runs first, before a single handler moves. Creating the
+    # directory and opening the file can both raise, and this is called from
+    # `main` *before* it enters the try that would call _restore_console_logging
+    # -- so a raise after the displacement loop would leave all three loggers with
+    # no handlers at all and nothing left to put them back. The feature built to
+    # protect stderr logging would be the thing that destroyed it.
+    file_handler = _open_log_file(log_path) if log_path is not None else None
+
     root = logging.getLogger()
     handler = _ReporterLogHandler(reporter)
     for target, existing in [(logger, console_handler), (server_logger, console_handler), *((root, h) for h in list(root.handlers))]:
@@ -1258,16 +1274,26 @@ def _install_tui_logging(reporter, log_path: str | None) -> _ReporterLogHandler:
     # `logger` and `server_logger` both set propagate=False, so handlers on root
     # cannot double-log their records.
     targets = (logger, server_logger, root)
-    if log_path is not None:
-        os.makedirs(os.path.dirname(log_path), exist_ok=True)
-        file_handler = logging.FileHandler(log_path, mode="a")
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
-        for target in targets:
-            target.addHandler(file_handler)
-    for target in targets:
-        target.addHandler(handler)
+    for attachment in (file_handler, handler):
+        if attachment is not None:
+            for target in targets:
+                target.addHandler(attachment)
     return handler
+
+
+def _open_log_file(log_path: str) -> logging.FileHandler:
+    """Create the log directory and open the file. Fallible on purpose, and isolated.
+
+    `--disk_logging` takes a bare filename as its `const`, so `dirname` is `""` for
+    the common `--disk_logging` (no value) form and `os.makedirs("")` raises
+    FileNotFoundError. `or "."` resolves that to the working directory, which is
+    where a bare filename was always going to land.
+    """
+    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+    file_handler = logging.FileHandler(log_path, mode="a")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+    return file_handler
 
 
 def _restore_console_logging(tui_handler: _ReporterLogHandler) -> None:
@@ -1371,9 +1397,15 @@ async def main():
 
     stats = poller = tui_handler = None
     if live:
-        if not args.disk_logging:
-            args.disk_logging = _tui_log_path(args.workspace)
-        tui_handler = _install_tui_logging(rep, args.disk_logging)
+        # Whether the path is the user's or the dashboard's has to be decided
+        # before args.disk_logging is overwritten -- afterwards the two are
+        # indistinguishable. A user-supplied --disk_logging already has a
+        # FileHandler on it from the top of main; opening a second one on the same
+        # file would write every record twice, so only a path the dashboard picked
+        # itself is handed to _install_tui_logging to open.
+        tui_log_path = None if args.disk_logging else _tui_log_path(args.workspace)
+        args.disk_logging = args.disk_logging or tui_log_path
+        tui_handler = _install_tui_logging(rep, tui_log_path)
         stats = VLLMStats()
         poller = VLLMStatsPoller(metrics_url(args.server), stats, interval=args.tui_poll_interval)
         poller.start()
