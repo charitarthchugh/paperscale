@@ -9,7 +9,9 @@ stays cheap.
 from __future__ import annotations
 
 import argparse
+import logging
 import os
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Sequence
@@ -37,6 +39,8 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--pplx-url", default="http://localhost:8000", help="base URL of the vLLM OpenAI-compatible server")
     ev.add_argument("--pplx-model", default=None, help="model id served by --pplx-url (required with --pplx)")
     ev.add_argument("--tui", action="store_true", help="show a live progress dashboard (needs the 'tui' extra)")
+    ev.add_argument("--tui-poll-interval", type=float, default=5.0, help="seconds between vLLM /metrics scrapes for the dashboard")
+    ev.add_argument("--disk-logging", default=None, help="write the full log here (defaults beside --db when --tui is on)")
     ev.add_argument("--jobs", type=int, default=os.cpu_count() or 4, help="worker count for CPU-bound metrics and pdftotext (default: cpu count)")
     ev.add_argument("--pplx-concurrency", type=int, default=8, help="docs scored in flight against the vLLM server (default 8)")
     ev.add_argument("--no-resume", action="store_true", help="rescore pplx from scratch instead of resuming already-scored docs")
@@ -74,6 +78,14 @@ def _load_dictionary(paths: list[Path]) -> frozenset[str]:
     return frozenset(words)
 
 
+def _evaluate_log_path(db: Path) -> str:
+    """Where evaluate's logs go when the dashboard owns the screen.
+
+    evaluate has no workspace, so the database's directory is the natural home.
+    """
+    return str(db.resolve().parent / "logs" / f"evaluate-{os.getpid()}.log")
+
+
 def _handle_evaluate(args: argparse.Namespace) -> int:
     from concurrent.futures import ProcessPoolExecutor
 
@@ -98,12 +110,38 @@ def _handle_evaluate(args: argparse.Namespace) -> int:
         all_pages.extend(pages)
         all_metas.extend(metas)
 
-    from paperscale.tui import make_reporter
+    from paperscale.tui import NullReporter, install_tui_logging, make_reporter, open_log_file, restore_console_logging
+    from paperscale.vllm_stats import VLLMStats, VLLMStatsPoller, metrics_url, push_vllm_stats
+
+    rep = make_reporter(args.tui, title="paperscale evaluate")
+    live = not isinstance(rep, NullReporter)
+
+    stats = poller = tui_handler = None
+    if live:
+        # The dashboard's own path unless the user named one, and either way
+        # install_tui_logging is the only thing that opens it. The pipeline splits
+        # this differently because it has already opened a user-supplied
+        # --disk_logging by now and must not open a second handler on the same
+        # file; here nothing has, and handing the path over is what keeps it
+        # attached -- install strips *every* handler off the root logger, which is
+        # where evaluate's file has to live, so a handler added before the call
+        # would be taken straight back off for the length of the run.
+        args.disk_logging = args.disk_logging or _evaluate_log_path(args.db)
+        tui_handler = install_tui_logging(rep, args.disk_logging)
+        if args.pplx:
+            stats = VLLMStats()
+            poller = VLLMStatsPoller(metrics_url(args.pplx_url), stats, interval=args.tui_poll_interval)
+            poller.start()
+    elif args.disk_logging:
+        # No frame to protect, but the flag still has to write the file. evaluate
+        # owns no logger of its own, so root -- where everything it and its
+        # dependencies emit ends up -- is the only place to attach it.
+        logging.getLogger().addHandler(open_log_file(args.disk_logging))
 
     db = EvalDB(args.db)
     leaderboard = ""
     try:
-        with make_reporter(args.tui, title="paperscale evaluate") as rep:
+        with rep:
             rep.set_stat("models", len(pages_by_model))
             rep.set_stat("documents", len({m.doc for m in all_metas}))
             rep.set_stat("pages", len(all_pages))
@@ -121,9 +159,7 @@ def _handle_evaluate(args: argparse.Namespace) -> int:
             # stay on this thread -- workers only return plain tuples.
             sym = build_dictionary(extra_words)
             n_workers = max(1, min(args.jobs, len(all_pages) or 1))
-            with ProcessPoolExecutor(
-                max_workers=n_workers, initializer=_pool_init, initargs=(extra_words,)
-            ) as pool:
+            with ProcessPoolExecutor(max_workers=n_workers, initializer=_pool_init, initargs=(extra_words,)) as pool:
                 # Corrections — how much a spell checker must change the text
                 # (correctable) and how much it cannot fix (uncorrectable).
                 ph = rep.phase("corrections", total=len(all_pages))
@@ -156,9 +192,7 @@ def _handle_evaluate(args: argparse.Namespace) -> int:
 
             # Metric 4 — text-layer agreement (calibration subset).
             ph = rep.phase("text-layer", total=len(all_pages))
-            textlayer_rows, skip = compute_textlayer_agreement(
-                all_pages, all_metas, progress=lambda note: ph.advance(), jobs=args.jobs
-            )
+            textlayer_rows, skip = compute_textlayer_agreement(all_pages, all_metas, progress=lambda note: ph.advance(), jobs=args.jobs)
             ph.done()
             db.write_textlayer_agreement(textlayer_rows)
             rep.log(
@@ -186,6 +220,18 @@ def _handle_evaluate(args: argparse.Namespace) -> int:
                         rep.log(f"pplx {label}: resuming — {len(done)} docs already scored, {len({p.doc for p in todo[label]})} to go.")
                 total_docs = sum(len({p.doc for p in pages}) for pages in todo.values())
                 ph = rep.phase("perplexity", total=total_docs)
+                # Docs a resume already scored: constant for the phase, so it is
+                # written once rather than re-pushed per doc.
+                rep.set_stat("skipped", sum(len({p.doc for p in pages}) for pages in pages_by_model.values()) - total_docs, group="issues")
+                # Seed the panel before the first doc lands -- scoring a document
+                # can take minutes, and an empty vllm column reads as a broken one.
+                push_vllm_stats(rep, stats, poller)
+
+                def scored(doc: str, label: str, ph=ph) -> None:
+                    ph.advance()
+                    rep.log(f"pplx {label}: {doc}")
+                    push_vllm_stats(rep, stats, poller)
+
                 for label, pages in todo.items():
                     score_run_pplx(
                         pages,
@@ -195,14 +241,22 @@ def _handle_evaluate(args: argparse.Namespace) -> int:
                         sym=sym,  # reuse the dictionary built for the correction metric
                         concurrency=args.pplx_concurrency,
                         on_doc=lambda doc, rows, label=label: db.write_pplx_doc(label, rows),
-                        progress=lambda doc, label=label: (ph.advance(), rep.log(f"pplx {label}: {doc}")),
+                        progress=lambda doc, label=label: scored(doc, label),
                     )
                 ph.done()
 
         leaderboard = db.leaderboard()
     finally:
         db.close()
+        if poller is not None:
+            poller.stop()
+        if tui_handler is not None:
+            restore_console_logging(tui_handler)
     print(leaderboard)
+    # The alternate screen is gone by now, so this lands on the real screen --
+    # without it a --tui run leaves no trace of where its log went.
+    if live and args.disk_logging:
+        print(f"Full log: {args.disk_logging}", file=sys.stderr)
     return 0
 
 

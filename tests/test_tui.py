@@ -1,8 +1,12 @@
 """Tests for the progress-reporter abstraction and its wiring."""
 
 import io
+import logging
+import os
 import re
+import tempfile
 import unittest
+from unittest import mock
 
 from paperscale.evaluation.runs import DocMeta, PageText
 from paperscale.evaluation.textlayer import compute_textlayer_agreement
@@ -14,7 +18,9 @@ from paperscale.tui import (  # noqa: F401
     RenderStyle,
     RichReporter,
     _layout_budget,
+    install_tui_logging,
     make_reporter,
+    restore_console_logging,
     terminal_profile,
 )
 
@@ -354,6 +360,101 @@ class DumbTerminalTest(unittest.TestCase):
 
         with mock.patch.dict("os.environ", {"TERM": "dumb"}):
             self.assertIsInstance(make_reporter(True, title="x", stream=_FakeTTY(True)), NullReporter)
+
+
+class _Rep:
+    def __init__(self):
+        self.seen = []
+
+    def log(self, message):
+        self.seen.append(message)
+
+
+class LoggingHandoffTest(unittest.TestCase):
+    """The hand-off generalised: the caller's own loggers, and root always.
+
+    The pipeline hands over two loggers that carry a shared console handler.
+    evaluate owns none: everything it emits propagates to root, where
+    `logging.lastResort` writes to stderr straight through the live frame if
+    nothing is attached. So the no-logger call has to be as complete as the
+    pipeline's, which is exactly what these tests pin.
+    """
+
+    def setUp(self):
+        self._saved = [(log, list(log.handlers)) for log in (logging.getLogger(),)]
+
+    def tearDown(self):
+        for log, handlers in self._saved:
+            for handler in log.handlers:
+                if handler not in handlers and isinstance(handler, logging.FileHandler):
+                    handler.close()
+            log.handlers[:] = handlers
+
+    def test_root_is_taken_over_when_the_caller_owns_no_logger(self):
+        root = logging.getLogger()
+        stderr_handler = logging.StreamHandler()
+        root.addHandler(stderr_handler)
+        rep = _Rep()
+
+        install_tui_logging(rep, None)
+
+        self.assertNotIn(stderr_handler, root.handlers)
+        with mock.patch.object(logging, "lastResort") as last_resort:
+            logging.getLogger("paperscale.vllm_stats").warning("statistics unavailable")
+        self.assertEqual(len(rep.seen), 1)
+        self.assertIn("statistics unavailable", rep.seen[0])
+        last_resort.handle.assert_not_called()
+
+    def test_caller_loggers_are_displaced_and_restored(self):
+        console = logging.StreamHandler()
+        owned = [logging.getLogger(f"paperscale.test.handoff.{i}") for i in (0, 1)]
+        for log in owned:
+            log.propagate = False
+            log.handlers[:] = [console]
+        self.addCleanup(lambda: [log.handlers.clear() for log in owned])
+
+        handler = install_tui_logging(_Rep(), None, owned, console)
+
+        for log in owned:
+            self.assertNotIn(console, log.handlers)
+            self.assertIn(handler, log.handlers)
+        restore_console_logging(handler)
+        for log in owned:
+            self.assertEqual(log.handlers, [console])
+        self.assertNotIn(handler, logging.getLogger().handlers)
+
+    def test_the_log_file_lands_on_every_target(self):
+        owned = logging.getLogger("paperscale.test.handoff.file")
+        owned.propagate = False
+        console = logging.StreamHandler()
+        owned.handlers[:] = [console]
+        self.addCleanup(owned.handlers.clear)
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "logs", "run.log")
+            handler = install_tui_logging(_Rep(), path, [owned], console)
+            self.addCleanup(restore_console_logging, handler)
+
+            self.assertTrue(os.path.exists(path))
+            for target in (owned, logging.getLogger()):
+                self.assertTrue(any(isinstance(h, logging.FileHandler) and h.baseFilename == path for h in target.handlers))
+
+    def test_a_failure_opening_the_log_leaves_every_logger_untouched(self):
+        """The ordering guarantee, with no caller logger: root must survive too."""
+        with tempfile.TemporaryDirectory() as d:
+            blocker = os.path.join(d, "not-a-dir")
+            with open(blocker, "w") as f:
+                f.write("x")
+            root = logging.getLogger()
+            stderr_handler = logging.StreamHandler()
+            root.addHandler(stderr_handler)
+            before = list(root.handlers)
+
+            with self.assertRaises(OSError):
+                install_tui_logging(_Rep(), os.path.join(blocker, "sub", "run.log"))
+
+            self.assertEqual(root.handlers, before)
+            self.assertIn(stderr_handler, root.handlers)
 
 
 if __name__ == "__main__":

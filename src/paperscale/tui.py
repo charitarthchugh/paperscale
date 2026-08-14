@@ -13,13 +13,20 @@ Use ``make_reporter`` to pick one. Both are context managers and expose the
 same ``phase`` / ``log`` / ``set_stat`` surface, so callers (evaluate today, the
 OCR pipeline later) stay renderer-agnostic. Reporters are pure instrumentation:
 driving them must never change a caller's output.
+
+``install_tui_logging`` / ``restore_console_logging`` live here too: both
+commands need the identical hand-off of stderr to the event pane, and this is
+the one UI module they already share.
 """
 
 from __future__ import annotations
 
+import logging
+import os
 import sys
+import time
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Protocol, Sequence, runtime_checkable
 
 
 @runtime_checkable
@@ -106,8 +113,6 @@ class RichReporter:
     """Fixed-height live dashboard: header, stat columns, phase bars, event tail."""
 
     def __init__(self, title: str, *, console=None, style: "RenderStyle | None" = None) -> None:
-        import os
-
         from rich.console import Console
         from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
         from rich.table import Column
@@ -266,8 +271,6 @@ def make_reporter(tui: bool, *, title: str, stream=None) -> ProgressReporter:
 
     Raises a clear error if --tui is requested but ``rich`` isn't installed.
     """
-    import os
-
     stream = stream if stream is not None else sys.stderr
     if not tui:
         return NullReporter()
@@ -280,6 +283,116 @@ def make_reporter(tui: bool, *, title: str, stream=None) -> ProgressReporter:
     except ImportError as exc:  # pragma: no cover - env-dependent
         raise SystemExit("--tui requires the 'tui' extra: poetry install --extras tui") from exc
     return RichReporter(title)
+
+
+# --------------------------------------------------------------------------- #
+# Logging hand-off
+# --------------------------------------------------------------------------- #
+class ReporterLogHandler(logging.Handler):
+    """Forward warnings and errors into the dashboard's event pane."""
+
+    def __init__(self, reporter) -> None:
+        super().__init__(level=logging.WARNING)
+        self._reporter = reporter
+        # The loggers this handler was attached to, and the handlers it displaced
+        # off them -- restored verbatim by `restore_console_logging`. They live
+        # here because the handler is the one object install and restore share.
+        self.displaced: list[tuple[logging.Logger, logging.Handler]] = []
+        self.targets: tuple[logging.Logger, ...] = ()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        # Logger.callHandlers already screens on self.level, but emit() is the
+        # public entry point a handler is judged on and it does no filtering of
+        # its own. The event pane holds a handful of rows; one INFO line that
+        # slipped in that way costs a warning the user needed to see.
+        if record.levelno < self.level:
+            return
+        try:
+            stamp = time.strftime("%H:%M:%S", time.localtime(record.created))
+            self._reporter.log(f"{stamp}  {record.levelname:<5} {record.getMessage()}")
+        except Exception:  # pragma: no cover - a logging handler must never raise
+            pass
+
+
+def install_tui_logging(
+    reporter,
+    log_path: str | None,
+    loggers: Sequence[logging.Logger] = (),
+    console_handler: logging.Handler | None = None,
+) -> ReporterLogHandler:
+    """Take stderr away from the loggers and give the pane the important lines.
+
+    Nothing may write to stderr underneath a live frame. Everything still lands in
+    the log file, because the alternate screen has no scrollback to recover from.
+
+    `loggers` are the caller's own loggers carrying `console_handler` -- the
+    pipeline hands over its module logger and the `vllm` server logger; evaluate
+    owns none and passes nothing. The root logger is always taken over on top of
+    those, and that is not belt-and-braces. work_queue, check, front_matter,
+    filter and vllm_stats each own a handler-less module logger that propagates to
+    root, and `paperscale.filter` calls `logging.basicConfig()` at import, which
+    puts a stderr StreamHandler there. Left alone it prints straight through the
+    frame. (vllm_stats is the sharpest case, and the one that reaches evaluate
+    too: its "statistics unavailable" warning would corrupt the very panel it
+    feeds -- and with nothing on root at all, `logging.lastResort` prints it to
+    stderr in any handler's place.) Root also has to keep at least one handler
+    afterwards, for that same lastResort reason.
+    """
+    # Every fallible step runs first, before a single handler moves. Creating the
+    # directory and opening the file can both raise, and this is called *before*
+    # the caller enters the try that would call `restore_console_logging` -- so a
+    # raise after the displacement loop would leave every logger with no handlers
+    # at all and nothing left to put them back. The feature built to protect
+    # stderr logging would be the thing that destroyed it.
+    file_handler = open_log_file(log_path) if log_path is not None else None
+
+    root = logging.getLogger()
+    handler = ReporterLogHandler(reporter)
+    # A caller that passes loggers but no console handler has nothing to displace
+    # off them; `(logger, None)` in `displaced` would put a None back on restore.
+    displaced = [(log, console_handler) for log in loggers if console_handler is not None]
+    displaced += [(root, h) for h in list(root.handlers)]
+    for target, existing in displaced:
+        target.removeHandler(existing)
+        handler.displaced.append((target, existing))
+
+    # Callers set propagate=False on the loggers they hand over (the pipeline's
+    # two do), so handlers on root cannot double-log their records.
+    handler.targets = (*loggers, root)
+    for attachment in (file_handler, handler):
+        if attachment is not None:
+            for target in handler.targets:
+                target.addHandler(attachment)
+    return handler
+
+
+def open_log_file(log_path: str) -> logging.FileHandler:
+    """Create the log directory and open the file. Fallible on purpose, and isolated.
+
+    `--disk_logging` takes a bare filename as its `const`, so `dirname` is `""` for
+    the common `--disk_logging` (no value) form and `os.makedirs("")` raises
+    FileNotFoundError. `or "."` resolves that to the working directory, which is
+    where a bare filename was always going to land.
+    """
+    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+    file_handler = logging.FileHandler(log_path, mode="a")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+    return file_handler
+
+
+def restore_console_logging(tui_handler: ReporterLogHandler) -> None:
+    """Undo install_tui_logging's rewiring. Must run even when the run crashed.
+
+    The reporter handler comes off every logger it was added to, root included:
+    past the `with rep` block the reporter is dead, and anything still routed into
+    it is lost rather than printed. The file handler stays, matching how
+    --disk_logging behaves for the life of the process.
+    """
+    for target in tui_handler.targets:
+        target.removeHandler(tui_handler)
+    for target, displaced in tui_handler.displaced:
+        target.addHandler(displaced)
 
 
 # --------------------------------------------------------------------------- #

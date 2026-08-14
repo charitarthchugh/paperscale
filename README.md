@@ -83,6 +83,47 @@ poetry run paperscale ./workspace --stats
 
 See `poetry run paperscale --help` for every flag.
 
+### Live dashboard
+
+`--tui` renders a fixed-height dashboard (needs `poetry install --extras tui`).
+It shows progress, live vLLM throughput and prefix-cache hit rate scraped from
+the server's `/metrics` endpoint, and document outcome counters. Both commands
+take it — the OCR pipeline and `paperscale evaluate` — and it is off by default:
+without `--tui` the output is exactly what it always was.
+
+```bash
+poetry run paperscale ./workspace --pdfs './docs/*.pdf' \
+  --server http://127.0.0.1:8000/v1 --tui
+```
+
+The dashboard is designed for tmux: the layout is recomputed on every frame, so
+splitting, zooming, and detach/reattach all resize cleanly. While it is on,
+nothing may write to stderr underneath the frame, so the full log is routed to a
+file and only warnings appear in the event pane:
+
+- pipeline — `<workspace>/logs/run-<pid>.log`, or the path given to
+  `--disk_logging`.
+- `evaluate` — `<--db directory>/logs/evaluate-<pid>.log`, or the path given to
+  `--disk-logging`. (evaluate has no workspace, so the database's directory is
+  its home.)
+
+The path is printed once the frame is gone, since the alternate screen keeps no
+scrollback.
+
+- `PAPERSCALE_TUI_ASCII=1` — force ASCII borders, bars, and spinner. Use this if
+  your terminal font renders box-drawing or braille characters as blanks or
+  boxes. Font coverage cannot be detected: a UTF-8 locale says nothing about
+  whether the rendering font has a braille block, and under tmux `TERM`
+  describes tmux rather than the outer terminal, so the font actually drawing
+  the glyphs is invisible from inside.
+- `PAPERSCALE_TUI_ASCII=0` — force rich glyphs when detection is over-cautious
+  (an ASCII-declared stream on a terminal that draws them fine).
+- `--tui-poll-interval` — seconds between `/metrics` scrapes (default 5).
+
+If the server exposes no `/metrics` — anything that is not vLLM, such as a
+hosted OpenAI-compatible endpoint — the vllm panel reads `unavailable` and the
+run continues. A statistics panel never ends a twelve-hour job.
+
 ### LightOnOCR-2
 
 `--ocr-model lightonocr2` selects

@@ -10,8 +10,18 @@ from types import SimpleNamespace
 from unittest import mock
 
 from paperscale import pipeline
-from paperscale.pipeline import PageResult, _build_arg_parser, _install_tui_logging, _tui_log_path, classify_document, count_documents, count_retries
+from paperscale.pipeline import PageResult, _build_arg_parser, _tui_log_path, classify_document, count_documents, count_retries
 from paperscale.prompts import PageResponse
+from paperscale.tui import install_tui_logging, restore_console_logging
+
+
+def _install_tui_logging(reporter, log_path):
+    """`install_tui_logging` bound to the pipeline's own loggers, as `main` calls it.
+
+    The helper is generic now (evaluate hands it no logger at all); these tests
+    are about the pipeline's wiring, so they pin the pipeline's arguments.
+    """
+    return install_tui_logging(reporter, log_path, (pipeline.logger, pipeline.server_logger), pipeline.console_handler)
 
 
 def _page(page_num: int, text, is_fallback=False) -> PageResult:
@@ -302,7 +312,7 @@ class TuiLoggingTest(unittest.TestCase):
         root_before = list(root.handlers)
 
         handler = _install_tui_logging(mock.Mock(), None)
-        pipeline._restore_console_logging(handler)
+        restore_console_logging(handler)
 
         for log in (pipeline.logger, pipeline.server_logger):
             self.assertIn(pipeline.console_handler, log.handlers)
@@ -498,7 +508,7 @@ class TuiDiskLoggingTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as ws:
             self.addCleanup(os.chdir, os.getcwd())
             os.chdir(ws)
-            handler = pipeline._install_tui_logging(mock.Mock(), "bare.log")
+            handler = _install_tui_logging(mock.Mock(), "bare.log")
             self.assertIsNotNone(handler)
             self.assertTrue(os.path.exists(os.path.join(ws, "bare.log")))
 
@@ -511,7 +521,7 @@ class TuiDiskLoggingTest(unittest.IsolatedAsyncioTestCase):
             before = {log: list(log.handlers) for log in (pipeline.logger, pipeline.server_logger, logging.getLogger())}
 
             with self.assertRaises(OSError):
-                pipeline._install_tui_logging(mock.Mock(), os.path.join(blocker, "sub", "run.log"))
+                _install_tui_logging(mock.Mock(), os.path.join(blocker, "sub", "run.log"))
 
             for log, handlers in before.items():
                 self.assertEqual(log.handlers, handlers)

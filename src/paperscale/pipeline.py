@@ -43,7 +43,6 @@ import ssl
 import sys
 import tarfile
 import tempfile
-import time
 from dataclasses import dataclass, replace
 from functools import cache
 from urllib.parse import urlparse
@@ -61,6 +60,10 @@ from paperscale.models import DEFAULT_MODEL, MODEL_REGISTRY, OCRModel, build_ocr
 from paperscale.prompts import PageResponse
 from paperscale.quality.verifier import DeterministicQualityVerifier
 from paperscale.renderpdf import png_dark_fraction, render_pdf_to_base64png
+
+# The stderr hand-off is shared with evaluate, which needs the identical ordering
+# guarantee; it lives in tui.py so neither command has to import the other.
+from paperscale.tui import install_tui_logging, restore_console_logging
 from paperscale.version import VERSION
 
 # The dashboard's vLLM column is rendered by push_vllm_stats, shared verbatim with
@@ -1216,100 +1219,6 @@ def _tui_log_path(workspace: str) -> str:
     return os.path.join(workspace, "logs", f"run-{os.getpid()}.log")
 
 
-class _ReporterLogHandler(logging.Handler):
-    """Forward warnings and errors into the dashboard's event pane."""
-
-    def __init__(self, reporter) -> None:
-        super().__init__(level=logging.WARNING)
-        self._reporter = reporter
-        # Handlers this one displaced, restored verbatim by
-        # _restore_console_logging. They live here because the handler is the one
-        # object install and restore already share.
-        self.displaced: list[tuple[logging.Logger, logging.Handler]] = []
-
-    def emit(self, record: logging.LogRecord) -> None:
-        # Logger.callHandlers already screens on self.level, but emit() is the
-        # public entry point a handler is judged on and it does no filtering of
-        # its own. The event pane holds a handful of rows; one INFO line that
-        # slipped in that way costs a warning the user needed to see.
-        if record.levelno < self.level:
-            return
-        try:
-            stamp = time.strftime("%H:%M:%S", time.localtime(record.created))
-            self._reporter.log(f"{stamp}  {record.levelname:<5} {record.getMessage()}")
-        except Exception:  # pragma: no cover - a logging handler must never raise
-            pass
-
-
-def _install_tui_logging(reporter, log_path: str | None) -> _ReporterLogHandler:
-    """Take stderr away from the loggers and give the pane the important lines.
-
-    Nothing may write to stderr underneath a live frame. Everything still lands in
-    the log file, because the alternate screen has no scrollback to recover from.
-
-    The root logger is handled too, and that is not belt-and-braces. `logger` and
-    `server_logger` are the only two carrying `console_handler`, but work_queue,
-    check, front_matter, filter and vllm_stats each own a handler-less module
-    logger that propagates to root -- and `paperscale.filter` calls
-    `logging.basicConfig()` at import, which puts a stderr StreamHandler there.
-    Left alone it prints straight through the frame. (vllm_stats is the sharpest
-    case: its "statistics unavailable" warning would corrupt the very panel it
-    feeds.) Root also has to keep at least one handler afterwards, or
-    `logging.lastResort` takes over and writes to stderr in its place.
-    """
-    # Every fallible step runs first, before a single handler moves. Creating the
-    # directory and opening the file can both raise, and this is called from
-    # `main` *before* it enters the try that would call _restore_console_logging
-    # -- so a raise after the displacement loop would leave all three loggers with
-    # no handlers at all and nothing left to put them back. The feature built to
-    # protect stderr logging would be the thing that destroyed it.
-    file_handler = _open_log_file(log_path) if log_path is not None else None
-
-    root = logging.getLogger()
-    handler = _ReporterLogHandler(reporter)
-    for target, existing in [(logger, console_handler), (server_logger, console_handler), *((root, h) for h in list(root.handlers))]:
-        target.removeHandler(existing)
-        handler.displaced.append((target, existing))
-
-    # `logger` and `server_logger` both set propagate=False, so handlers on root
-    # cannot double-log their records.
-    targets = (logger, server_logger, root)
-    for attachment in (file_handler, handler):
-        if attachment is not None:
-            for target in targets:
-                target.addHandler(attachment)
-    return handler
-
-
-def _open_log_file(log_path: str) -> logging.FileHandler:
-    """Create the log directory and open the file. Fallible on purpose, and isolated.
-
-    `--disk_logging` takes a bare filename as its `const`, so `dirname` is `""` for
-    the common `--disk_logging` (no value) form and `os.makedirs("")` raises
-    FileNotFoundError. `or "."` resolves that to the working directory, which is
-    where a bare filename was always going to land.
-    """
-    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
-    file_handler = logging.FileHandler(log_path, mode="a")
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
-    return file_handler
-
-
-def _restore_console_logging(tui_handler: _ReporterLogHandler) -> None:
-    """Undo _install_tui_logging's rewiring. Must run even when the run crashed.
-
-    The reporter handler comes off every logger it was added to, root included:
-    past the `with rep` block the reporter is dead, and anything still routed into
-    it is lost rather than printed. The file handler stays, matching how
-    --disk_logging behaves for the life of the process.
-    """
-    for target in (logger, server_logger, logging.getLogger()):
-        target.removeHandler(tui_handler)
-    for target, displaced in tui_handler.displaced:
-        target.addHandler(displaced)
-
-
 async def main():
     parser = _build_arg_parser()
     args, unknown_args = parser.parse_known_args()
@@ -1405,7 +1314,7 @@ async def main():
         # itself is handed to _install_tui_logging to open.
         tui_log_path = None if args.disk_logging else _tui_log_path(args.workspace)
         args.disk_logging = args.disk_logging or tui_log_path
-        tui_handler = _install_tui_logging(rep, tui_log_path)
+        tui_handler = install_tui_logging(rep, tui_log_path, (logger, server_logger), console_handler)
         stats = VLLMStats()
         poller = VLLMStatsPoller(metrics_url(args.server), stats, interval=args.tui_poll_interval)
         poller.start()
@@ -1439,7 +1348,7 @@ async def main():
         if poller is not None:
             poller.stop()
         if tui_handler is not None:
-            _restore_console_logging(tui_handler)
+            restore_console_logging(tui_handler)
 
     # The alternate screen is gone by now, so the summary lands on the real
     # screen. Without this a finished run leaves a bare prompt and no numbers.
