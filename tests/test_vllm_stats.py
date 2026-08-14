@@ -3,7 +3,7 @@
 import pathlib
 import unittest
 
-from paperscale.vllm_stats import Snapshot, metrics_url, parse_metrics, snapshot_from  # noqa: F401
+from paperscale.vllm_stats import Rates, Snapshot, VLLMStats, metrics_url, parse_metrics, snapshot_from  # noqa: F401
 
 FIXTURE = pathlib.Path(__file__).parent / "fixtures" / "vllm_metrics.txt"
 
@@ -92,6 +92,107 @@ class MetricsUrlTest(unittest.TestCase):
 
     def test_bare_base_url(self):
         self.assertEqual(metrics_url("http://gigaspark:8000"), "http://gigaspark:8000/metrics")
+
+
+class _FakeClock:
+    """Deterministic monotonic clock. Advance with `tick`."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def tick(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class VLLMStatsTest(unittest.TestCase):
+    def setUp(self):
+        self.clock = _FakeClock()
+        self.stats = VLLMStats(window=60.0, clock=self.clock)
+
+    def test_single_sample_has_no_rate(self):
+        # One point cannot make a rate; must be `-`, not 0.
+        self.stats.add(Snapshot(generation_tokens=100.0))
+        self.assertIsNone(self.stats.rates().gen_tps)
+
+    def test_windowed_rate_from_two_samples(self):
+        self.stats.add(Snapshot(generation_tokens=100.0))
+        self.clock.tick(10.0)
+        self.stats.add(Snapshot(generation_tokens=600.0))
+        self.assertAlmostEqual(self.stats.rates().gen_tps, 50.0)  # 500 tokens / 10 s
+
+    def test_window_trims_old_samples(self):
+        self.stats.add(Snapshot(generation_tokens=0.0))
+        self.clock.tick(120.0)  # older than the 60 s window
+        self.stats.add(Snapshot(generation_tokens=1200.0))
+        self.clock.tick(10.0)
+        self.stats.add(Snapshot(generation_tokens=1700.0))
+        # Window holds only the last two samples: 500 tokens over 10 s.
+        self.assertAlmostEqual(self.stats.rates().gen_tps, 50.0)
+
+    def test_avg_spans_since_first_sample(self):
+        self.stats.add(Snapshot(generation_tokens=0.0))
+        self.clock.tick(100.0)
+        self.stats.add(Snapshot(generation_tokens=1000.0))
+        self.assertAlmostEqual(self.stats.rates().gen_tps_avg, 10.0)  # 1000 / 100 s
+
+    def test_kv_hit_is_a_windowed_ratio(self):
+        self.stats.add(Snapshot(cache_hits=0.0, cache_queries=0.0))
+        self.clock.tick(10.0)
+        self.stats.add(Snapshot(cache_hits=80.0, cache_queries=100.0))
+        self.assertAlmostEqual(self.stats.rates().kv_hit, 0.8)
+
+    def test_counter_reset_yields_none_not_negative(self):
+        # A vLLM restart sends counters backwards. A negative tok/s is nonsense.
+        self.stats.add(Snapshot(generation_tokens=1000.0))
+        self.clock.tick(10.0)
+        self.stats.add(Snapshot(generation_tokens=5.0))
+        rates = self.stats.rates()
+        self.assertIsNone(rates.gen_tps)
+        self.assertIsNone(rates.gen_tps_avg)
+
+    def test_recovers_after_counter_reset(self):
+        self.stats.add(Snapshot(generation_tokens=1000.0))
+        self.clock.tick(10.0)
+        self.stats.add(Snapshot(generation_tokens=5.0))  # reset, window cleared
+        self.clock.tick(10.0)
+        self.stats.add(Snapshot(generation_tokens=105.0))
+        self.assertAlmostEqual(self.stats.rates().gen_tps, 10.0)
+
+    def test_zero_elapsed_time_yields_none(self):
+        self.stats.add(Snapshot(generation_tokens=100.0))
+        self.stats.add(Snapshot(generation_tokens=200.0))  # same instant
+        self.assertIsNone(self.stats.rates().gen_tps)
+
+    def test_zero_queries_in_window_yields_none(self):
+        self.stats.add(Snapshot(cache_hits=10.0, cache_queries=50.0))
+        self.clock.tick(10.0)
+        self.stats.add(Snapshot(cache_hits=10.0, cache_queries=50.0))  # idle server
+        self.assertIsNone(self.stats.rates().kv_hit)
+
+    def test_gauges_come_from_the_latest_sample(self):
+        self.stats.add(Snapshot(running=1.0, waiting=9.0, kv_usage=0.1))
+        self.clock.tick(5.0)
+        self.stats.add(Snapshot(running=4.0, waiting=0.0, kv_usage=0.7))
+        rates = self.stats.rates()
+        self.assertEqual(rates.running, 4.0)
+        self.assertEqual(rates.waiting, 0.0)
+        self.assertAlmostEqual(rates.kv_usage, 0.7)
+
+    def test_empty_stats_are_all_none(self):
+        rates = self.stats.rates()
+        self.assertIsNone(rates.gen_tps)
+        self.assertIsNone(rates.running)
+
+    def test_missing_counter_does_not_break_others(self):
+        self.stats.add(Snapshot(generation_tokens=None, prompt_tokens=0.0))
+        self.clock.tick(10.0)
+        self.stats.add(Snapshot(generation_tokens=None, prompt_tokens=100.0))
+        rates = self.stats.rates()
+        self.assertIsNone(rates.gen_tps)
+        self.assertAlmostEqual(rates.prompt_tps, 10.0)
 
 
 if __name__ == "__main__":

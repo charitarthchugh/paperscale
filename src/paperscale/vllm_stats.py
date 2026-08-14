@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import math
 import re
+import time
+from collections import deque
 from dataclasses import dataclass
 
 # name{label="value",...} 123.0   -- the label block is optional
@@ -108,3 +110,100 @@ def metrics_url(server: str) -> str:
     if base.endswith("/v1"):
         base = base[: -len("/v1")].rstrip("/")
     return f"{base}/metrics"
+
+
+# Counters that must only ever increase. A decrease means the server restarted.
+_MONOTONIC = ("generation_tokens", "prompt_tokens", "cache_hits", "cache_queries")
+
+
+@dataclass(frozen=True)
+class Rates:
+    gen_tps: float | None = None
+    gen_tps_avg: float | None = None
+    prompt_tps: float | None = None
+    prompt_tps_avg: float | None = None
+    kv_hit: float | None = None
+    kv_hit_avg: float | None = None
+    running: float | None = None
+    waiting: float | None = None
+    kv_usage: float | None = None
+
+
+def _rate(newer: Snapshot, older: Snapshot, field: str, seconds: float) -> float | None:
+    """Tokens per second between two samples, or None if underivable."""
+    new_val, old_val = getattr(newer, field), getattr(older, field)
+    if new_val is None or old_val is None or seconds <= 0:
+        return None
+    return (new_val - old_val) / seconds
+
+
+def _ratio(newer: Snapshot, older: Snapshot, num: str, den: str) -> float | None:
+    """Hit ratio between two samples, or None if the denominator did not move."""
+    d_num = _delta(newer, older, num)
+    d_den = _delta(newer, older, den)
+    if d_num is None or d_den is None or d_den <= 0:
+        return None
+    return d_num / d_den
+
+
+def _delta(newer: Snapshot, older: Snapshot, field: str) -> float | None:
+    new_val, old_val = getattr(newer, field), getattr(older, field)
+    if new_val is None or old_val is None:
+        return None
+    return new_val - old_val
+
+
+class VLLMStats:
+    """Sliding window of scrapes, exposing windowed and since-start figures.
+
+    ``*_avg`` means since the first scrape of this run, not since server boot:
+    ``/metrics`` exposes no dependable uptime, and reporting a server-lifetime
+    ratio beside a run-scoped rate in the same panel would mislead.
+    """
+
+    def __init__(self, window: float = 60.0, clock=time.monotonic) -> None:
+        self._window = window
+        self._clock = clock
+        self._samples: deque[tuple[float, Snapshot]] = deque()
+        self._first: tuple[float, Snapshot] | None = None
+
+    def add(self, snap: Snapshot) -> None:
+        now = self._clock()
+        if self._is_reset(snap):
+            # Server restarted: every prior sample is from a different counter
+            # lineage and differencing across the boundary is meaningless.
+            self._samples.clear()
+            self._first = None
+        self._samples.append((now, snap))
+        if self._first is None:
+            self._first = (now, snap)
+        while len(self._samples) > 2 and self._samples[0][0] < now - self._window:
+            self._samples.popleft()
+
+    def _is_reset(self, snap: Snapshot) -> bool:
+        if not self._samples:
+            return False
+        _, latest = self._samples[-1]
+        return any(getattr(snap, f) is not None and getattr(latest, f) is not None and getattr(snap, f) < getattr(latest, f) for f in _MONOTONIC)
+
+    def rates(self) -> Rates:
+        if not self._samples:
+            return Rates()
+        newest_t, newest = self._samples[-1]
+        oldest_t, oldest = self._samples[0]
+        window_s = newest_t - oldest_t
+
+        first_t, first = self._first if self._first is not None else (newest_t, newest)
+        avg_s = newest_t - first_t
+
+        return Rates(
+            gen_tps=_rate(newest, oldest, "generation_tokens", window_s),
+            gen_tps_avg=_rate(newest, first, "generation_tokens", avg_s),
+            prompt_tps=_rate(newest, oldest, "prompt_tokens", window_s),
+            prompt_tps_avg=_rate(newest, first, "prompt_tokens", avg_s),
+            kv_hit=_ratio(newest, oldest, "cache_hits", "cache_queries"),
+            kv_hit_avg=_ratio(newest, first, "cache_hits", "cache_queries"),
+            running=newest.running,
+            waiting=newest.waiting,
+            kv_usage=newest.kv_usage,
+        )
