@@ -129,9 +129,15 @@ class RichReporter:
             # nine rows at width 40 and blows the budget -- and rich wraps rather than
             # overflows, so only a row count catches it, never a width assertion.
             TextColumn("[bold]{task.description}", table_column=Column(no_wrap=True, overflow=self._overflow)),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
+            # Every column needs the overflow too, not just the description: rich's
+            # default is `ellipsis` and it truncates with U+2026 whatever the console
+            # encoding says, so on a genuinely ascii-encoded stderr a narrow pane
+            # raises UnicodeEncodeError straight out of console.print and into the
+            # caller. These three take no table_column of their own -- unlike
+            # TextColumn -- so `Column(overflow=...)` drops no default.
+            BarColumn(table_column=Column(overflow=self._overflow)),
+            MofNCompleteColumn(table_column=Column(overflow=self._overflow)),
+            TimeElapsedColumn(table_column=Column(overflow=self._overflow)),
             console=self._console,
         )
         self._live = None

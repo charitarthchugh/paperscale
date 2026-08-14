@@ -240,12 +240,30 @@ class FixedHeightRenderTest(unittest.TestCase):
         self.assertLess(len(short), len(tall))
 
     def test_ascii_mode_emits_no_box_drawing(self):
-        console, _ = _SizedConsole.make(80, 24, encoding="ascii")
+        # Narrow widths are the whole point: truncation is clean at 80, so a
+        # single 80-column case cannot see a column that still ellipsizes with
+        # U+2026. The progress counters start truncating at 40 and the bar and
+        # elapsed columns follow at 30 and 20.
+        for width in (20, 30, 40, 80):
+            console, _ = _SizedConsole.make(width, 24, encoding="ascii")
+            rep = RichReporter("paperscale", console=console)
+            self._populate(rep)
+            text = "\n".join(_frame_lines(rep, console))
+            for char in text:
+                self.assertLess(ord(char), 256, f"non-Latin-1 codepoint {char!r} in ASCII mode at width {width}")
+
+    def test_ascii_stream_renders_without_encoding_error(self):
+        # The reporter is pure instrumentation: it must never take down the run
+        # it reports on. Against a genuinely ascii-encoded stderr a stray U+2026
+        # raises UnicodeEncodeError out of console.print, into the caller.
+        from rich.console import Console
+
+        stream = io.TextIOWrapper(io.BytesIO(), encoding="ascii", newline="")
+        console = Console(file=stream, force_terminal=True, width=20, height=24)
         rep = RichReporter("paperscale", console=console)
         self._populate(rep)
-        text = "\n".join(_frame_lines(rep, console))
-        for char in text:
-            self.assertLess(ord(char), 256, f"non-Latin-1 codepoint {char!r} in ASCII mode")
+        console.print(rep.__rich__())  # must not raise UnicodeEncodeError
+        stream.flush()
 
     def test_grouped_stats_render_under_their_own_heading(self):
         console, _ = _SizedConsole.make(120, 30)
