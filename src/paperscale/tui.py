@@ -257,3 +257,54 @@ def _layout_budget(height: int, n_stats: int, n_phases: int) -> Budget:
     else:
         bar_rows += surplus
     return Budget(stat_rows, bar_rows, event_rows)
+
+
+# --------------------------------------------------------------------------- #
+# Terminal capability
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class RenderStyle:
+    """What this terminal can be trusted to draw.
+
+    Geometry is measured per render (see _layout_budget); capability is resolved
+    once, because it does not change mid-run.
+    """
+
+    ascii_only: bool
+    spinner: str
+    use_screen: bool
+    refresh_per_second: int
+
+    @property
+    def box(self):
+        from rich import box as rich_box
+
+        return rich_box.ASCII if self.ascii_only else rich_box.ROUNDED
+
+
+def terminal_profile(encoding: str, env: dict) -> RenderStyle:
+    """Resolve render style from terminal capabilities.
+
+    Glyph coverage cannot be detected, and tmux makes that structurally worse:
+    TERM describes tmux, not the outer terminal, so the outer terminal's font is
+    invisible here and a UTF-8 locale says nothing about whether the rendering
+    font has a braille block. Hence PAPERSCALE_TUI_ASCII.
+    """
+    term = (env.get("TERM") or "").lower()
+    override = env.get("PAPERSCALE_TUI_ASCII")
+    if override == "1":
+        ascii_only = True
+    elif override == "0":
+        ascii_only = False
+    else:
+        ascii_only = "utf" not in (encoding or "").lower()
+
+    # The Linux VT console draws boxes but its font has no braille block.
+    braille_ok = not ascii_only and not term.startswith("linux")
+    multiplexed = term.startswith("screen") or term.startswith("tmux")
+    return RenderStyle(
+        ascii_only=ascii_only,
+        spinner="dots" if braille_ok else "line",
+        use_screen=True,
+        refresh_per_second=2 if multiplexed else 4,
+    )

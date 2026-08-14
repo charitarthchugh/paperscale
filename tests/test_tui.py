@@ -5,7 +5,7 @@ import unittest
 
 from paperscale.evaluation.runs import DocMeta, PageText
 from paperscale.evaluation.textlayer import compute_textlayer_agreement
-from paperscale.tui import Budget, NullReporter, RichReporter, _layout_budget, make_reporter  # noqa: F401
+from paperscale.tui import Budget, NullReporter, RenderStyle, RichReporter, _layout_budget, make_reporter, terminal_profile  # noqa: F401
 
 
 class _FakeTTY(io.StringIO):
@@ -106,6 +106,46 @@ class LayoutBudgetTest(unittest.TestCase):
     def test_bars_never_exceed_phase_count_while_events_can_grow(self):
         b = _layout_budget(40, 3, 2)
         self.assertEqual(b.bar_rows, 2)
+
+
+class TerminalProfileTest(unittest.TestCase):
+    def test_utf8_xterm_gets_rich_glyphs(self):
+        style = terminal_profile("utf-8", {"TERM": "xterm-256color"})
+        self.assertFalse(style.ascii_only)
+        self.assertEqual(style.spinner, "dots")
+
+    def test_non_utf8_falls_back_to_ascii(self):
+        style = terminal_profile("ascii", {"TERM": "xterm-256color"})
+        self.assertTrue(style.ascii_only)
+        self.assertEqual(style.spinner, "line")
+
+    def test_linux_console_keeps_boxes_but_drops_braille(self):
+        # The VT console renders box-drawing fine; its font has no braille block.
+        style = terminal_profile("utf-8", {"TERM": "linux"})
+        self.assertFalse(style.ascii_only)
+        self.assertEqual(style.spinner, "line")
+
+    def test_tmux_slows_refresh(self):
+        for term in ("screen-256color", "tmux-256color"):
+            style = terminal_profile("utf-8", {"TERM": term})
+            self.assertEqual(style.refresh_per_second, 2, term)
+            self.assertTrue(style.use_screen)
+
+    def test_plain_terminal_refreshes_faster(self):
+        self.assertEqual(terminal_profile("utf-8", {"TERM": "xterm-256color"}).refresh_per_second, 4)
+
+    def test_env_override_forces_ascii(self):
+        # Font coverage is undetectable, so the escape hatch must be explicit.
+        style = terminal_profile("utf-8", {"TERM": "xterm-256color", "PAPERSCALE_TUI_ASCII": "1"})
+        self.assertTrue(style.ascii_only)
+
+    def test_env_override_forces_rich_glyphs(self):
+        style = terminal_profile("ascii", {"TERM": "xterm-256color", "PAPERSCALE_TUI_ASCII": "0"})
+        self.assertFalse(style.ascii_only)
+
+    def test_missing_term_is_safe(self):
+        style = terminal_profile("utf-8", {})
+        self.assertIsInstance(style, RenderStyle)
 
 
 if __name__ == "__main__":
