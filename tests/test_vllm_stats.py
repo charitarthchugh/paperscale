@@ -340,12 +340,49 @@ class FormatRateTest(unittest.TestCase):
 
 
 class PushVllmStatsTest(unittest.TestCase):
-    def test_unavailable_poller_shows_status_only(self):
+    def test_unavailable_poller_blanks_the_rates(self):
         rep = _RecordingRep()
         poller = VLLMStatsPoller("http://x/metrics", self.stats_obj(), fetch=lambda url: "")
         poller.available = False
         push_vllm_stats(rep, self.stats_obj(), poller)
-        self.assertEqual(rep.stats["vllm"], {"status": "unavailable"})
+        self.assertEqual(rep.stats["vllm"], {"status": "unavailable", "gen": "-", "prompt": "-", "kv hit": "-", "running": "-"})
+
+    def test_transitions_leave_no_stale_rows(self):
+        """unavailable -> available -> unavailable, with nothing surviving a step.
+
+        `set_stat` can only add or overwrite, so a branch writing a subset of the
+        rows leaves the other branch's values on the panel. That is what left
+        `status: unavailable` sitting beside live token rates for a whole run.
+        """
+        clock = _FakeClock()
+        stats = VLLMStats(clock=clock)
+        rep = _RecordingRep()
+        poller = VLLMStatsPoller("http://x/metrics", stats, fetch=lambda url: "")
+
+        # 1. Down. The pipeline's very first tick always looks like this: the
+        #    poller thread has not completed a scrape yet.
+        poller.available = False
+        push_vllm_stats(rep, stats, poller)
+        self.assertEqual(rep.stats["vllm"]["status"], "unavailable")
+        self.assertEqual(rep.stats["vllm"]["gen"], "-")
+
+        # 2. Recovered. No "unavailable" may remain anywhere in the group.
+        stats.add(Snapshot(generation_tokens=0.0, prompt_tokens=0.0, cache_hits=0.0, cache_queries=0.0, running=8.0, waiting=2.0))
+        clock.tick(10.0)
+        stats.add(Snapshot(generation_tokens=4120.0, prompt_tokens=1000.0, cache_hits=93.0, cache_queries=100.0, running=8.0, waiting=2.0))
+        poller.available = True
+        push_vllm_stats(rep, stats, poller)
+        self.assertEqual(rep.stats["vllm"]["status"], "live")
+        self.assertIn("412 tok/s", rep.stats["vllm"]["gen"])
+        self.assertNotIn("unavailable", "".join(map(str, rep.stats["vllm"].values())))
+
+        # 3. Down again. The rates must not linger as though they were current.
+        poller.available = False
+        push_vllm_stats(rep, stats, poller)
+        self.assertEqual(rep.stats["vllm"], {"status": "unavailable", "gen": "-", "prompt": "-", "kv hit": "-", "running": "-"})
+
+        # The row set is identical at every step, so no key can outlive a change.
+        self.assertEqual(set(rep.stats["vllm"]), {"status", "gen", "prompt", "kv hit", "running"})
 
     def test_populates_all_rows_when_available(self):
         clock = _FakeClock()

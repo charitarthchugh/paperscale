@@ -966,6 +966,7 @@ async def metrics_reporter(work_queue, rep=None, stats=None, poller=None):
             logger.info("\n" + str(await tracker.get_status_table()))
         else:
             totals = metrics.get_total_metrics()
+            rep.set_stat("docs", f"{count_documents(totals):,}")
             rep.set_stat("queue", work_queue.size)
             rep.set_stat("pages", f"{totals.get('completed_pages', 0):,}")
             rep.set_stat("tokens", f"{totals.get('server_output_tokens', 0):,}")
@@ -973,6 +974,24 @@ async def metrics_reporter(work_queue, rep=None, stats=None, poller=None):
             _push_issue_stats(rep, totals)
             push_vllm_stats(rep, stats, poller)
         await asyncio.sleep(10)
+
+
+# Every document reaches exactly one of these, and process_single_pdf / process_pdf
+# guarantee it fires exactly once (see the docs_crashed comment at their call site).
+# Summing them is therefore a document count, not an approximation.
+_DOC_OUTCOMES = ("docs_ok", "docs_partial", "docs_discarded", "docs_crashed", "docs_missing")
+
+
+def count_documents(totals: dict) -> int:
+    """Documents that have reached an outcome, of any kind.
+
+    Deliberately reported without a denominator. The queue is measured in work
+    items -- page groups sized by `--pages_per_group` -- so the queue length is
+    not a document total and never was; the only honest denominator would need a
+    full scan of the inputs that nothing else in the run performs. The work-items
+    progress bar already carries an X/Y for the thing that does have one.
+    """
+    return sum(totals.get(key, 0) for key in _DOC_OUTCOMES)
 
 
 def count_retries(totals: dict) -> int:
@@ -1362,7 +1381,9 @@ async def main():
     try:
         with rep:
             rep.set_stat("workspace", args.workspace)
-            rep.set_stat("docs", f"0/{qsize}")
+            # `docs` is owned by metrics_reporter's tick, not seeded here: a value
+            # written once before any work starts is a constant, and it read
+            # "0/<work items>" for entire runs.
             # Only the live reporter is asked for a phase. NullReporter.phase()
             # prints a `[name]` header to stderr -- right for evaluate, which
             # always printed one, but brand-new output here. --tui has to be

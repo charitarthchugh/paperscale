@@ -303,15 +303,37 @@ def format_rate(value: float | None) -> str:
     return f"{value / 1000:.1f}k" if value >= 1000 else f"{value:.0f}"
 
 
+# Every push writes this exact set of rows, in this order. A reporter's `set_stat`
+# can only add or overwrite -- there is no way to take a row back off the panel --
+# so a branch that writes a subset leaves the rest of the previous branch behind.
+# That is what put a permanent `status: unavailable` next to live token rates: the
+# pipeline's first tick fires before the poller's first scrape completes, and
+# nothing ever overwrote that row again. A fixed row set makes the panel
+# self-consistent in both directions by construction rather than by care.
+_VLLM_ROWS = ("status", "gen", "prompt", "kv hit", "running")
+
+
 def push_vllm_stats(rep, stats: "VLLMStats | None", poller: "VLLMStatsPoller | None") -> None:
-    """Fill the reporter's `vllm` column. Shared by the pipeline and evaluate."""
+    """Fill the reporter's `vllm` column. Shared by the pipeline and evaluate.
+
+    Both branches must supply every row in `_VLLM_ROWS`; the write loop raises a
+    KeyError if one forgets, which is why the values are assembled first rather
+    than pushed inline. Unavailable renders the rates as `-` -- the same "no
+    measurement" marker `format_rate` uses -- so a dead scraper cannot leave its
+    last numbers on screen reading as though they were current.
+    """
     if stats is None:
         return
     if poller is not None and not poller.available:
-        rep.set_stat("status", "unavailable", group="vllm")
-        return
-    rates = stats.rates()
-    rep.set_stat("gen", f"{format_rate(rates.gen_tps)} tok/s  (avg {format_rate(rates.gen_tps_avg)})", group="vllm")
-    rep.set_stat("prompt", f"{format_rate(rates.prompt_tps)} tok/s  (avg {format_rate(rates.prompt_tps_avg)})", group="vllm")
-    rep.set_stat("kv hit", "-" if rates.kv_hit is None else f"{rates.kv_hit:.0%}", group="vllm")
-    rep.set_stat("running", f"{rates.running or 0:.0f}   wait {rates.waiting or 0:.0f}", group="vllm")
+        values = dict.fromkeys(_VLLM_ROWS, "-") | {"status": "unavailable"}
+    else:
+        rates = stats.rates()
+        values = {
+            "status": "live",
+            "gen": f"{format_rate(rates.gen_tps)} tok/s  (avg {format_rate(rates.gen_tps_avg)})",
+            "prompt": f"{format_rate(rates.prompt_tps)} tok/s  (avg {format_rate(rates.prompt_tps_avg)})",
+            "kv hit": "-" if rates.kv_hit is None else f"{rates.kv_hit:.0%}",
+            "running": f"{rates.running or 0:.0f}   wait {rates.waiting or 0:.0f}",
+        }
+    for row in _VLLM_ROWS:
+        rep.set_stat(row, values[row], group="vllm")

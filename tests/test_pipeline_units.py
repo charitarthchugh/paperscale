@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from paperscale import pipeline
-from paperscale.pipeline import PageResult, _build_arg_parser, _install_tui_logging, _tui_log_path, classify_document, count_retries
+from paperscale.pipeline import PageResult, _build_arg_parser, _install_tui_logging, _tui_log_path, classify_document, count_documents, count_retries
 from paperscale.prompts import PageResponse
 
 
@@ -394,6 +394,21 @@ class NoTuiIsInvisibleTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(os.path.exists(os.path.join(ws, "logs")))
 
 
+class CountDocumentsTest(unittest.TestCase):
+    def test_sums_every_outcome_counter(self):
+        totals = {"docs_ok": 40, "docs_partial": 3, "docs_discarded": 2, "docs_crashed": 1, "docs_missing": 4}
+        self.assertEqual(count_documents(totals), 50)
+
+    def test_missing_counters_are_zero(self):
+        self.assertEqual(count_documents({"docs_ok": 7}), 7)
+
+    def test_unrelated_metrics_ignored(self):
+        self.assertEqual(count_documents({"completed_pages": 900, "server_output_tokens": 12}), 0)
+
+    def test_empty_totals_is_zero(self):
+        self.assertEqual(count_documents({}), 0)
+
+
 class _FakeLiveReporter:
     """A reporter that is not a NullReporter, so main() takes the live path."""
 
@@ -417,6 +432,36 @@ class _FakeLiveReporter:
         self.stats[(group, name)] = value
 
 
+class DocsStatTest(unittest.IsolatedAsyncioTestCase):
+    """The `docs` row must track the outcome counters, not a value fixed at startup."""
+
+    async def _one_tick(self, rep, totals, queue_size=7):
+        class _Stop(Exception):
+            pass
+
+        with (
+            mock.patch.object(pipeline, "metrics") as metrics,
+            mock.patch.object(pipeline.asyncio, "sleep", side_effect=_Stop),
+        ):
+            metrics.get_total_metrics.return_value = totals
+            with self.assertRaises(_Stop):
+                await pipeline.metrics_reporter(SimpleNamespace(size=queue_size), rep)
+
+    async def test_docs_reflects_the_counters_and_carries_no_denominator(self):
+        rep = _FakeLiveReporter()
+        await self._one_tick(rep, {"docs_ok": 40, "docs_partial": 3, "docs_discarded": 2, "docs_crashed": 1, "docs_missing": 4})
+        self.assertEqual(rep.stats[("run", "docs")], "50")
+        # "0/500" was the bug: work items are page groups, not documents.
+        self.assertNotIn("/", rep.stats[("run", "docs")])
+
+    async def test_docs_moves_between_ticks(self):
+        rep = _FakeLiveReporter()
+        await self._one_tick(rep, {"docs_ok": 2})
+        self.assertEqual(rep.stats[("run", "docs")], "2")
+        await self._one_tick(rep, {"docs_ok": 1200, "docs_crashed": 34})
+        self.assertEqual(rep.stats[("run", "docs")], "1,234")
+
+
 class TuiCleanupTest(unittest.IsolatedAsyncioTestCase):
     """A crash mid-run must not leave the process with no stderr logging."""
 
@@ -429,6 +474,7 @@ class TuiCleanupTest(unittest.IsolatedAsyncioTestCase):
         queue.size = 1
         poller = mock.Mock()
         poller.available = False
+        reporter = _FakeLiveReporter()
 
         async def boom(*a, **kw):
             raise RuntimeError("worker exploded")
@@ -441,7 +487,7 @@ class TuiCleanupTest(unittest.IsolatedAsyncioTestCase):
                 mock.patch.object(pipeline, "WorkQueue", return_value=queue),
                 mock.patch.object(pipeline, "vllm_server_ready", new=mock.AsyncMock()),
                 mock.patch.object(pipeline, "worker", new=boom),
-                mock.patch("paperscale.tui.make_reporter", return_value=_FakeLiveReporter()),
+                mock.patch("paperscale.tui.make_reporter", return_value=reporter),
                 mock.patch("paperscale.vllm_stats.VLLMStatsPoller", return_value=poller),
             ):
                 with self.assertRaises(RuntimeError):
@@ -453,6 +499,9 @@ class TuiCleanupTest(unittest.IsolatedAsyncioTestCase):
 
         poller.start.assert_called_once()
         poller.stop.assert_called_once()
+        # main() must not seed `docs` with a startup constant. Deterministic either
+        # way: absent if no tick ran, otherwise a plain count from the counters.
+        self.assertNotIn("/", str(reporter.stats.get(("run", "docs"), "")))
         # Every displaced handler is back, so a crashed run still logs to stderr.
         for log, handlers in before:
             for handler in handlers:
