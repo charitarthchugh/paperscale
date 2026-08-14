@@ -4,7 +4,17 @@ import pathlib
 import unittest
 from unittest import mock
 
-from paperscale.vllm_stats import Rates, Snapshot, VLLMStats, VLLMStatsPoller, format_rate, metrics_url, parse_metrics, push_vllm_stats, snapshot_from  # noqa: F401
+from paperscale.vllm_stats import (
+    Rates,  # noqa: F401
+    Snapshot,
+    VLLMStats,
+    VLLMStatsPoller,
+    format_rate,
+    metrics_url,
+    parse_metrics,
+    push_vllm_stats,
+    snapshot_from,
+)
 
 FIXTURE = pathlib.Path(__file__).parent / "fixtures" / "vllm_metrics.txt"
 
@@ -257,6 +267,26 @@ class VLLMStatsPollerTest(unittest.TestCase):
         self.assertEqual(log.warning.call_count, 1)
         self.assertEqual(log.debug.call_count, 2)
 
+    def test_warns_again_after_a_fresh_failure_following_recovery(self):
+        # A recovered poller must not stay "already warned" forever: a later,
+        # unrelated outage is a new incident and must WARNING again, not hide
+        # behind DEBUG from the first incident.
+        calls = {"n": 0}
+
+        def flaky(url):
+            calls["n"] += 1
+            if calls["n"] in (1, 3):
+                raise OSError("nope")
+            return FIXTURE.read_text()
+
+        poller = VLLMStatsPoller("http://x/metrics", self.stats, fetch=flaky)
+        with mock.patch("paperscale.vllm_stats.logger") as log:
+            self.assertFalse(poller._tick())  # fails -> WARNING
+            self.assertTrue(poller._tick())  # recovers -> resets the latch
+            self.assertFalse(poller._tick())  # fails again -> WARNING, not DEBUG
+        self.assertEqual(log.warning.call_count, 2)
+        self.assertEqual(log.debug.call_count, 0)
+
     def test_recovers_after_failure(self):
         calls = {"n": 0}
 
@@ -274,6 +304,20 @@ class VLLMStatsPollerTest(unittest.TestCase):
     def test_stop_is_safe_before_start(self):
         poller = VLLMStatsPoller("http://x/metrics", self.stats, fetch=lambda url: "")
         poller.stop()  # must not raise
+
+    def test_stop_then_start_clears_the_stop_event(self):
+        # stop() sets the threading.Event; a later start() must clear it, or
+        # _run()'s loop condition (`while not self._stop.is_set()`) is already
+        # false and the new thread exits without ever polling. Thread class is
+        # mocked so no real thread is spun up; we assert on the event itself.
+        poller = VLLMStatsPoller("http://x/metrics", self.stats, fetch=lambda url: "")
+        with mock.patch("paperscale.vllm_stats.threading.Thread") as thread_cls:
+            thread_cls.return_value = mock.Mock()
+            poller.start()
+            poller.stop()
+            self.assertTrue(poller._stop.is_set())
+            poller.start()
+            self.assertFalse(poller._stop.is_set())
 
 
 class _RecordingRep:

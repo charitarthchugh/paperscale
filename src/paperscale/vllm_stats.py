@@ -252,6 +252,7 @@ class VLLMStatsPoller:
     def start(self) -> None:
         if self._thread is not None:
             return
+        self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="vllm-stats", daemon=True)
         self._thread.start()
 
@@ -282,6 +283,7 @@ class VLLMStatsPoller:
                 logger.debug("vLLM statistics still unavailable at %s: %s", self._url, exc)
             self.available = False
             return False
+        self._warned = False
         self.available = True
         return True
 
