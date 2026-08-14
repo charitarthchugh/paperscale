@@ -41,12 +41,18 @@ def _extract_layer(doc: str, page: int) -> str:
 
 
 def compute_textlayer_agreement(
-    pages: list[PageText], metas: list[DocMeta], progress=None, jobs: int | None = None
+    pages: list[PageText], metas: list[DocMeta], progress=None, jobs: int | None = None,
+    on_doc=None,
 ) -> tuple[list[tuple[str, str, int, float, float]], SkipReport]:
     """``progress``: optional callable(note) invoked once per page (instrumentation only).
 
     ``jobs``: thread-pool width for the pdftotext subprocess calls (I/O-bound,
     GIL released while blocked on the child process).
+
+    ``on_doc``: optional callable(model, doc, rows) invoked as each doc finishes, so
+    the caller can commit per doc and resume an interrupted phase. It fires for
+    skipped docs too (with no rows): the doc IS complete, and a caller that only
+    heard about row-producing docs would re-attempt the skipped ones every run.
     """
     fallback = {(m.model, m.doc): m.fallback_pages for m in metas}
     report = SkipReport(docs_missing_pdf=0, docs_with_fallback=0, pages_blank_layer=0)
@@ -71,17 +77,36 @@ def compute_textlayer_agreement(
     # ex.map preserves candidate (= page) order, so rows/progress/counters stay
     # deterministic on this (the main) thread.
     workers = max(1, jobs or min(32, (os.cpu_count() or 4) * 4))
+    # Rows of the doc currently being consumed, flushed to on_doc at each boundary.
+    # `pages` is grouped by doc in practice (load_run emits a doc's pages together);
+    # a doc split across non-adjacent runs would simply flush more than once, which
+    # write_doc tolerates because it replaces that doc's rows wholesale.
+    doc_key: tuple[str, str] | None = None
+    doc_rows: list[tuple[str, str, int, float, float]] = []
+
+    def flush() -> None:
+        nonlocal doc_key, doc_rows
+        if doc_key is not None and on_doc is not None:
+            on_doc(doc_key[0], doc_key[1], doc_rows)
+        doc_key, doc_rows = None, []
+
     with ThreadPoolExecutor(max_workers=workers) as ex:
         layers = iter(ex.map(lambda p: _extract_layer(p.doc, p.page), candidates))
         for pg in pages:
             if progress is not None:
                 progress(f"{pg.doc}#{pg.page}")
+            if (pg.model, pg.doc) != doc_key:
+                flush()
+                doc_key = (pg.model, pg.doc)
             if (pg.model, pg.doc) in skip_docs:
                 continue
             layer = next(layers)
             if sum(c.isalnum() for c in layer) < _MIN_ALNUM:
                 report.pages_blank_layer += 1
                 continue
-            rows.append((pg.model, pg.doc, pg.page, bow_f1(pg.text, layer), one_minus_ned(pg.text, layer)))
+            row = (pg.model, pg.doc, pg.page, bow_f1(pg.text, layer), one_minus_ned(pg.text, layer))
+            rows.append(row)
+            doc_rows.append(row)
+        flush()
 
     return rows, report

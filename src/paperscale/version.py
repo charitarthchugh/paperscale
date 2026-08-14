@@ -1,5 +1,5 @@
 _MAJOR = "0"
-_MINOR = "6"
+_MINOR = "7"
 _PATCH = "0"
 
 VERSION_SHORT = f"{_MAJOR}.{_MINOR}"
