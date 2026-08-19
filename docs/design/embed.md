@@ -107,7 +107,8 @@ to `.npz` for classification) was considered and **rejected**: it would put coar
 a cross-Sink join, leave #27's `documents` table without a reason to exist (it holds the provenance
 `chunks` deliberately does not repeat), spend the property #34 and #25 earned across two tickets —
 that **one** Sink alone suffices to recompute and confirm the Document vector — and make both Sinks
-mandatory for a Consumer doing both jobs, when `CONTEXT.md` says a Run *may* have more than one Sink.
+mandatory for a Consumer doing both jobs, when `CONTEXT.md` says an Invocation *may* enable more than
+one Sink.
 
 The guidance is therefore about the *shape of the store*, not about the job:
 
@@ -2341,8 +2342,13 @@ explicitly, and the split is between *why* and *how*:
   7. That `--context-length` above the model card is permitted and warns, and what the warning means:
      quality above the card is *unmeasured by the vendor*, not measured and lower.
   8. The `embed` extra and the install line.
-- **`CONTEXT.md` needs no change.** It already carries every term this document uses, including
-  *Invocation*, added by #26.
+- **`CONTEXT.md` was updated alongside this document**, and is now tracked. Its **Sink** and **Resume**
+  entries were scoped to the **Invocation** rather than the **Run** — the distinction this document
+  leans on throughout, and which those two entries alone still blurred. **Chunk budget** and
+  **Stored / Native dimension** were added as terms; **Overflow** gained its measured 6%; and
+  **Document name** gained the collision rule from #41. Deliberately *not* added: `manifest`,
+  `sidecar`, `stored_dim`. Those are one Sink's file roles and field names, not domain language, and a
+  glossary that absorbs implementation nouns stops being one.
 - **`evaluate`'s docs should recommend** the `[A-Za-z0-9._-]` label charset, so labels stay portable
   between the two subcommands, without `evaluate` enforcing it
   ([§14.4](#144-run-label-validation--enforced-in-embed-only)).
