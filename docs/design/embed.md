@@ -347,16 +347,35 @@ It does **not** cover two models of *equal* width, which is why #38 requires the
 
 ## 4. The context-length rule and the Chunk budget as numbers
 
-### 4.1 There are three numbers on the table, not two
+### 4.1 There are four numbers on the table, not two
 
 Standing decision 4.3 framed this as *server-advertised* versus *documented*. #37 found a third
-number on both cards that neither the map nor the ticket anticipated:
+number on both cards that neither the map nor the ticket anticipated, and a later check of the
+checkpoints themselves found a fourth on Nemotron:
 
 | | Qwen3-Embedding-8B | Nemotron-3-Embed-8B |
 |---|---|---|
 | vLLM advertises on a default serve | 40,960 | 262,144 |
+| `config.json` `max_position_embeddings` | 40,960 | 262,144 |
 | Card states | "Context Length: 32k" | "The model's max sequence length is 32768." |
 | Card **exercises** | `max_length = 8192` in its own examples | "We set the model sequence length to **4096** for the evaluation results below." |
+| RoPE base before scaling | — (`rope_scaling: null`) | `original_max_position_embeddings` **16,384** |
+
+**The fourth number explains the first.** Nemotron's `rope_parameters` are
+`{"rope_type": "yarn", "factor": 16.0, "original_max_position_embeddings": 16384}`, and
+16,384 x 16 = **262,144** exactly. vLLM's advertisement is not arbitrary and is not a bug: it is the
+YaRN-scaled base, computed from the checkpoint. Qwen3 carries `rope_scaling: null` and simply
+advertises its `max_position_embeddings` of 40,960, which is why only one of the two families shows a
+wild number.
+
+**`apply_yarn_scaling: False` is a trap, and the card says so.** Read plainly it means long context is
+switched off, which would put Nemotron's real window at 16,384 and halve its Chunk budget. It does not
+mean that. NVIDIA's card states: *"`apply_yarn_scaling` is retained as a temporary vLLM compatibility
+field that preserves the checkpoint's intended long-context RoPE behavior. **Do not remove it from
+`config.json`.**"* It emits a load-time warning and points at
+[vLLM issue #48621](https://github.com/vllm-project/vllm/issues/48621). **Anyone who "fixes" that
+warning by deleting the field changes the model's positional behaviour.** The card's 32,768 remains
+the authoritative number and [§4.2](#42-the-rule)'s arithmetic is unchanged.
 
 Nemotron's sentence is not a limit — it is the provenance of the benchmark numbers. Every published
 score for that model was produced at 4096; above that, quality is not degraded so much as
