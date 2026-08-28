@@ -350,7 +350,7 @@ class PushVllmStatsTest(unittest.TestCase):
         poller = VLLMStatsPoller("http://x/metrics", self.stats_obj(), fetch=lambda url: "")
         poller.available = False
         push_vllm_stats(rep, self.stats_obj(), poller)
-        self.assertEqual(rep.stats["vllm"], _ALL_BLANK)
+        self.assertEqual(rep.stats["server"], _ALL_BLANK)
 
     def test_transitions_leave_no_stale_rows(self):
         """unavailable -> available -> unavailable, with nothing surviving a step.
@@ -368,8 +368,8 @@ class PushVllmStatsTest(unittest.TestCase):
         #    poller thread has not completed a scrape yet.
         poller.available = False
         push_vllm_stats(rep, stats, poller)
-        self.assertEqual(rep.stats["vllm"]["status"], "unavailable")
-        self.assertEqual(rep.stats["vllm"]["gen"], "-")
+        self.assertEqual(rep.stats["server"]["status"], "unavailable")
+        self.assertEqual(rep.stats["server"]["gen"], "-")
 
         # 2. Recovered. No "unavailable" may remain anywhere in the group.
         stats.add(Snapshot(generation_tokens=0.0, prompt_tokens=0.0, cache_hits=0.0, cache_queries=0.0, running=8.0, waiting=2.0))
@@ -377,17 +377,17 @@ class PushVllmStatsTest(unittest.TestCase):
         stats.add(Snapshot(generation_tokens=4120.0, prompt_tokens=1000.0, cache_hits=93.0, cache_queries=100.0, running=8.0, waiting=2.0))
         poller.available = True
         push_vllm_stats(rep, stats, poller)
-        self.assertEqual(rep.stats["vllm"]["status"], "live")
-        self.assertIn("412 tok/s", rep.stats["vllm"]["gen"])
-        self.assertNotIn("unavailable", "".join(map(str, rep.stats["vllm"].values())))
+        self.assertEqual(rep.stats["server"]["status"], "live")
+        self.assertIn("412 tok/s", rep.stats["server"]["gen"])
+        self.assertNotIn("unavailable", "".join(map(str, rep.stats["server"].values())))
 
         # 3. Down again. The rates must not linger as though they were current.
         poller.available = False
         push_vllm_stats(rep, stats, poller)
-        self.assertEqual(rep.stats["vllm"], _ALL_BLANK)
+        self.assertEqual(rep.stats["server"], _ALL_BLANK)
 
         # The row set is identical at every step, so no key can outlive a change.
-        self.assertEqual(set(rep.stats["vllm"]), set(_VLLM_ROWS))
+        self.assertEqual(set(rep.stats["server"]), set(_VLLM_ROWS))
 
     def test_populates_all_rows_when_available(self):
         clock = _FakeClock()
@@ -397,8 +397,8 @@ class PushVllmStatsTest(unittest.TestCase):
         stats.add(Snapshot(generation_tokens=4120.0, prompt_tokens=100.0, cache_hits=93.0, cache_queries=100.0, running=8.0, waiting=2.0))
         rep = _RecordingRep()
         push_vllm_stats(rep, stats, None)
-        self.assertIn("412 tok/s", rep.stats["vllm"]["gen"])
-        self.assertEqual(rep.stats["vllm"]["kv hit"], "93%")
+        self.assertIn("412 tok/s", rep.stats["server"]["gen"])
+        self.assertEqual(rep.stats["server"]["kv hit"], "93%")
 
     def test_no_stats_is_a_noop(self):
         rep = _RecordingRep()

@@ -263,7 +263,7 @@ class RichReporter:
         from rich.panel import Panel
         from rich.table import Table
 
-        order = [g for g in ("run", "vllm", "issues") if g in self._stats]
+        order = [g for g in ("run", "server", "issues") if g in self._stats]
         order += [g for g in self._stats if g not in order]
 
         panels = []

@@ -263,8 +263,8 @@ class EvaluatePplxPanelTest(unittest.TestCase):
         poller.start.assert_called_once()
         poller.stop.assert_called_once()
         # An unavailable scraper writes the whole row set, never a stale subset.
-        self.assertEqual(rep.stats[("vllm", "status")], "unavailable")
-        self.assertEqual(rep.stats[("vllm", "gen")], "-")
+        self.assertEqual(rep.stats[("server", "status")], "unavailable")
+        self.assertEqual(rep.stats[("server", "gen")], "-")
         self.assertEqual(rep.stats[("issues", "skipped")], 0)
         # Every doc scored, so the failure row exists and reads zero.
         self.assertEqual(rep.stats[("issues", "failed")], 0)
@@ -325,7 +325,7 @@ class EvaluatePplxPanelTest(unittest.TestCase):
             ):
                 main(["evaluate", "--run", f"good={_one_run(base)}", "--db", str(base / "eval.sqlite"), "--tui"])
         poller_cls.assert_not_called()
-        self.assertNotIn(("vllm", "status"), rep.stats)
+        self.assertNotIn(("server", "status"), rep.stats)
 
 
 SENTINEL = 0.12345  # a value no real metric would produce

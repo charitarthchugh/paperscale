@@ -348,4 +348,4 @@ def push_vllm_stats(rep, stats: "VLLMStats | None", poller: "VLLMStatsPoller | N
             "running": f"{rates.running or 0:.0f}  wait {rates.waiting or 0:.0f}",
         }
     for row in _VLLM_ROWS:
-        rep.set_stat(row, values[row], group="vllm")
+        rep.set_stat(row, values[row], group="server")

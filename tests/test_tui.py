@@ -344,7 +344,7 @@ class FixedHeightRenderTest(unittest.TestCase):
         console, _ = _SizedConsole.make(80, 24)
         rep = RichReporter("paperscale", console=console)
         self._populate(rep)
-        panel = _panel_slice(_frame_lines(rep, console), "vllm")
+        panel = _panel_slice(_frame_lines(rep, console), "server")
         for label in _VLLM_ROWS:
             self.assertIn(label, panel, f"vllm label {label!r} truncated at 80 columns")
         for value in ("live", "6.1k tok/s", "6.2k tok/s", "5.9k / 5.8k", "93%", "12  wait 3"):
@@ -419,7 +419,7 @@ class FixedHeightRenderTest(unittest.TestCase):
         rep = RichReporter("paperscale", console=console)
         self._populate(rep)
         text = "\n".join(_frame_lines(rep, console))
-        self.assertIn("vllm", text)
+        self.assertIn("server", text)
         self.assertIn("issues", text)
         self.assertIn("6.1k tok/s", text)
 
