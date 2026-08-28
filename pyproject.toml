@@ -27,6 +27,10 @@ dependencies = [
 [project.optional-dependencies]
 # Only needed for the live progress dashboard (`--tui`).
 tui = ["rich (>=13.0.0,<15.0.0)"]
+# Only needed for `paperscale embed`. One extra per feature, matching `tui`:
+# splitting it so .npz-only users skip lancedb/pyarrow can be done later without
+# breaking anyone, whereas merging two extras back into one cannot.
+embed = ["numpy (>=2.0.0,<3.0.0)", "lancedb (>=0.37.0,<0.38.0)", "pyarrow (>=25.0.0,<26.0.0)"]
 
 [tool.poetry]
 packages = [{ include = "paperscale", from = "src" }]

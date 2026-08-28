@@ -1,9 +1,10 @@
-"""`paperscale evaluate` — reference-free OCR-model comparison.
+"""`paperscale evaluate` and `paperscale embed` — the non-OCR subcommands.
 
 Reached via a shim in `pipeline.cli_main`: when the first CLI token is
-``evaluate`` the pipeline delegates to `main` here. Heavy scoring deps
-(wordfreq, rapidfuzz) are imported inside the handler so importing this module
-stays cheap.
+``evaluate`` or ``embed`` the pipeline delegates to `main` here. Heavy deps
+(wordfreq and rapidfuzz for evaluate; numpy, lancedb and pyarrow for embed) are
+imported inside their handler so importing this module stays cheap -- an
+OCR-only install has none of them and must still reach ``--help``.
 """
 
 from __future__ import annotations
@@ -55,7 +56,69 @@ def build_parser() -> argparse.ArgumentParser:
         help="drop every cached score for these runs and rescore from scratch (default: reuse scores for docs whose text is unchanged)",
     )
     ev.set_defaults(handler=_handle_evaluate)
+
+    _add_embed_parser(subparsers)
     return parser
+
+
+def _add_embed_parser(subparsers) -> None:
+    """`paperscale embed` -- hyphenated throughout, shaped like `evaluate`.
+
+    Flags and defaults are `docs/design/embed.md` 14.1 verbatim. Three of the
+    numbers (`--concurrency`, `--request-tokens`, `--max-request-retries`) are
+    calibrated starting points borrowed from `evaluate`'s prefill-only pplx
+    scorer against the same hardware -- not measurements of this workload.
+    """
+    em = subparsers.add_parser(
+        "embed",
+        help="embed an OCR run's text into vectors against an external embedding server",
+        description="Read results/*.jsonl, chunk and embed each document, and write the vectors to one or both sinks.",
+    )
+    em.add_argument(
+        "--run",
+        action="append",
+        required=True,
+        metavar="LABEL=PATH",
+        help="a model run: LABEL=PATH where PATH is a workspace dir, a dir of .jsonl, or a .jsonl file. Repeatable.",
+    )
+    em.add_argument("--out", type=Path, default=Path("./vectors"), help="the .npz tree, the manifest and the failures file (default ./vectors)")
+    em.add_argument("--embed-model", required=True, help="embedding adapter name (required -- vectors are meaningless across models, so there is no default)")
+    em.add_argument("--embed-url", default="http://localhost:8000", help="base URL of the vLLM OpenAI-compatible embedding server")
+    em.add_argument("--embed-dim", type=int, default=768, help="stored vector width; sliced client-side from the native width (default 768)")
+    em.add_argument(
+        "--context-length",
+        type=int,
+        default=None,
+        help="override the validated context length (default: min(model card, server max_model_len)); rejected above the server's, warns above the card's",
+    )
+    em.add_argument("--api-key", default=None, help="bearer token for the embedding server")
+    em.add_argument("--lancedb", type=Path, default=None, help="also write a LanceDB database here (the path is the opt-in)")
+    em.add_argument("--no-npz", action="store_true", help="do not write the .npz tree (requires --lancedb)")
+    em.add_argument("--concurrency", type=int, default=64, help="embedding requests in flight against the server (default 64)")
+    em.add_argument(
+        "--request-tokens",
+        type=int,
+        default=32000,
+        help="token budget per /v1/embeddings request; raised to the chunk budget when below it (default 32000)",
+    )
+    em.add_argument("--max-request-retries", type=int, default=8, help="attempts for the bad-response/timeout axis only (default 8)")
+    em.add_argument("--no-resume", action="store_true", help="re-embed every document and overwrite; deletes nothing (unlike the OCR command's --no-resume)")
+    em.add_argument("--tui", action="store_true", help="show a live progress dashboard (needs the 'tui' extra)")
+    em.add_argument("--tui-poll-interval", type=float, default=5.0, help="seconds between vLLM /metrics scrapes for the dashboard")
+    em.add_argument("--disk-logging", default=None, help="write the full log here (defaults beside --out when --tui is on)")
+    em.set_defaults(handler=_handle_embed)
+
+
+def _handle_embed(args: argparse.Namespace) -> int:
+    """Thin shim. Every `paperscale.embed.*` import sits inside `run_embed`.
+
+    Matching `_handle_evaluate`: the extra's dependencies must not be touched
+    until the subcommand actually runs, so an OCR-only install reaches
+    `paperscale embed --help` and gets a real message rather than an ImportError.
+    """
+    from paperscale.embed.run import run_embed
+
+    return run_embed(args)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
