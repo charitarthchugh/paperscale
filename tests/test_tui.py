@@ -14,6 +14,7 @@ from paperscale.pipeline import _push_issue_stats
 from paperscale.tui import (
     MAX_EVENT_ROWS,
     MAX_LOG_HISTORY,
+    MIN_EVENT_ROWS,
     NullReporter,
     RenderStyle,
     RichReporter,
@@ -125,6 +126,59 @@ class LayoutBudgetTest(unittest.TestCase):
     def test_bars_never_exceed_phase_count_while_events_can_grow(self):
         b = _layout_budget(40, 3, 2)
         self.assertEqual(b.bar_rows, 2)
+
+
+class EventPanePaddingTest(unittest.TestCase):
+    """`n_events` stops the event pane at the lines it actually holds.
+
+    Told the log length, the budget lets the frame come up short of the pane
+    instead of padding. An embedding run is silent until something fails, so
+    grow-into-the-surplus drew three log lines above forty blank ones on a zoomed
+    pane; the OCR pipeline is chatty enough that it never showed there, which is
+    why the cap arrives now and not with the renderer.
+    """
+
+    def test_a_short_log_takes_only_the_rows_it_can_fill(self):
+        for height in (20, 30, 40, 60):
+            with self.subTest(height=height):
+                self.assertEqual(_layout_budget(height, 4, 2, 3).event_rows, 3)
+
+    def test_an_empty_log_keeps_the_minimum_pane(self):
+        # Not zero. The panel exists before the first line does, and letting it
+        # appear on that line would shuffle the stats and bars above it exactly
+        # when something has gone wrong and they are being read.
+        self.assertEqual(_layout_budget(40, 4, 2, 0).event_rows, MIN_EVENT_ROWS)
+        self.assertEqual(_layout_budget(40, 4, 2, 1).event_rows, MIN_EVENT_ROWS)
+
+    def test_a_capped_frame_never_outgrows_the_pane(self):
+        # The invariant the whole budget exists for still holds; only the
+        # never-one-row-fewer half is traded away, and only where events cap.
+        for height in range(1, 61):
+            for n_events in (0, 1, 3, 8, MAX_LOG_HISTORY):
+                b = _layout_budget(height, 4, 2, n_events)
+                self.assertLessEqual(b.total_rows(), height, f"h={height} events={n_events}")
+                self.assertGreaterEqual(min(b.stat_rows, b.bar_rows, b.event_rows), 0)
+
+    def test_a_full_log_keeps_the_original_growth(self):
+        # A log longer than any pane is the case the cap must not touch: wherever
+        # the event pane survives at all, the budget matches the uncapped one row
+        # for row, which is what keeps the OCR frames as they were.
+        for height in range(1, 61):
+            uncapped = _layout_budget(height, 4, 2)
+            if uncapped.event_rows:
+                self.assertEqual(_layout_budget(height, 4, 2, MAX_LOG_HISTORY), uncapped, f"h={height}")
+
+    def test_a_starved_pane_does_not_get_its_event_panel_back(self):
+        # `event_rows == 0` means the panel was dropped whole; handing it rows
+        # back would re-add its two border rows to a budget with no room.
+        b = _layout_budget(9, 4, 2, 3)
+        self.assertEqual(b.event_rows, 0)
+        self.assertLessEqual(b.total_rows(), 9)
+
+    def test_omitting_the_log_length_keeps_the_old_meaning(self):
+        # A caller that genuinely does not know how many lines it holds is not
+        # made to lie about it: three arguments still means grow-into-the-surplus.
+        self.assertGreater(_layout_budget(60, 4, 2).event_rows, MAX_EVENT_ROWS)
 
 
 class TerminalProfileTest(unittest.TestCase):
@@ -484,6 +538,59 @@ class FixedHeightRenderTest(unittest.TestCase):
                 self.assertEqual(len(lines), bar_rows, f"w={width} bar_rows={bar_rows}: {lines!r}")
 
 
+# ASCII box drawing, so the slicing below can name the border characters it
+# matches in ASCII rather than in the U+256D family `_panel_slice` uses.
+_ASCII_STYLE = RenderStyle(ascii_only=True, spinner="line", use_screen=True, refresh_per_second=4)
+
+
+def _ascii_reporter(width: int, height: int):
+    console, _ = _SizedConsole.make(width, height)
+    return RichReporter("paperscale", console=console, style=_ASCII_STYLE), console
+
+
+def _event_rows(lines: list[str]) -> list[str]:
+    """The event panel's content rows, borders stripped.
+
+    Sliced rather than grepped for the log text: the thing under test is the
+    blank rows *between* and *below* the log lines, which a grep cannot see.
+    """
+    top = next(i for i, line in enumerate(lines) if line.startswith("+- events"))
+    rows = []
+    for line in lines[top + 1 :]:
+        if line.startswith("+-"):
+            break
+        rows.append(line.strip("|").strip())
+    return rows
+
+
+class QuietRunRenderTest(unittest.TestCase):
+    def test_a_quiet_run_draws_no_blank_event_rows(self):
+        rep, console = _ascii_reporter(120, 40)
+        rep.set_stat("documents", "0")
+        rep.phase("embedding", total=8578)
+        for i in range(3):
+            rep.log(f"event {i}")
+        lines = _frame_lines(rep, console)
+        self.assertEqual(_event_rows(lines), ["event 0", "event 1", "event 2"])
+        # And the surplus is dropped rather than moved to another panel: the
+        # frame is as tall as it has something to say and no taller.
+        self.assertLess(len(lines), 40)
+
+    def test_a_chatty_run_still_fills_the_pane(self):
+        # The other half of the trade. The OCR pipeline logs far more than any
+        # pane holds, so its frames are unchanged by the cap.
+        rep, console = _ascii_reporter(120, 40)
+        rep.set_stat("documents", "0")
+        rep.phase("scoring", total=10)
+        for i in range(120):
+            rep.log(f"event {i}")
+        lines = _frame_lines(rep, console)
+        rows = _event_rows(lines)
+        self.assertGreater(len(rows), MAX_EVENT_ROWS)
+        self.assertNotIn("", rows)
+        self.assertEqual(len(lines), 40)
+
+
 class ElapsedTest(unittest.TestCase):
     def test_formats_hours_minutes_seconds(self):
         self.assertEqual(_elapsed(0), "00:00:00")
@@ -502,7 +609,7 @@ class ElapsedTest(unittest.TestCase):
 class SetStatGroupTest(unittest.TestCase):
     def test_null_reporter_accepts_group(self):
         with NullReporter() as rep:
-            rep.set_stat("gen", 1, group="vllm")  # must not raise
+            rep.set_stat("gen", 1, group="server")  # must not raise
 
     def test_default_group_is_run(self):
         console, _ = _SizedConsole.make(120, 30)

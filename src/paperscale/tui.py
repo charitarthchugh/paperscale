@@ -211,7 +211,10 @@ class RichReporter:
 
         width, height = self._console.size.width, self._console.size.height
         n_stats = max((len(v) for v in self._stats.values()), default=0)
-        budget = _layout_budget(height, n_stats, len(self._progress.tasks))
+        # The log length is an input to the budget, not just to the slice below:
+        # without it the event pane grows into the surplus and pads what it does
+        # not have. See `_layout_budget`'s `n_events`.
+        budget = _layout_budget(height, n_stats, len(self._progress.tasks), len(self._log))
 
         rows = [self._header()]
 
@@ -451,7 +454,9 @@ MAX_EVENT_ROWS = 8
 # `_layout_budget` treats MAX_EVENT_ROWS as a growth target, not a cap: events
 # absorb the leftover surplus, so a 60-row pane hands the panel ~48 rows.
 # Retention has to be decoupled from that target, or a tall pane would draw a
-# few log lines padded out with blank rows.
+# few log lines padded out with blank rows. Retention is now also what bounds
+# the panel outright, since `_layout_budget`'s `n_events` stops it at the lines
+# actually held: this constant is the most rows any pane can ever draw.
 MAX_LOG_HISTORY = 200
 
 
@@ -471,8 +476,10 @@ def _cost(stat_rows: int, bar_rows: int, event_rows: int) -> int:
     return stats + bar_rows + events
 
 
-def _layout_budget(height: int, n_stats: int, n_phases: int) -> Budget:
-    """Split `height` rows so the frame is exactly the height of the terminal.
+def _layout_budget(height: int, n_stats: int, n_phases: int, n_events: int | None = None) -> Budget:
+    """Split `height` rows between the sections so the frame fits the terminal.
+
+    Exactly fills it, save for the one case `n_events` describes below.
 
     Recomputed on every render, never cached: tmux panes change size on split,
     zoom, and detach/reattach, and a cached budget would reintroduce the original
@@ -480,6 +487,15 @@ def _layout_budget(height: int, n_stats: int, n_phases: int) -> Budget:
 
     Starvation order: events go first, then stats. Bars never go -- a dashboard
     with no progress indicator tells you nothing.
+
+    `n_events` is how many log lines the caller actually holds. Given it, the
+    event pane stops at that many rows and the frame is allowed to come up
+    *short* of the pane. Without it events absorb the whole surplus, which on a
+    60-row pane drew three log lines above forty blank ones -- invisible to the
+    OCR pipeline, which is chatty enough to fill any pane, and the first thing an
+    embedding Invocation shows, because it is silent until something fails. The
+    parameter is optional so that a caller which genuinely does not know the log
+    length keeps the original meaning rather than being made to lie about it.
     """
     available = max(int(height), 1) - HEADER_ROWS
     if available < MIN_BAR_ROWS:
@@ -493,12 +509,19 @@ def _layout_budget(height: int, n_stats: int, n_phases: int) -> Budget:
     if _cost(stat_rows, bar_rows, event_rows) > available:
         return Budget(0, available, 0)
 
+    # An empty log keeps MIN_EVENT_ROWS rather than collapsing the panel: the
+    # pane exists before the first line does, and letting it appear on that line
+    # would shuffle the stats and bars above it exactly when something has just
+    # gone wrong and the operator is reading them.
+    event_cap = None if n_events is None else max(n_events, MIN_EVENT_ROWS)
+
     surplus = available - _cost(stat_rows, bar_rows, event_rows)
     grown = min(surplus, max(n_phases - bar_rows, 0))
     bar_rows += grown
     surplus -= grown
     if event_rows:
-        grown = min(surplus, MAX_EVENT_ROWS - event_rows)
+        target = MAX_EVENT_ROWS if event_cap is None else min(MAX_EVENT_ROWS, event_cap)
+        grown = min(surplus, max(target - event_rows, 0))
         event_rows += grown
         surplus -= grown
     if stat_rows:
@@ -506,8 +529,19 @@ def _layout_budget(height: int, n_stats: int, n_phases: int) -> Budget:
         stat_rows += grown
         surplus -= grown
 
-    # Whatever is left pads a section so the frame fills the pane exactly.
-    if event_rows:
+    # Whatever is left pads a section so the frame fills the pane exactly. With a
+    # known log length there is nothing left to pad *with*: every section has
+    # already grown to what it can fill (bars to `n_phases`, stats to `n_stats`,
+    # events to the lines they hold), so the remainder is dropped and the frame
+    # shrinks to what it has to say. Padding stats instead would move the blank
+    # rows one panel to the left, not remove them.
+    if event_cap is not None:
+        # Never on a starved pane: `event_rows == 0` means the panel was dropped
+        # whole, and handing it rows back would re-add its two border rows to a
+        # budget that had no room for them.
+        if event_rows:
+            event_rows += min(surplus, max(event_cap - event_rows, 0))
+    elif event_rows:
         event_rows += surplus
     elif stat_rows:
         stat_rows += surplus
