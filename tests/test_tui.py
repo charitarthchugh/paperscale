@@ -591,6 +591,42 @@ class QuietRunRenderTest(unittest.TestCase):
         self.assertEqual(len(lines), 40)
 
 
+class ResumedSkipsTest(unittest.TestCase):
+    """The bar counts only Documents that will actually be embedded.
+
+    The prototype showed `documents 407` beside a bar reading `4309/12480`: the
+    counter is Documents embedded, the bar is Documents done including 3,902
+    resumed skips. Both correct, together confusing. With no content-change
+    detection a large silent skip count is exactly the symptom of a stale output
+    directory, so it is made structural -- what the bar counts -- rather than
+    buried as one counter among four.
+    """
+
+    def test_the_bar_total_excludes_resumed_skips(self):
+        rep, console = _ascii_reporter(100, 24)
+        rep.set_stat("documents", "0")
+        rep.set_stat("skipped", "3,902")
+        rep.phase("embedding", total=12480 - 3902)
+        frame = "\n".join(_frame_lines(rep, console))
+        self.assertIn("0/8578", frame)
+        self.assertNotIn("12480", frame)
+        # The count is not lost, it just stops driving the bar.
+        self.assertIn("3,902", frame)
+
+    def test_a_fully_resumed_invocation_reads_zero_of_zero(self):
+        # The failure case reads `0/0`: the Invocation visibly has nothing to do,
+        # with no threshold to pick and no judgement call about what counts as
+        # "too many skips".
+        rep, console = _ascii_reporter(100, 24)
+        rep.set_stat("skipped", "12,480")
+        phase = rep.phase("embedding", total=0)
+        phase.advance(0)
+        phase.done()
+        frame = "\n".join(_frame_lines(rep, console))
+        self.assertIn("0/0", frame)
+        self.assertIn("12,480", frame)
+
+
 class ElapsedTest(unittest.TestCase):
     def test_formats_hours_minutes_seconds(self):
         self.assertEqual(_elapsed(0), "00:00:00")
