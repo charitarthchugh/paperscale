@@ -21,6 +21,8 @@ path, including `pypdfium2`'s except-branch.
 
 from __future__ import annotations
 
+import ast
+import pathlib
 import subprocess
 import sys
 import textwrap
@@ -113,3 +115,50 @@ class OcrOnlyInstallTest(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("--embed-model", done.stdout)
         self.assertIn("exit 0", done.stdout)
+
+
+class ModuleScopeImportTest(unittest.TestCase):
+    """The design's "no heavy import at module scope" rule, checked on the source.
+
+    Asserted structurally rather than through `sys.modules` for the reason in the
+    module docstring: `paperscale.pipeline` pulls numpy transitively through
+    `pypdfium2`, so `paperscale.embed.client` -- which imports `apost` from the
+    pipeline -- shows numpy in `sys.modules` while containing no numpy import at all.
+    Reading the source says what the rule actually means.
+    """
+
+    def test_no_embed_module_imports_a_heavy_package_at_module_scope(self):
+        import paperscale.embed
+
+        # Anchored on the imported package rather than a cwd-relative path, so the
+        # test reads the sources that are actually installed.
+        package_dir = pathlib.Path(next(iter(paperscale.embed.__path__)))
+        sources = sorted(package_dir.glob("*.py"))
+        self.assertGreater(len(sources), 1, f"found no embed sources under {package_dir}")
+
+        offenders: list[str] = []
+        for path in sources:
+            for node in ast.parse(path.read_text()).body:
+                # Only module-scope statements are walked. Imports inside a function
+                # are the point of the rule, and `if TYPE_CHECKING:` blocks never
+                # execute, so neither is an offence.
+                names: list[str] = []
+                if isinstance(node, ast.Import):
+                    names = [alias.name for alias in node.names]
+                elif isinstance(node, ast.ImportFrom):
+                    names = [node.module or ""]
+                for name in names:
+                    if name.split(".")[0] in HEAVY:
+                        offenders.append(f"{path.name}:{node.lineno} imports {name}")
+        self.assertEqual(offenders, [])
+
+    def test_the_checker_would_notice_a_violation(self):
+        """Guards the test above: an AST walk that matched nothing would also pass."""
+        tree = ast.parse("import numpy\n")
+        node = tree.body[0]
+        assert isinstance(node, ast.Import)
+        self.assertIn(node.names[0].name.split(".")[0], HEAVY)
+
+
+if __name__ == "__main__":
+    unittest.main()
