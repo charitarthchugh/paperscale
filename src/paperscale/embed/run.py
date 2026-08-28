@@ -23,7 +23,7 @@ worker, which is what "single writer" means here -- LanceDB batches at 64 and th
 `.npz` pair is two creates and two renames, neither of which is safe to interleave.
 
 The failure taxonomy is design 12.6/17.1 and the dispositions genuinely differ:
-a `/v1/tokenize` failure or an exhausted response axis fails **the Document**; a
+a `/tokenize` failure or an exhausted response axis fails **the Document**; a
 `ServerGoneError` is terminal for **the Invocation** and propagates, because a dead
 server would otherwise burn through the corpus at six connection attempts each,
 marking every Document failed -- and a Document recorded failed is one Resume retries,
@@ -486,7 +486,7 @@ def _report(counts: _Counts, *, out: Path, failures_name: str) -> None:
 class _Embedder:
     """The two stages, the request packer, and the single writer.
 
-    Stage one turns Documents into Chunks (`/v1/tokenize`, bounded by the client's own
+    Stage one turns Documents into Chunks (`/tokenize`, bounded by the client's own
     tokenize semaphore). Stage two packs Chunks into `/v1/embeddings` requests by a
     **token budget, never a count of Chunks** -- greedy page packing means one Chunk
     may be a short page and the next forty-five dense ones, so "16 Chunks" is anywhere
@@ -584,7 +584,7 @@ class _Embedder:
     async def _prepare_worker(self) -> None:
         """Turn Documents into Chunks until the queue is empty, then post a sentinel.
 
-        A `/v1/tokenize` failure fails the **Document**, not the Invocation: without a
+        A `/tokenize` failure fails the **Document**, not the Invocation: without a
         token count a Chunk cannot be sized, and the whole design rests on vLLM
         erroring on overflow rather than truncating, so proceeding on a guess is
         unsafe rather than merely imprecise.

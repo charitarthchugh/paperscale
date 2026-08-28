@@ -68,7 +68,7 @@ class _FakeServer:
         return 200, json.dumps(body).encode()
 
     async def apost(self, url, json_data, api_key=None):
-        if url.endswith("/v1/tokenize"):
+        if url.endswith("/tokenize"):
             self.tokenize_calls.append(json_data["prompt"])
             return 200, json.dumps({"count": len(json_data["prompt"])}).encode()
         if url.endswith("/v1/embeddings"):
@@ -421,7 +421,7 @@ class ServerGoneTest(unittest.TestCase):
 
 
 class TokenizeFailureTest(unittest.TestCase):
-    """Design 12.6 -- a `/v1/tokenize` failure fails the Document, not the Invocation."""
+    """Design 12.6 -- a `/tokenize` failure fails the Document, not the Invocation."""
 
     def test_one_document_fails_and_the_rest_are_embedded(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -431,7 +431,7 @@ class TokenizeFailureTest(unittest.TestCase):
             original = server.apost
 
             async def refuse_poison_tokenize(url, json_data, api_key=None):
-                if url.endswith("/v1/tokenize") and _POISON in json_data["prompt"]:
+                if url.endswith("/tokenize") and _POISON in json_data["prompt"]:
                     return 500, b"tokenizer exploded"
                 return await original(url, json_data, api_key)
 

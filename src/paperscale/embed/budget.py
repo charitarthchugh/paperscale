@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 # NOT a defence against packing -- subadditivity already covers packing, and covers the
 # Instruction with it, since tokens("passage: ") + tokens(text) >= tokens("passage: " + text).
-# What is left is a ROUTE-level risk: paperscale counts tokens on /v1/tokenize and sends text
+# What is left is a ROUTE-level risk: paperscale counts tokens on /tokenize and sends text
 # to /v1/embeddings, and if those two routes apply special tokens differently by even one
 # token, a Chunk sitting exactly on the budget hard-fails -- the design deliberately relies on
 # vLLM *erroring* on overflow rather than truncating. 64 tokens is 0.2% of the context against
@@ -96,7 +96,7 @@ def chunk_budget(validated_context_length: int, instruction_tokens: int) -> int:
     """Largest Chunk, in tokens, that can carry the Instruction and still fit.
 
     `instruction_tokens` is the document-side Instruction's exact count -- one
-    `/v1/tokenize` call at startup, or 0 for Qwen3's empty string. The Adapter
+    `/tokenize` call at startup, or 0 for Qwen3's empty string. The Adapter
     applies the Instruction, so its tokens are spent out of the same window the
     Chunk text is measured against.
 

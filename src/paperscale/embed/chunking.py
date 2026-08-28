@@ -32,7 +32,7 @@ Document vector and stop the stored offsets describing a partition, so reconstru
 the offsets would no longer round-trip. Overlap is a retrieval-side tactic and belongs to
 the Consumer, which holds the exact offsets and can re-chunk without help.
 
-Rejected: rebuilding character offsets from `/v1/tokenize`'s `return_token_strs`.
+Rejected: rebuilding character offsets from `/tokenize`'s `return_token_strs`.
 `evaluation/pplx.py:201` already carries the warning -- decoded tokens carry marker glyphs
 (SentencePiece, BPE) whose handling differs per tokenizer, so character attribution built on
 them breaks silently when the model changes. Slicing by the offsets already in hand is exact
@@ -113,7 +113,7 @@ async def chunk_document(text: str, spans: list[list[int]], budget: int, tokeniz
 
     counts: list[int] = []
     for start, end, _page in spans:
-        # A zero-width page is answered here rather than on the wire. /v1/tokenize prepends
+        # A zero-width page is answered here rather than on the wire. /tokenize prepends
         # the model's BOS by default, so the server answers "" with 1, and a page that cost
         # one token could close a Chunk that still had room -- exactly the break the design
         # says an empty page can never force. It also saves a round trip per empty page.

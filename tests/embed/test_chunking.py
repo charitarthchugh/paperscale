@@ -2,7 +2,7 @@
 
 Every test drives `chunk_document` with a fake tokenizer, which is what makes the call
 *count* observable -- the design's central affordability claim is that the common case costs
-exactly one `/v1/tokenize` call per Document, and nothing else can prove it.
+exactly one `/tokenize` call per Document, and nothing else can prove it.
 
 Documents are built by `_document`, which reproduces `build_dolma_document`'s span layout
 byte for byte: the `\\n` joiner folded into the preceding page, and a zero-width span for a
@@ -26,7 +26,7 @@ class _FakeTokenizer:
     `ceil(len(s) / 4)` is subadditive the same way a BPE count is -- splitting a string can
     only raise the total -- so a packer that respects the budget under this counter respects
     it under a real one. The empty string answers 1, not 0, to imitate the BOS token
-    /v1/tokenize prepends by default: if the packer ever asked the server about a zero-width
+    /tokenize prepends by default: if the packer ever asked the server about a zero-width
     page, that 1 would show up as a token an empty page had cost.
     """
 

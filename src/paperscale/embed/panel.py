@@ -88,7 +88,7 @@ def push_embed_stats(
         # Two numbers in one slot: what `--concurrency` controls, over what says
         # the flag is set too high. `waiting`, not the OCR panel's `running` --
         # queue depth is the signal and admitted requests are not. The client
-        # figure counts `/v1/embeddings` only: `/v1/tokenize` is served CPU-side
+        # figure counts `/v1/embeddings` only: `/tokenize` is served CPU-side
         # in the API server process and never enters the engine scheduler, so it
         # cannot produce the queue it would be compared against, and folding it
         # in would inflate the left number with traffic that cannot cause the

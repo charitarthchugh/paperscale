@@ -17,7 +17,7 @@ an inventory of four serving engines (#23) found three facts that do not go away
    for Qwen3-8B against a documented 32768. ``budget.py`` takes the ``min()`` of the two.
 
 Everything else is asked of the server and recorded: the served model id from ``/v1/models``, exact
-token counts from ``POST /v1/tokenize``, and the output width from the response itself -- a probe,
+token counts from ``POST /tokenize``, and the output width from the response itself -- a probe,
 never an ask, because no surveyed engine reports it (huggingface/text-embeddings-inference#148 is
 still true; it was closed COMPLETED by a comment that reframed the question, not by a fix).
 

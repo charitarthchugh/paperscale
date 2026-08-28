@@ -331,7 +331,7 @@ class RoutesTest(unittest.TestCase):
         c = _client(transport)
         self.assertEqual(asyncio.run(c.tokenize("some text")), 1234)
         url, body = transport.calls[0]
-        self.assertEqual(url, "http://vllm/v1/tokenize")
+        self.assertEqual(url, "http://vllm/tokenize")
         self.assertEqual(body, {"model": "served-id", "prompt": "some text"})
 
     def test_tokenize_falls_back_to_the_token_list(self):

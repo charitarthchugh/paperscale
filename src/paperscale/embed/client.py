@@ -3,7 +3,7 @@
 Three routes, three different dispositions on failure:
 
 * ``POST /v1/embeddings`` -- the GPU work, bounded by ``--concurrency``.
-* ``POST /v1/tokenize`` -- exact token counts for the chunker (design 5.2), served
+* ``POST /tokenize`` -- exact token counts for the chunker (design 5.2), served
   CPU-side in the API server process and bounded separately (design 12.4).
 * ``GET /v1/models`` -- the served model id and ``max_model_len``, asked once at
   startup before the reporter exists (design 12.1 steps 4 and 10).
@@ -133,7 +133,7 @@ class EmbedClient:
     """Speaks to one embedding server; owns the retry policy and the two rate bounds.
 
     Two **separate** semaphores, not one shared pool (design 12.4). ``concurrency``
-    bounds ``/v1/embeddings`` only. ``/v1/tokenize`` gets ``(concurrency * 3) // 2``
+    bounds ``/v1/embeddings`` only. ``/tokenize`` gets ``(concurrency * 3) // 2``
     of its own -- 96 at the default 64 -- because tokenize never reaches the GPU and
     sharing slots with it would idle the engine during CPU-side work, while it is
     still HTTP against the same API server process and so is not free either.
@@ -287,7 +287,7 @@ class EmbedClient:
         return served, int(max_model_len)
 
     async def tokenize(self, text: str) -> int:
-        """``POST /v1/tokenize`` -> the exact token count for the model actually loaded.
+        """``POST /tokenize`` -> the exact token count for the model actually loaded.
 
         Asking the server is what keeps the count honest: there is no second
         tokenizer to drift from the server's, and the whole chunking design rests on
@@ -298,7 +298,7 @@ class EmbedClient:
         what ``/v1/embeddings`` will apply to the same text, and pinning it here could
         only make the two disagree.
         """
-        return await self._with_backoff("POST /v1/tokenize", lambda: self._send_tokenize(text))
+        return await self._with_backoff("POST /tokenize", lambda: self._send_tokenize(text))
 
     async def _send_tokenize(self, text: str) -> int:
         body = {"model": self.model, "prompt": text}
@@ -306,18 +306,18 @@ class EmbedClient:
         # Not counted in ``outstanding``: this route is handled in the API server
         # process and never enters the engine scheduler.
         async with limit:
-            status, raw = await self._post(f"{self.url}/v1/tokenize", json_data=body, api_key=self.api_key)
+            status, raw = await self._post(f"{self.url}/tokenize", json_data=body, api_key=self.api_key)
         if status != 200:
-            raise EmbedRequestError(f"embed: /v1/tokenize returned {status}: {(raw or b'')[:300]!r}")
+            raise EmbedRequestError(f"embed: /tokenize returned {status}: {(raw or b'')[:300]!r}")
         try:
             parsed = json.loads(raw)
         except ValueError as e:
-            raise EmbedRequestError(f"embed: malformed /v1/tokenize response: {type(e).__name__}: {e}") from e
+            raise EmbedRequestError(f"embed: malformed /tokenize response: {type(e).__name__}: {e}") from e
         count = parsed.get("count") if isinstance(parsed, dict) else None
         if count is None:
             tokens = parsed.get("tokens") if isinstance(parsed, dict) else None
             if not isinstance(tokens, list):
-                raise EmbedRequestError(f"embed: /v1/tokenize response carries neither 'count' nor 'tokens': {parsed!r}")
+                raise EmbedRequestError(f"embed: /tokenize response carries neither 'count' nor 'tokens': {parsed!r}")
             count = len(tokens)
         return int(count)
 
