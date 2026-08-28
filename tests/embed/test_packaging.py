@@ -116,6 +116,29 @@ class OcrOnlyInstallTest(unittest.TestCase):
         self.assertIn("--embed-model", done.stdout)
         self.assertIn("exit 0", done.stdout)
 
+    def test_every_embed_module_imports_without_the_extra(self):
+        """Import-time purity, module by module, so a failure names the file.
+
+        The Sinks and `vectors` genuinely need numpy to *run*; they must still
+        *import*, because `run.py` imports them during startup and the flags that
+        decide whether they are used are read after that.
+        """
+        done = _run_without_the_extra(f"""
+            import importlib
+            broken = []
+            for name in {_EMBED_MODULES!r}:
+                try:
+                    importlib.import_module("paperscale.embed." + name)
+                except Exception as exc:
+                    broken.append((name, type(exc).__name__, str(exc)))
+            print(broken)
+            print(sorted(m for m in BLOCKED if m in sys.modules))
+            """)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        broken, leaked = done.stdout.strip().split("\n")[-2:]
+        self.assertEqual(broken, "[]")
+        self.assertEqual(leaked, "[]")
+
 
 class ModuleScopeImportTest(unittest.TestCase):
     """The design's "no heavy import at module scope" rule, checked on the source.
