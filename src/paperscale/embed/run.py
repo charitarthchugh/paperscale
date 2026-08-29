@@ -100,11 +100,19 @@ class _ChunkRef:
 
     The packing unit is the Chunk and not the Document, so a Document whose Chunks
     together exceed the request budget is spread over several requests rather than
-    sent as one oversized body. `doc_id` is what makes split-on-failure meaningful:
-    the Documents of a failed request are exactly the distinct `doc_id`s in it.
+    sent as one oversized body. `document_index` is what makes split-on-failure
+    meaningful: the Documents of a failed request are exactly the distinct
+    `document_index` values in it.
+
+    It is a **position** -- the Document's place in `todo`, from `enumerate` -- and not
+    a Document name. Nothing outside this module ever sees it: the Sinks are keyed by
+    `(run_label, document_name)`, and this index exists only because a dict keyed by an
+    integer is what lets a Chunk vector find its Document while the request is in
+    flight.
     """
 
-    doc_id: int
+    document_index: int
+    #: The Chunk's position within its own Document, which is what orders `vectors`.
     index: int
     text: str
     tokens: int
@@ -363,6 +371,7 @@ async def _embed_invocation(args, *, runs: list[tuple[str, str]], adapter, store
             # a column that grows a new row mid-run reads as something breaking.
             rep.set_stat("failed", 0, group="issues")
             rep.set_stat("oversize", 0, group="issues")
+            rep.set_stat("retrying", 0, group="issues")
             rep.log(f"embedding {len(todo)} of {len(corpus)} Document(s); {counts.skipped} already held by every enabled Sink.")
 
             # -- step 12: run -------------------------------------------------
@@ -546,8 +555,8 @@ class _Embedder:
         self._fatal: BaseException | None = None
         self._stop = asyncio.Event()
         self._doc_q: asyncio.Queue = asyncio.Queue()
-        for doc_id, doc in enumerate(todo):
-            self._doc_q.put_nowait((doc_id, doc))
+        for document_index, doc in enumerate(todo):
+            self._doc_q.put_nowait((document_index, doc))
         # Bounded, so the chunking stage cannot read the whole corpus into Chunks while
         # the GPU is the thing running behind. The packer is the only consumer, so one
         # slot per request in flight is the natural depth.
@@ -596,7 +605,7 @@ class _Embedder:
         try:
             while not self._stop.is_set():
                 try:
-                    doc_id, doc = self._doc_q.get_nowait()
+                    document_index, doc = self._doc_q.get_nowait()
                 except asyncio.QueueEmpty:
                     break
                 try:
@@ -613,7 +622,7 @@ class _Embedder:
                     logger.exception("embed: unexpected error while chunking %s", doc.document_name)
                     self._record_failure(doc, exc)
                     continue
-                await self._prepared_q.put((doc_id, doc, chunks))
+                await self._prepared_q.put((document_index, doc, chunks))
         finally:
             # One sentinel per worker, on every path out. The packer counts them to
             # know the stage is over, so a worker that returned without posting one
@@ -636,17 +645,17 @@ class _Embedder:
                 # Keep draining rather than break: a worker blocked on `put` would
                 # never reach its sentinel and this loop would never end.
                 continue
-            doc_id, doc, chunks = item
+            document_index, doc, chunks = item
             if not chunks:
                 # Nothing to send. Recorded as an outcome and written to both Sinks --
                 # an empty output is how a Document with no usable text is distinguished
                 # from one that was never reached (design 11.4).
-                self.states[doc_id] = _DocState(doc, chunks)
-                self._complete(doc_id)
+                self.states[document_index] = _DocState(doc, chunks)
+                self._complete(document_index)
                 continue
-            self.states[doc_id] = _DocState(doc, chunks)
+            self.states[document_index] = _DocState(doc, chunks)
             for index, chunk in enumerate(chunks):
-                ref = _ChunkRef(doc_id, index, doc.text[chunk.start_char : chunk.end_char], chunk.token_count)
+                ref = _ChunkRef(document_index, index, doc.text[chunk.start_char : chunk.end_char], chunk.token_count)
                 if batch and tokens + ref.tokens > self.request_budget_tokens:
                     await self._dispatch(batch)
                     batch, tokens = [], 0
@@ -692,8 +701,8 @@ class _Embedder:
             raise
         except Exception as exc:  # noqa: BLE001 -- the disposition is the same for anything unforeseen
             logger.exception("embed: unexpected error while embedding %d chunk(s)", len(refs))
-            for doc_id in sorted({ref.doc_id for ref in refs}):
-                self._fail(doc_id, exc)
+            for document_index in sorted({ref.document_index for ref in refs}):
+                self._fail(document_index, exc)
 
     async def _embed_refs(self, refs: list[_ChunkRef]) -> None:
         """Embed one request's Chunks; on terminal failure, split before failing Documents.
@@ -717,20 +726,20 @@ class _Embedder:
             raw = await self.client.embed(texts)
             vectors = slice_and_normalize(raw, self.stored_dim)
         except (EmbedRequestError, TerminalDocumentError, ValueError) as exc:
-            doc_ids = sorted({ref.doc_id for ref in refs})
-            if len(doc_ids) > 1:
+            document_indexes = sorted({ref.document_index for ref in refs})
+            if len(document_indexes) > 1:
                 logger.warning(
                     "embed: a request carrying %d Documents failed (%s); re-issuing them one at a time so only the bad one fails",
-                    len(doc_ids),
+                    len(document_indexes),
                     exc,
                 )
-                for doc_id in doc_ids:
-                    await self._embed_refs([ref for ref in refs if ref.doc_id == doc_id])
+                for document_index in document_indexes:
+                    await self._embed_refs([ref for ref in refs if ref.document_index == document_index])
                 return
-            self._fail(doc_ids[0], exc)
+            self._fail(document_indexes[0], exc)
             return
         for ref, row in zip(refs, vectors):
-            state = self.states.get(ref.doc_id)
+            state = self.states.get(ref.document_index)
             if state is None or state.failed:
                 # Its sibling request already failed it. Dropping the vector is right:
                 # nothing is written for a failed Document, so Resume retries it whole.
@@ -738,11 +747,11 @@ class _Embedder:
             state.vectors[ref.index] = row
             state.pending -= 1
             if state.pending == 0:
-                self._complete(ref.doc_id)
+                self._complete(ref.document_index)
 
     # -- the single writer ---------------------------------------------------
 
-    def _complete(self, doc_id: int) -> None:
+    def _complete(self, document_index: int) -> None:
         """Pool, write both Sinks in order, and count the outcome.
 
         Called only from the event-loop thread, which is what makes "single writer"
@@ -754,7 +763,7 @@ class _Embedder:
         from paperscale.embed.names import NameCollisionError, source_digest
         from paperscale.embed.vectors import EmbeddedDocument, pool_document_vector
 
-        state = self.states.pop(doc_id)
+        state = self.states.pop(document_index)
         doc = state.doc
         if state.chunks:
             chunk_vectors = np.stack(state.vectors).astype(np.float32, copy=False)
@@ -796,12 +805,12 @@ class _Embedder:
 
     # -- failures ------------------------------------------------------------
 
-    def _fail(self, doc_id: int, exc: BaseException) -> None:
-        state = self.states.get(doc_id)
+    def _fail(self, document_index: int, exc: BaseException) -> None:
+        state = self.states.get(document_index)
         if state is None or state.failed:
             return
         state.failed = True
-        self.states.pop(doc_id, None)
+        self.states.pop(document_index, None)
         self._record_failure(state.doc, exc)
 
     def _record_failure(self, doc: _Document, exc: BaseException) -> None:
@@ -848,6 +857,9 @@ class _Embedder:
                 advisory = queue_advisory(self._queue_history)
                 if advisory:
                     self.rep.log(advisory)
+            # Design 13.2's gauge, sampled on the same cadence as the `server` column
+            # because it is the same kind of number: true now, not true cumulatively.
+            self.rep.set_stat("retrying", self.client.retrying, group="issues")
             push_embed_stats(
                 self.rep,
                 self.stats,

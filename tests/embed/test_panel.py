@@ -241,11 +241,24 @@ def _reporter(width: int, height: int):
 
 
 def _populate(rep, *, log_lines: int = 20) -> None:
-    """The panel an embed Invocation actually draws, pushed by its own writers."""
+    """The panel an embed Invocation actually draws.
+
+    The `server` group is pushed by the production writer. The `run` and `issues`
+    rows are fed here at corpus-sized values, but only at names a real Invocation
+    writes: `run_embed` seeds and updates all four `run` rows, and `_Embedder`
+    writes `failed` and `oversize`.
+
+    **`retrying` is absent on purpose.** Design 13.1 puts it in `issues`, but no
+    production writer exists for it -- the number it would show, requests
+    currently in backoff, is only visible inside `EmbedClient._with_backoff`,
+    which keeps no counter of it. Writing it here anyway made these frames prove
+    the layout of a row no operator can ever see. Restore it in this tuple when
+    the counter and the `set_stat` that reads it exist.
+    """
     for name, value in (("documents", "4,309"), ("chunks", "61,204"), ("skipped", "3,902"), ("empty", "12")):
         rep.set_stat(name, value)
     push_embed_stats(rep, _live_stats(), _Poller(True), stored_dim=768, native_dim=4096, outstanding=16)
-    for name, value in (("failed", "0"), ("retrying", "2"), ("oversize", "0")):
+    for name, value in (("failed", "0"), ("oversize", "0")):
         rep.set_stat(name, value, group="issues")
     rep.phase("embedding", total=8578)
     for i in range(log_lines):

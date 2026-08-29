@@ -80,7 +80,8 @@ class _FakeServer:
                 # 413, not a plain 400. Design 12.6 makes only a context-overflow `400` and a
                 # `413` terminal for the Document; every other `400` rides the response axis for
                 # eight attempts. The split exists for a refusal the Document cannot come back
-                # from, so the poison has to be one.
+                # from, so the poison has to be one -- a plain `400` would test the retry axis
+                # instead, and would do it eight backoffs at a time.
                 return 413, b'{"error": {"message": "request entity too large"}}'
             data = [{"index": i, "embedding": _b64(self._vector(text))} for i, text in enumerate(texts)]
             return 200, json.dumps({"data": data}).encode()
@@ -708,6 +709,14 @@ class PanelWiringTest(unittest.TestCase):
         recorder = self._embed()
         self.assertEqual(recorder.phases, [("embedding", 3)])
         self.assertEqual(recorder.stats[("run", "skipped")], 0)
+
+    def test_the_issues_group_seeds_all_three_rows_including_retrying(self) -> None:
+        # Design 13.1 lists `failed`, `retrying`, `oversize`. All three are seeded before
+        # the first Document so the column is its full height from the first frame -- a
+        # row that appears mid-run reads as something breaking.
+        recorder = self._embed()
+        for row in ("failed", "retrying", "oversize"):
+            self.assertEqual(recorder.stats[("issues", row)], 0, row)
 
     def test_a_fully_resumed_invocation_reads_zero_of_zero(self) -> None:
         self._embed()

@@ -59,9 +59,9 @@ class EmbedModel(abc.ABC):
     #: ever enforce on our behalf.
     min_dim: int = 32
 
-    #: Prefix paperscale applies to every Document before embedding, and records in both Sinks.
-    #: Recording it is load-bearing rather than defensive: a Consumer that does not know Documents
-    #: were prefixed will build queries that do not match them.
+    #: The Instruction paperscale applies to every Document before embedding, and records in both
+    #: Sinks. Recording it is load-bearing rather than defensive: a Consumer that does not know
+    #: which Instruction the Documents carried will build queries that do not match them.
     document_instruction: str
 
     #: The query-side convention, recorded for the Consumer and **never applied here** -- queries

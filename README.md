@@ -114,8 +114,10 @@ file and only warnings appear in the event pane:
 - `evaluate` — `<--db directory>/logs/evaluate-<pid>.log`, or the path given to
   `--disk-logging`. (evaluate has no workspace, so the database's directory is
   its home.)
-- `embed` — beneath the `--out` directory, or the path given to
-  `--disk-logging`.
+- `embed` — `<the --out directory's parent>/logs/embed-<pid>.log`, or the path
+  given to `--disk-logging`. (Beside `--out` and not inside it: `--out` is the
+  deliverable a Consumer reads, and a `logs/` directory in there is one more
+  thing every reader has to learn to ignore.)
 
 The path is printed once the frame is gone, since the alternate screen keeps no
 scrollback.
