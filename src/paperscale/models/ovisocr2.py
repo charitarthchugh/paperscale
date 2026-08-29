@@ -20,12 +20,10 @@ vLLM serving (vendor pins ``vllm==0.22.1``; the checkpoint declares
 Verified end-to-end on vLLM 0.27.1, which registers the arch natively)::
 
     vllm serve ATH-MaaS/OvisOCR2 --port 8000 \
-        --gdn-prefill-backend triton \
         --limit-mm-per-prompt '{"image": 1}' \
         --mm-processor-kwargs '{"images_kwargs": {"min_pixels": 200704, "max_pixels": 8294400}}'
 
-``--gdn-prefill-backend triton`` is the vendor's ``gdn_prefill_backend="triton"``
-LLM kwarg; the mm-processor bounds are their ``min_pixels=448*448`` /
+The mm-processor bounds are the vendor's ``min_pixels=448*448`` /
 ``max_pixels=2880*2880``. The default 1540px render sits comfortably inside that
 band (~1.8 MP for a letter page), and the band tolerates up to ~3270px on the
 long edge via ``--target_longest_image_dim`` if fine print needs it.

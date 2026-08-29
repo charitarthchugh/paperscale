@@ -262,12 +262,10 @@ paperscale strips the `<img src="images/bbox_…">` placeholders the model emits
 charts and figures (their crops are never written) and flags those pages as
 diagrams instead.
 
-The vendor pins `vllm==0.22.1` and selects the Triton GDN prefill backend — the
-model interleaves Gated-DeltaNet `linear_attention` layers with full attention:
+The vendor pins `vllm==0.22.1`:
 
 ```bash
 vllm serve ATH-MaaS/OvisOCR2 --port 8000 \
-  --gdn-prefill-backend triton \
   --limit-mm-per-prompt '{"image": 1}' \
   --mm-processor-kwargs '{"images_kwargs": {"min_pixels": 200704, "max_pixels": 8294400}}'
 
