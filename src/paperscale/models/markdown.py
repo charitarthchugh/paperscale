@@ -17,11 +17,27 @@ DEFAULT_MARKDOWN_PROMPT = (
 
 _CODE_FENCE = re.compile(r"^\s*```(?:markdown|md)?\s*\n(?P<body>.*?)\n```\s*$", re.DOTALL | re.IGNORECASE)
 
+# A complete <think>...</think> reasoning block. Several OCR VLMs emit one when
+# thinking is enabled; paperscale never enables it, so stripping is defensive.
+# Matched-pair only, so a literal "</think>" transcribed from the page cannot
+# truncate real content.
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL)
+
 
 def _strip_code_fence(content: str) -> str:
     """Remove a single wrapping ```markdown ... ``` fence some models add."""
     match = _CODE_FENCE.match(content)
     return match.group("body") if match else content
+
+
+def strip_think_blocks(content: str) -> str:
+    """Drop any complete ``<think>...</think>`` reasoning block from a response."""
+    return _THINK_BLOCK.sub("", content)
+
+
+def has_html_table(markdown: str | None) -> bool:
+    """Whether Markdown carries an HTML ``<table>``, which paperscale keeps as-is."""
+    return "<table" in (markdown or "").lower()
 
 
 class MarkdownModel(OCRModel):

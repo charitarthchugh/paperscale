@@ -58,7 +58,7 @@ from paperscale.image_utils import convert_image_to_pdf_bytes, is_jpeg, is_png
 from paperscale.metrics import MetricsKeeper, WorkerTracker
 from paperscale.models import DEFAULT_MODEL, MODEL_REGISTRY, OCRModel, build_ocr_model
 from paperscale.prompts import PageResponse
-from paperscale.quality.verifier import DeterministicQualityVerifier
+from paperscale.quality.verifier import DISABLE_ALL_CHECKS, QUALITY_CHECK_CODES, DeterministicQualityVerifier, expand_disabled_checks
 from paperscale.renderpdf import png_dark_fraction, render_pdf_to_base64png
 
 # The stderr hand-off is shared with evaluate, which needs the identical ordering
@@ -107,8 +107,19 @@ get_pdf_filter = cache(lambda: PdfFilter(languages_to_keep={Language.ENGLISH, No
 
 # Page acceptance uses paperscale's deterministic quality gate (empty / mojibake /
 # control-chars / refusal / repetition / truncation / length checks) instead of
-# olmOCR's token-count + finish_reason + rotation heuristics.
+# olmOCR's token-count + finish_reason + rotation heuristics. main() builds the
+# run's verifier onto args from --disable-quality-check; this is the default for
+# callers that drive try_single_page directly (tests, embedders).
 _verifier = DeterministicQualityVerifier()
+
+
+def _build_verifier(disabled: list[str]) -> DeterministicQualityVerifier:
+    """Build the page verifier, honouring ``--disable-quality-check``."""
+    codes = expand_disabled_checks(disabled)
+    if codes:
+        logger.warning(f"Quality checks disabled: {', '.join(sorted(codes))}. Pages these would reject are now accepted as-is.")
+    return DeterministicQualityVerifier(disabled_checks=codes)
+
 
 # A page whose rendered image has less ink than this is treated as genuinely blank:
 # an empty/degenerate OCR result for it is accepted as a successful empty page
@@ -117,7 +128,7 @@ _BLANK_INK_THRESHOLD = 0.01
 
 # Quality diagnostics that, on a near-blank render, mean "genuinely blank page"
 # (empty output, or a model repetition loop on noise) rather than a read failure.
-_BLANK_ELIGIBLE_DIAGNOSTICS = frozenset({"empty_output", "repeated_ngram", "repeated_character"})
+_BLANK_ELIGIBLE_DIAGNOSTICS = frozenset({"empty_output", "repeated_ngram", "repeated_character", "repeated_tail"})
 
 
 def _render_is_blank(image_base64: str) -> bool:
@@ -235,7 +246,7 @@ async def try_single_page(
         model_response_markdown = base_response_data["choices"][0]["message"]["content"]
         page_response = args.ocr_model.parse(model_response_markdown)
 
-        finding = _verifier.classify(page_response.natural_text or "")
+        finding = args.quality_verifier.classify(page_response.natural_text or "")
         if finding.accepted:
             is_valid, is_terminal = True, False
         elif finding.kind in _BLANK_ELIGIBLE_DIAGNOSTICS and render_is_blank:
@@ -1167,6 +1178,20 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pages_per_group", type=int, default=100, help="Aim for this many PDF pages per work item group.")
     parser.add_argument("--max_page_retries", type=int, default=8, help="Max number of times to retry a page.")
     parser.add_argument("--max_page_error_rate", type=float, default=0.004, help="Allowable fraction of fallback pages per document.")
+    parser.add_argument(
+        "--disable-quality-check",
+        dest="disabled_quality_checks",
+        action="append",
+        default=[],
+        metavar="CHECK",
+        choices=(*QUALITY_CHECK_CODES, DISABLE_ALL_CHECKS),
+        help="Skip a deterministic quality check so it cannot reject a page. Repeatable. "
+        f"'{DISABLE_ALL_CHECKS}' disables the gate entirely. Choices: {', '.join(QUALITY_CHECK_CODES)}.",
+    )
+    # main() replaces this from --disable-quality-check; the default keeps the fully
+    # armed gate available to callers that drive try_single_page without going
+    # through main() (tests, embedders).
+    parser.set_defaults(quality_verifier=_verifier)
     parser.add_argument("--workers", type=int, default=4, help="Max number of page groups processed at once.")
     parser.add_argument("--max_concurrent_requests", type=int, default=500, help="Max requests in-flight to the inference provider at once.")
     parser.add_argument("--max_server_ready_timeout", type=int, default=600, help="Seconds to wait for the server to become ready.")
@@ -1244,6 +1269,7 @@ async def main():
 
     # Resolve the OCR model adapter and the served model name.
     args.ocr_model = build_ocr_model(args.ocr_model_name)
+    args.quality_verifier = _build_verifier(args.disabled_quality_checks)
     if args.model is None:
         args.model = args.ocr_model.default_model_name
     # Render size: explicit --target_longest_image_dim wins, else the model's preferred.
