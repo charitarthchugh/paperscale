@@ -417,7 +417,9 @@ of a whole corpus.
 
 `--embed-url` is a base URL **without** `/v1` (mirroring `--pplx-url`).
 paperscale asks it for the served model id and `max_model_len` on `/v1/models`,
-counts tokens on `/v1/tokenize`, and embeds on `/v1/embeddings`.
+counts tokens on `/tokenize`, and embeds on `/v1/embeddings`. The missing `/v1`
+on the middle one is not a typo: vLLM mounts `tokenize` at the top level, and
+only its OpenAI-compatible routes sit under `/v1`.
 
 Both sinks carry both artifacts, because there are two consumers and neither is
 primary. Retrieval reads the **chunk vectors** — ranking is max-over-chunks,
@@ -549,7 +551,7 @@ every long document hard-fail.
   than enforcing a quality opinion under cover of a safety check.
 
 The chunk budget follows from that: `validated context length - tokens(document
-instruction) - 64`, where the 64 is margin against `/v1/tokenize` and
+instruction) - 64`, where the 64 is margin against `/tokenize` and
 `/v1/embeddings` disagreeing by a token on special tokens. For a default serve
 that is 32704 (Qwen3) or about 32701 (Nemotron), which is roughly 45 dense pages
 — so chunking is the minority path, not the usual one. There is deliberately no

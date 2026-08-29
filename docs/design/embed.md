@@ -253,7 +253,7 @@ four-engine inventory established that three facts are irreducible.
 true; it was closed COMPLETED by a maintainer comment reframing the question, not by a fix.
 
 **Everything else is asked of the server and recorded.** Served model id comes from `/v1/models`
-(`.id` plus `.root`); exact token counts come from `POST /v1/tokenize`.
+(`.id` plus `.root`); exact token counts come from `POST /tokenize`.
 
 ### 3.3 The Adapter's complete contract
 
@@ -452,7 +452,7 @@ a decision, and 2.6% of the context is a lot to spend on nothing recorded.
 **The margin does not defend against packing.** #24's subadditivity proof already covers packing, and
 covers the Instruction too, since `tokens("passage: ") + tokens(text) >= tokens("passage: " + text)`
 by the same argument. What remains is a **route-level** risk: paperscale counts tokens on
-`/v1/tokenize` and sends text to `/v1/embeddings`. If those two apply special tokens differently by
+`/tokenize` and sends text to `/v1/embeddings`. If those two apply special tokens differently by
 even one token, a Chunk sitting exactly on the budget hard-fails — because the design deliberately
 relies on vLLM *erroring* on overflow rather than truncating. 64 tokens is 0.2% of context against a
 visible hard failure.
@@ -494,7 +494,11 @@ offsets *and* page spans** (#24).
 
 ### 5.2 Token counting — ask the server
 
-`POST /v1/tokenize` returns the exact count for the model actually loaded. No new dependency, no
+`POST /tokenize` returns the exact count for the model actually loaded. **The route carries no
+`/v1`**: vLLM mounts `tokenize` and `detokenize` at the *top level*, and only the OpenAI-compatible
+routes sit under `/v1`. This document said `/v1/tokenize` in 23 places, which 404s on every build
+and so failed every Document until a live run caught it — see
+[§17.3](#173-stale-text-still-standing-in-the-record). No new dependency, no
 second tokenizer to keep in sync with the server's, and it follows the precedent already set in
 `src/paperscale/evaluation/pplx.py` of reading token facts off the server rather than reimplementing
 them. Two properties make it affordable: the route is handled CPU-side in the API server process and
@@ -560,7 +564,7 @@ pages from `pdf_page_numbers`. The recorded fields are `start_char`, `end_char`,
 `last_page`, `chunk_index`, `n_chunks`, `token_count`, `is_partial_page` — of which `chunk_index` and
 `n_chunks` are later dropped from the `.npz` as derived ([§8.4](#the-decisions-under-that-table)).
 
-**Rejected: deriving offsets from the tokenizer's output.** `/v1/tokenize` can return
+**Rejected: deriving offsets from the tokenizer's output.** `/tokenize` can return
 `return_token_strs`, and it is tempting to reconstruct character positions from them.
 `pplx.py:201` already carries the warning: decoded tokens carry marker glyphs (SentencePiece `▁`, BPE
 `Ġ`) whose handling differs per tokenizer, so character attribution built on them breaks silently
@@ -1369,7 +1373,7 @@ Invocation before any GPU work happens.
 5. **Compute `validated_context_length`** = `min(card, server)`, then apply `--context-length` if
    given: reject above the server, warn above the card ([§4.2](#42-the-rule)).
 6. **Compute `chunk_budget`** = `validated_context_length − tokens(document_instruction) − 64`. The
-   Instruction's token count is one `/v1/tokenize` call, or 0 for the empty string.
+   Instruction's token count is one `/tokenize` call, or 0 for the empty string.
 7. **Compute the effective request budget** = `max(--request-tokens, chunk_budget)`, with an explicit
    log line when it is raised ([§12.3](#123-batching--a-token-budget-never-a-count-of-chunks)).
 8. **Probe the output dimension** — one cheap `/v1/embeddings` request — and assert the observed width
@@ -1394,7 +1398,7 @@ accepted that when it chose one bar over two.
 
 Per Document, in order:
 
-1. `POST /v1/tokenize` on the whole text — one call.
+1. `POST /tokenize` on the whole text — one call.
 2. If it fits, one Chunk. Otherwise the Overflow path ([§5.3](#53-the-algorithm)).
 3. Chunks are packed into `/v1/embeddings` requests bounded by the effective request token budget,
    **mixing Documents**.
@@ -1469,7 +1473,7 @@ Three deliberate properties: it **names the flag**, so the advice is actionable 
 document; it is **advisory only**, so nothing oscillates; and it needs **no new plumbing**, because
 `vllm:num_requests_waiting` is already parsed and already surfaced.
 
-**`/v1/tokenize` gets its own concurrency bound, not `--concurrency` slots.** A producer stage
+**`/tokenize` gets its own concurrency bound, not `--concurrency` slots.** A producer stage
 (tokenize, chunk, pack) feeds a consumer stage (embed); `--concurrency` bounds the consumer only.
 Sharing the slots would idle the GPU during CPU-side work.
 
@@ -1548,7 +1552,7 @@ alone are recorded as failed. #30's own framing — *"one bad PDF must never end
 without the split, one bad Document fails forty. (#36 found this is genuinely uncommon: **blast radius
 is the batch, not the record, everywhere except olmOCR.**)
 
-**A `/v1/tokenize` failure fails the Document, not the Invocation.** Without a token count a Chunk
+**A `/tokenize` failure fails the Document, not the Invocation.** Without a token count a Chunk
 cannot be sized, and the design depends on vLLM erroring on overflow rather than truncating, so
 proceeding on a guess is unsafe. Counted in `failed`. Tokenize shares the taxonomy and the backoff
 above — same client, same server, same failure modes.
@@ -1624,7 +1628,7 @@ the server figure (`Rates.waiting`, from `vllm:num_requests_waiting`) is what sa
 high. Note this is *waiting*, not the OCR panel's *running*: queue depth is the signal, admitted
 requests are not. Either half renders `-` when absent, never `0`, per `format_rate`'s existing rule.
 
-**It counts `/v1/embeddings` requests only.** `/v1/tokenize` is served CPU-side in the API server
+**It counts `/v1/embeddings` requests only.** `/tokenize` is served CPU-side in the API server
 process and never enters the engine scheduler, so it cannot produce the queue it would be compared
 against. Folding it in would inflate the client number with traffic that cannot cause the thing the
 row measures. **Tokenize gets no panel row at all**; it belongs in the end-of-run report if anywhere.
@@ -2105,7 +2109,7 @@ it is cheap to correct.
    reading is that it always is, since `<out>` always exists and the invariant comparison is useful
    regardless; that reading is what this document assumes, and it should be confirmed rather than
    inherited.
-2. **The `/v1/tokenize` concurrency bound had no value — settled here.** #40 decided it gets *"its own
+2. **The `/tokenize` concurrency bound had no value — settled here.** #40 decided it gets *"its own
    bound, not `--concurrency` slots"* and added no flag, but recorded no number. **Settled as
    `(concurrency * 3) // 2`**, 96 at the default, marked unmeasured on the same footing as every other
    constant in [§14.2](#142-where-the-numbers-come-from). See
@@ -2144,6 +2148,13 @@ in this document.
   not.
 - **#33 is a two-engine client design for an engine now out of scope.** Nothing in it should be built.
 - **#35's "must not be operator-settable"** was overturned by #37's amendment.
+- **Every ticket that names the tokenizer route writes `POST /v1/tokenize`.** vLLM mounts
+  `tokenize` and `detokenize` at the **top level**; only the OpenAI-compatible routes sit under
+  `/v1`. The `/v1` form 404s on every build, and a 404 rides the bad-response retry axis, so each
+  Document burned its whole budget on an error that could never succeed. Caught by a live run, not
+  by the tests: the fake transport answers whatever URL it is handed, so the route assertion pinned
+  the wrong string just as confidently. **It is superseded** — the route is `/tokenize`, corrected
+  here in 23 places and in `README.md` in 2.
 - **`_parse_runs` is at `src/paperscale/cli.py:66`**, not `:65` as #27, #28 and #35 all cite.
 
 ---
@@ -2167,7 +2178,7 @@ The split of files *inside* the package is decided here:
 | `names.py` | Document-name derivation, the path digest, the startup collision check |
 | `budget.py` | `validated_context_length` rule, `--context-length` handling, `chunk_budget`, the request-budget floor |
 | `chunking.py` | greedy page packing and the oversized-page path |
-| `client.py` | the vLLM client: `/v1/models`, `/v1/tokenize`, `/v1/embeddings`, the explicit `encoding_format`/`embed_dtype`/`endianness` triple and the `"<f4"` base64 decode ([§16.2](#162-encoding_format-base64--confirmed-by-source-read)), the three retry axes, the outstanding-request counter |
+| `client.py` | the vLLM client: `/v1/models`, `/tokenize`, `/v1/embeddings`, the explicit `encoding_format`/`embed_dtype`/`endianness` triple and the `"<f4"` base64 decode ([§16.2](#162-encoding_format-base64--confirmed-by-source-read)), the three retry axes, the outstanding-request counter |
 | `vectors.py` | MRL slice + re-normalize, token-weighted pooling, the single-Chunk short-circuit |
 | `npz_sink.py` | manifest, sidecar, the eight arrays, write ordering, reserved names |
 | `lance_sink.py` | the two tables, table metadata, `add()`/`merge_insert`, the scoped delete and its quoting |
@@ -2246,7 +2257,7 @@ load-bearing but no test is named.
 8. **[implied]** A page whose `natural_text` is `None` (zero-width span) never forces a Chunk break.
 9. **[implied]** A page that alone exceeds the budget is cut at the last `\n` at or before it, else
    hard-cut; `is_partial_page` is set; text is never dropped and the Document never fails.
-10. **[implied]** The common case costs exactly one `/v1/tokenize` call per Document.
+10. **[implied]** The common case costs exactly one `/tokenize` call per Document.
 11. **[implied]** Assembled Chunks are never re-tokenized and never exceed the budget when tokenized
     whole.
 
@@ -2588,7 +2599,7 @@ TEI issue #148 is still true; a maintainer closed it COMPLETED with a comment th
 question, not with a fix.
 
 **Everything else comes from the server.** The served model id comes from `/v1/models` (`.id` and
-`.root`). Exact token counts come from `POST /v1/tokenize`.
+`.root`). Exact token counts come from `POST /tokenize`.
 
 **The complete Adapter contract:**
 
@@ -2747,7 +2758,7 @@ budget(tok)  chars@3.6   Overflow   pct   max Chunks   total Chunks / 49 Documen
 decision, and 2.6% of the context is too much to spend on nothing recorded. The margin does **not**
 defend against packing — subadditivity already covers packing, and covers the Instruction too,
 because `tokens("passage: ") + tokens(text) >= tokens("passage: " + text)`. What is left is a
-**route-level** risk: paperscale counts tokens on `/v1/tokenize` and sends text to `/v1/embeddings`.
+**route-level** risk: paperscale counts tokens on `/tokenize` and sends text to `/v1/embeddings`.
 If those two routes apply special tokens differently by one token, a Chunk exactly on the budget
 hard-fails — because the design wants vLLM to **error** on overflow, not truncate. 64 tokens is 0.2%
 of the context against a visible hard failure.
@@ -2785,8 +2796,12 @@ recorded as character offsets **and** page spans.
 2. **paperscale cannot count tokens today.** There is no `transformers`, `tokenizers` or `tiktoken`
    in `pyproject.toml`. To count tokens is a new capability, not a call to something that exists.
 
-**Ask the server: `POST /v1/tokenize`.** It gives the exact count for the model that is loaded. It
-adds no dependency and no second tokenizer to keep in step. It follows the precedent in
+**Ask the server: `POST /tokenize`.** It gives the exact count for the model that is loaded. It
+adds no dependency and no second tokenizer to keep in step.
+
+**The route has no `/v1`.** vLLM puts `tokenize` and `detokenize` at the top level. Only the
+OpenAI-compatible routes use `/v1`. The wrong route gives a 404 on every build. It made each
+Document fail until a live run found it. It follows the precedent in
 `src/paperscale/evaluation/pplx.py`. Two properties make it affordable: the API server process
 handles the route on the CPU and it never enters the engine scheduler, and the common case costs
 exactly **one** call per Document.
@@ -2843,7 +2858,7 @@ corpus-wide constant and no second request.
   case. Offsets alone force every Consumer to derive pages again. The recorded fields are
   `start_char`, `end_char`, `first_page`, `last_page`, `chunk_index`, `n_chunks`, `token_count`,
   `is_partial_page`. The `.npz` Sink later drops `chunk_index` and `n_chunks` as derived.
-- **Rejected: offsets from the tokenizer's output.** `/v1/tokenize` can return `return_token_strs`,
+- **Rejected: offsets from the tokenizer's output.** `/tokenize` can return `return_token_strs`,
   and it is tempting to rebuild character positions from them. `pplx.py:201` already carries the
   warning: decoded tokens carry marker glyphs (SentencePiece `▁`, BPE `Ġ`) whose handling differs per
   tokenizer, so character attribution built on them breaks silently across models. A slice by the
@@ -3501,7 +3516,7 @@ before any GPU work.
 5. Compute `validated_context_length` = `min(card, server)`. Then apply `--context-length` if given:
    reject above the server, warn above the card.
 6. Compute `chunk_budget` = `validated_context_length − tokens(document_instruction) − 64`. The
-   Instruction's count is one `/v1/tokenize` call, or 0 for an empty string.
+   Instruction's count is one `/tokenize` call, or 0 for an empty string.
 7. Compute the effective request budget = `max(--request-tokens, chunk_budget)`, with an explicit log
    line when it is raised.
 8. Probe the output dimension with one cheap `/v1/embeddings` request. Assert the width equals
@@ -3523,7 +3538,7 @@ it chose one bar over two.
 
 **Per Document, in order:**
 
-1. `POST /v1/tokenize` on the whole text — one call.
+1. `POST /tokenize` on the whole text — one call.
 2. If it fits, one Chunk. If not, the Overflow path.
 3. Pack Chunks into `/v1/embeddings` requests bounded by the effective request token budget, **mixing
    Documents**.
@@ -3592,7 +3607,7 @@ Three deliberate properties: it **names the flag**, so the advice is actionable 
 document; it is **advisory only**, so nothing oscillates; and it needs **no new plumbing**, because
 `vllm:num_requests_waiting` is already parsed and surfaced.
 
-**`/v1/tokenize` gets its own concurrency bound, not `--concurrency` slots.** A producer stage
+**`/tokenize` gets its own concurrency bound, not `--concurrency` slots.** A producer stage
 (tokenize, chunk, pack) feeds a consumer stage (embed), and `--concurrency` bounds the consumer only.
 To share the slots would idle the GPU during CPU-side work. **The bound is `(concurrency * 3) // 2`** —
 96 at the default 64. Tokenize never reaches the GPU, so it can run ahead without contention, but it
@@ -3658,7 +3673,7 @@ multi-Document request, re-issue its Documents **one at a time**, and record as 
 fail alone. #30's own framing — *"one bad PDF must never end a run"* — is the reason. #36 found this is
 genuinely uncommon: **blast radius is the batch, not the record, everywhere except olmOCR.**
 
-**A `/v1/tokenize` failure fails the Document, not the Invocation.** With no token count a Chunk cannot
+**A `/tokenize` failure fails the Document, not the Invocation.** With no token count a Chunk cannot
 be sized, and the design depends on vLLM erroring on overflow rather than truncating, so to proceed on
 a guess is unsafe. It counts in `failed`. Tokenize shares the taxonomy and the backoff — same client,
 same server, same failure modes.
@@ -3722,7 +3737,7 @@ both, so nothing needs writing. It needs to be correct one time.
 The server figure (`Rates.waiting`, from `vllm:num_requests_waiting`) is what says the flag is too
 high. Note this is *waiting*, not the OCR panel's *running*: queue depth is the signal, admitted
 requests are not. Either half renders `-` when absent, never `0`, per `format_rate`'s existing rule.
-**It counts `/v1/embeddings` requests only.** `/v1/tokenize` is served CPU-side and never enters the
+**It counts `/v1/embeddings` requests only.** `/tokenize` is served CPU-side and never enters the
 engine scheduler, so it cannot make the queue it would be compared against. **Tokenize gets no panel
 row at all**; it belongs in the end-of-run report if anywhere.
 
@@ -4120,7 +4135,7 @@ correct.
    written when `--no-npz` is set.** The smallest consistent reading is that it always is, because
    `<out>` always exists and the invariant comparison is useful either way. That reading is what this
    document assumes, and somebody should confirm it rather than inherit it.
-2. **The `/v1/tokenize` concurrency bound had no value — settled here** as `(concurrency * 3) // 2`, 96
+2. **The `/tokenize` concurrency bound had no value — settled here** as `(concurrency * 3) // 2`, 96
    at the default, marked unmeasured on the same footing as every other constant. *This is a decision
    made in this document, not one recovered from the record.*
 3. **The mechanism to make resumed skips visually distinct** was a requirement with no design —
@@ -4149,6 +4164,12 @@ A later amendment supersedes each one, and this document carries the amendment.
 - **#30's batching rationale** is disproven by #36. The decision stands; the stated mechanism does not.
 - **#33 is a two-engine client design for an engine now out of scope.** Build nothing from it.
 - **#35's "must not be operator-settable"** was overturned by #37's amendment.
+- **Every ticket that names the tokenizer route writes `POST /v1/tokenize`.** vLLM puts `tokenize`
+  and `detokenize` at the top level. Only the OpenAI-compatible routes use `/v1`. The `/v1` form
+  gives a 404 on every build. A 404 goes on the bad-response retry axis. So each Document used its
+  full budget on an error that can never succeed. A live run found this. The tests could not: the
+  fake transport answers each URL it gets, so the route test held the wrong text. **It is
+  superseded.** The route is `/tokenize`.
 - **`_parse_runs` is at `src/paperscale/cli.py:66`**, not `:65` as #27, #28 and #35 all cite.
 
 ### 21.18 The implementation plan
@@ -4166,7 +4187,7 @@ one `embed` extra implementable at all.
 | `names.py` | Document-name derivation, the path digest, the startup collision check |
 | `budget.py` | the `validated_context_length` rule, `--context-length`, `chunk_budget`, the request-budget floor |
 | `chunking.py` | greedy page packing and the oversized-page path |
-| `client.py` | `/v1/models`, `/v1/tokenize`, `/v1/embeddings`, the explicit wire-parameter triple, the `"<f4"` decode, the three retry axes, the outstanding-request counter |
+| `client.py` | `/v1/models`, `/tokenize`, `/v1/embeddings`, the explicit wire-parameter triple, the `"<f4"` decode, the three retry axes, the outstanding-request counter |
 | `vectors.py` | MRL slice and re-normalize, token-weighted pooling, the single-Chunk short-circuit |
 | `npz_sink.py` | manifest, sidecar, the eight arrays, write ordering, reserved names |
 | `lance_sink.py` | the two tables, table metadata, `add()`/`merge_insert`, the scoped delete and its quoting |
