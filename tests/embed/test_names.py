@@ -92,6 +92,18 @@ class TarballFormTest(unittest.TestCase):
     def test_internal_path_cannot_escape_the_archive_directory(self):
         self.assertEqual(names.document_name("corpus.tar.gz::../../doc.pdf"), "doc.pdf")
 
+    def test_an_absolute_member_keeps_the_archive_directory(self):
+        # `os.path.join(basename, "/internal/doc.pdf")` returns the member alone, dropping the
+        # archive directory this branch exists to add.
+        self.assertEqual(names.document_name("corpus.tar.gz::/internal/doc.pdf"), "corpus/internal/doc.pdf")
+
+    def test_two_archives_sharing_an_absolute_member_do_not_collapse(self):
+        # The consequence of the join above, and the reason it is not cosmetic: both archives
+        # derived `/doc.pdf`, so two different Documents claimed one name and `check_collisions`
+        # would have failed the Invocation at startup on a corpus that is perfectly well formed.
+        first, second = names.document_name("a.tar.gz::/doc.pdf"), names.document_name("b.tar.gz::/doc.pdf")
+        self.assertEqual((first, second), ("a/doc.pdf", "b/doc.pdf"))
+
 
 class DigestTest(unittest.TestCase):
     """Obligation 15 -- sha256 over the Source-File string, never over the text."""

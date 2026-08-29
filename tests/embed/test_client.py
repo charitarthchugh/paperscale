@@ -225,6 +225,31 @@ class WireFormatTest(unittest.TestCase):
         self.assertEqual(transport.calls, [])
 
 
+class ResponseOrderingTest(unittest.TestCase):
+    """``index`` is the only thing tying a payload back to its Chunk, so it cannot be defaulted.
+
+    The happy path -- a response arriving reversed and coming back in input order -- is
+    :meth:`WireFormatTest.test_payloads_are_ordered_by_index_not_arrival`. These two cover the
+    responses where the field is not there to sort by.
+    """
+
+    def test_a_missing_index_is_a_bad_response_not_a_silent_reorder(self):
+        # The old `.get("index", i)` default fell back to arrival order, which is exactly what
+        # `index` exists to correct, so a server that omitted it had its vectors assigned to the
+        # wrong Chunks and stored as entirely plausible output. Nothing downstream can catch
+        # that: the widths match, the norms are 1, and Resume only ever asks about names.
+        body = json.dumps({"data": [{"embedding": _b64([1.0])}, {"embedding": _b64([2.0])}]}).encode()
+        with _NoSleep(), self.assertRaises(EmbedRequestError):
+            asyncio.run(_client(_Transport((200, body)), max_request_retries=2).embed(["a", "b"]))
+
+    def test_a_partial_index_is_refused_rather_than_interleaved(self):
+        # Worse than omitting it everywhere: real indices and positional fallbacks sorted on one
+        # scale interleave, so some Chunks keep their vector and some silently swap.
+        body = json.dumps({"data": [{"index": 1, "embedding": _b64([1.0])}, {"embedding": _b64([2.0])}]}).encode()
+        with _NoSleep(), self.assertRaises(EmbedRequestError):
+            asyncio.run(_client(_Transport((200, body)), max_request_retries=2).embed(["a", "b"]))
+
+
 class RetryAxesTest(unittest.TestCase):
     def test_fd_exhaustion_is_unbounded_and_consumes_no_attempt(self):
         # max_request_retries=2 -- if fd exhaustion spent the response budget, this
@@ -389,6 +414,24 @@ class RoutesTest(unittest.TestCase):
     def test_tokenize_falls_back_to_the_token_list(self):
         transport = _Transport((200, json.dumps({"tokens": [1, 2, 3]}).encode()))
         self.assertEqual(asyncio.run(_client(transport).tokenize("x")), 3)
+
+    def test_tokenize_413_is_terminal_for_the_document_and_sent_once(self):
+        # Design 12.6 makes 413 terminal without a retry and 5.2 puts /tokenize under the same
+        # taxonomy. The single call is the assertion that matters: on the retryable branch this
+        # is the /v1/tokenize 404 shape again, spending the whole budget on a fixed answer.
+        transport = _Transport(_err(413, "payload too large"))
+        with _NoSleep(), self.assertRaises(TerminalDocumentError):
+            asyncio.run(_client(transport).tokenize("x"))
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_a_non_numeric_count_is_a_bad_response_not_a_crash(self):
+        # `int(count)` sat outside the wrapper, so this raised a bare ValueError straight past
+        # the taxonomy and ended the Invocation. It belongs on the response axis: retried, then
+        # failing this Document alone.
+        transport = _Transport((200, json.dumps({"count": "not-a-number"}).encode()))
+        with _NoSleep(), self.assertRaises(EmbedRequestError):
+            asyncio.run(_client(transport, max_request_retries=3).tokenize("x"))
+        self.assertEqual(len(transport.calls), 3)
 
     def test_models_returns_the_served_id_and_max_model_len(self):
         body = json.dumps({"data": [{"id": "Qwen/Qwen3-Embedding-0.6B", "max_model_len": 32768}]}).encode()

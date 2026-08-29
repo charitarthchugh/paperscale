@@ -126,7 +126,11 @@ def document_name(source_file: str) -> str:
         # The internal path arrives from inside an archive, so its ``..`` is the one case
         # here that is plausibly hostile rather than merely sloppy; sanitizing the joined
         # path covers it with the same guard the plain branch uses.
-        relative_path = os.path.join(basename, internal_path)
+        # Joined by hand: ``os.path.join`` discards ``basename`` outright when the member is
+        # recorded with a leading ``/``, so ``corpus.tar.gz::/internal/doc.pdf`` came out as
+        # ``/internal/doc.pdf``. That drops the archive namespace this branch exists to add,
+        # and two archives holding the same internal path then collide on one name.
+        relative_path = f"{basename}/{internal_path.lstrip('/')}"
     else:
         relative_path = source_file
 

@@ -77,6 +77,22 @@ class SliceAndNormalizeTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             slice_and_normalize(vectors, _STORED_DIM)
 
+    def test_an_infinite_row_is_an_error_never_nan(self):
+        # `inf` is not a second flavour of the case above, it is the input that *makes* one:
+        # its norm is `inf`, which passes a `> 0` guard cleanly, and `inf / inf` is NaN. The
+        # row above arrives as NaN and is caught; this one arrives looking finite and leaves
+        # as `[nan, 0, 0, ...]`, which the `.npz` Sink shape-casts and stores.
+        #
+        # The row number is asserted because `argmin` picks the wrong one here -- against an
+        # infinite norm it returns the smallest *finite* entry, naming a row that is fine.
+        for coordinate in (np.float32("inf"), np.float32("-inf")):
+            with self.subTest(coordinate=coordinate):
+                vectors = _server_vectors(2)
+                vectors[1, 0] = coordinate
+                with self.assertRaises(ValueError) as caught:
+                    slice_and_normalize(vectors, _STORED_DIM)
+                self.assertIn("vector 1", str(caught.exception))
+
 
 class SingleChunkTest(unittest.TestCase):
     """The identity case, which the design requires to be exact by construction."""

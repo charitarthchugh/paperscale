@@ -103,10 +103,23 @@ def slice_and_normalize(raw, stored_dim: int) -> np.ndarray:
     # rounding a second time in the narrow type.
     sliced = vectors[:, :stored_dim].astype(np.float64)
     norms = np.linalg.norm(sliced, axis=1)
-    if not np.all(norms > 0):
+    usable = np.isfinite(norms) & (norms > 0)
+    if not np.all(usable):
         # `> 0` rather than `!= 0` so a NaN row -- which compares False against
         # everything -- is caught here too, instead of propagating into a Sink.
-        bad = int(np.argmin(norms))
+        #
+        # `isfinite` is the other half of the same guard and is not redundant. An `inf`
+        # coordinate gives an *infinite* norm, which passes `> 0` cleanly, and then
+        # `inf / inf` manufactures exactly the NaN this message refuses: the row arrives
+        # looking finite and leaves as `[nan, 0, 0, ...]`. fp16 inference overflows to
+        # `inf` in practice, so rejecting only the NaN that *arrives* leaves the input
+        # that *creates* one to reach the `.npz` Sink, which shape-casts and nothing more.
+        # LanceDB stops it a second time at `on_bad_vectors="error"`; `.npz` has no such
+        # backstop, so this is the only place that can refuse it.
+        #
+        # `argmin` can no longer name the row: against an infinite norm it returns the
+        # smallest *finite* one, which is a row that is fine. Index the offenders instead.
+        bad = int(np.flatnonzero(~usable)[0])
         raise ValueError(f"vector {bad} has no usable direction in its first {stored_dim} dimensions (norm {norms[bad]!r}); refusing to write NaN")
     return (sliced / norms[:, None]).astype(np.float32)
 

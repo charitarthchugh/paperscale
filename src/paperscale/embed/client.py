@@ -334,6 +334,12 @@ class EmbedClient:
         # process and never enters the engine scheduler.
         async with limit:
             status, raw = await self._post(f"{self.url}/tokenize", json_data=body, api_key=self.api_key)
+        if status == 413:
+            # Design 12.6 makes `413` terminal for the Document without a retry, and 5.2 puts
+            # `/tokenize` under that same taxonomy. Left on the retryable branch it repeats the
+            # shape of the `/v1/tokenize` 404 this file carried until `ddce48d`: an answer that
+            # cannot change, spending the whole budget to arrive back where it started.
+            raise TerminalDocumentError(f"embed: /tokenize returned 413: {(raw or b'')[:300]!r}")
         if status != 200:
             raise EmbedRequestError(f"embed: /tokenize returned {status}: {(raw or b'')[:300]!r}")
         try:
@@ -346,7 +352,14 @@ class EmbedClient:
             if not isinstance(tokens, list):
                 raise EmbedRequestError(f"embed: /tokenize response carries neither 'count' nor 'tokens': {parsed!r}")
             count = len(tokens)
-        return int(count)
+        try:
+            return int(count)
+        except (TypeError, ValueError) as e:
+            # A 200 carrying a non-numeric `count` is a bad response like any other, but this
+            # conversion sat outside the wrapper above, so the bare `ValueError` escaped design
+            # 12.6's taxonomy entirely: a route whose whole contract is that it *shares* that
+            # taxonomy failed the Invocation on one bad body instead of retrying the request.
+            raise EmbedRequestError(f"embed: /tokenize returned a non-numeric count {count!r}: {type(e).__name__}: {e}") from e
 
     async def embed(self, texts: list[str]):
         """``POST /v1/embeddings`` -> ``(len(texts), native_dim)`` float32, in input order.
@@ -424,7 +437,12 @@ class EmbedClient:
             # vLLM fans one ``input`` array into N independent engine requests and
             # merges them as they finish, so arrival order is not input order. The
             # ``index`` field is the only thing that ties a payload back to its Chunk.
-            order = sorted(range(len(data)), key=lambda i: data[i].get("index", i))
+            # No positional fallback. `.get("index", i)` defaulted to the arrival order the
+            # line above calls unreliable, and a *partial* omission is worse than a total one:
+            # it sorts real indices against positions on a single scale and interleaves them.
+            # A missing key raises `KeyError` into the handler below, which is where a response
+            # this malformed belongs.
+            order = sorted(range(len(data)), key=lambda i: data[i]["index"])
             encoded = [data[i]["embedding"] for i in order]
         except (ValueError, KeyError, IndexError, TypeError, AttributeError) as e:
             raise EmbedRequestError(f"embed: malformed /v1/embeddings response: {type(e).__name__}: {e}") from e
