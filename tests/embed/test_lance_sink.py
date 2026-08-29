@@ -496,5 +496,42 @@ class KnownTest(_SinkTestCase):
         self.assertEqual(len(self.sink().known()), 25)
 
 
+class _FailingDocuments:
+    """Passes `delete` through and fails `merge_insert`, which is precisely the crash window."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def merge_insert(self, *args, **kwargs):
+        raise RuntimeError("crash between the two commits")
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
+class ReplaceCrashTest(_SinkTestCase):
+    """`_replace` is two commits with no transaction across them, so the order decides the damage."""
+
+    def test_a_crash_before_the_documents_write_leaves_the_marker_missing_not_stale(self):
+        # `known()` reads `documents` alone, which makes that row the commit marker. With the
+        # delete last, this crash left the marker in place describing three Chunks that the
+        # merge below had already replaced with two -- and Resume, seeing the name, would skip
+        # that Document for good. Deleting first means a crash anywhere leaves no marker, and
+        # the next Invocation repairs it by re-embedding.
+        self.write_all(self.sink(), [_document("a.pdf", n_chunks=3)])
+
+        sink = self.sink()
+        sink._documents = _FailingDocuments(sink._documents)  # type: ignore[bad-assignment]
+        sink.write(_document("a.pdf", n_chunks=2, seed=5), is_new=False)
+        with self.assertRaises(RuntimeError):
+            sink.flush()
+
+        # The `chunks` write landing is what puts this mid-window rather than before it: the
+        # tables really are inconsistent here, and the marker's absence is what makes that
+        # temporary instead of permanent.
+        self.assertEqual(len(_rows(self.path, CHUNKS_TABLE)), 2)
+        self.assertEqual(self.sink().known(), set())
+
+
 if __name__ == "__main__":
     unittest.main()

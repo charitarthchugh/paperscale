@@ -436,6 +436,20 @@ class LanceSink:
 
         documents, chunks = self._require_open()
         scope = _document_scope(doc.run_label, doc.document_name)
+        # **The delete goes first, and that ordering is the crash contract.** `_scan_known`
+        # resumes from `documents` alone, which makes that row this Sink's commit marker, and
+        # the two writes below are separate commits with no transaction spanning them. Updating
+        # `documents` last left a window where a crash kept a *stale* marker: Resume finds the
+        # name, skips the Document for good, and the stored Document vector goes on describing
+        # Chunks the merge already replaced. Removing the marker up front makes every window
+        # leave it *missing* instead, and a missing marker is one the next Invocation repairs by
+        # re-embedding. Missing costs one Document of work. Stale is silent, permanent, and
+        # invisible to every check this Sink has.
+        #
+        # `flush` reaches here only for `is_new=False` -- the case `close` calls "the expected
+        # repair after a crash between Sinks". So this is the crash-repair path, and until now
+        # it carried a crash window of its own.
+        documents.delete(scope)
         (
             chunks.merge_insert(["run_label", "document_name", "chunk_index"])
             .when_matched_update_all()
