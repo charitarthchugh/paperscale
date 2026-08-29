@@ -5,11 +5,13 @@ seam the OCR path posts through). One test drives the real socket transport
 against a throwaway HTTP server to prove requests actually overlap.
 """
 
+import asyncio
 import json
 import math
 import threading
 import time
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from paperscale.evaluation import pplx
@@ -314,3 +316,57 @@ class BuildDictionaryTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RetryAxisTest(unittest.TestCase):
+    """Which budget a failure is charged to, counted in sends.
+
+    The axes are told apart by how many sends they buy, never by the exception that
+    finally comes out -- a timeout raises `TimeoutError` whichever arm caught it. The
+    request axis stops at `_MAX_ATTEMPTS`; the connection axis tests with `>`, so it
+    spends one more send than its own constant. That asymmetry is deliberate: unlike
+    the embed client, nothing in this module claims a number of attempts to disagree
+    with, so its messages and its guard already say the same thing.
+    """
+
+    def _sends_before_giving_up(self, exc: BaseException) -> int:
+        sends = 0
+
+        async def boom(url, json_data, api_key=None):
+            nonlocal sends
+            sends += 1
+            raise exc
+
+        async def no_sleep(_delay):
+            return None
+
+        async def main():
+            # `_request_limit` binds to the loop that first awaits it, so a fresh one
+            # per run is what lets two of these live in one test class.
+            pplx._request_limit = asyncio.BoundedSemaphore(1)
+            return await pplx._post_logprobs_with_backoff("http://vllm", "q", "hello", None)
+
+        orig_apost, orig_limit = pplx.apost, pplx._request_limit
+        pplx.apost = boom
+        try:
+            with mock.patch("asyncio.sleep", new=no_sleep), self.assertRaises(type(exc)):
+                asyncio.run(main())
+        finally:
+            pplx.apost, pplx._request_limit = orig_apost, orig_limit
+        return sends
+
+    def test_a_timeout_is_charged_to_the_request_axis(self):
+        # `asyncio.TimeoutError` *is* the builtin `TimeoutError`, which subclasses
+        # `OSError`. An `except OSError` arm placed first therefore swallows every
+        # timeout and spends the connection budget on a server that did answer, only
+        # slowly -- and then reports it as unreachable.
+        self.assertEqual(self._sends_before_giving_up(TimeoutError("slow")), pplx._MAX_ATTEMPTS)
+
+    def test_a_refused_connection_is_still_charged_to_the_connection_axis(self):
+        # The reorder must not drag ordinary connection errors across with it. A
+        # refused connection is an `OSError` that is not a `TimeoutError`, so it has
+        # to fall past the request arm to the one that backs off for a restart.
+        self.assertEqual(
+            self._sends_before_giving_up(ConnectionRefusedError("no route")),
+            pplx._MAX_CONN_BACKOFF_ATTEMPTS + 1,
+        )

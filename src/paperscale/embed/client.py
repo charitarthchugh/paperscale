@@ -219,9 +219,10 @@ class EmbedClient:
 
         The response arm is written **above** the ``OSError`` arm on purpose: since
         3.11 the builtin ``TimeoutError`` -- which ``asyncio.TimeoutError`` aliases --
-        is an ``OSError`` subclass, so the pplx ordering silently routes every
-        timeout onto the connection axis and, at six failures, ends the Invocation
-        for what design 12.6 classes as a per-request fault.
+        is an ``OSError`` subclass, so the other order routes every timeout onto the
+        connection axis and, at six failures, ends the Invocation for what design
+        12.6 classes as a per-request fault. ``evaluation/pplx.py`` carried exactly
+        that ordering until it was corrected against this one.
         """
         attempt = conn_attempt = fd_backoff = 0
         while True:

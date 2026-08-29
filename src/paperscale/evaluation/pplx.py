@@ -144,6 +144,13 @@ async def _post_logprobs_with_backoff(
     File-descriptor exhaustion (EMFILE/ENFILE) is a soft drop -- backed off and
     retried indefinitely without consuming an attempt, since it self-resolves as
     in-flight sockets close. Connection errors get bounded exponential backoff.
+
+    The request arm is written **above** the ``OSError`` arm on purpose. Since 3.11
+    the builtin ``TimeoutError`` -- which ``asyncio.TimeoutError`` aliases -- is an
+    ``OSError`` subclass, so the other order catches every timeout on the connection
+    arm instead: ``_MAX_ATTEMPTS`` is then unreachable, and a scorer that is merely
+    slow gives up after six failures claiming the server cannot be reached. The two
+    arms are not interchangeable and their order is the only thing separating them.
     """
     attempt = conn_backoff = fd_backoff = 0
     while True:
@@ -151,6 +158,16 @@ async def _post_logprobs_with_backoff(
             return await _post_logprobs(url, model, prompt, api_key)
         except asyncio.CancelledError:
             raise
+        except (PplxRequestError, asyncio.TimeoutError) as e:
+            attempt += 1
+            if attempt >= _MAX_ATTEMPTS:
+                raise
+            delay = min(2**attempt, 30)
+            logger.warning(
+                f"pplx: request failed ({type(e).__name__}: {e}); "
+                f"attempt {attempt}/{_MAX_ATTEMPTS}, sleeping {delay}s"
+            )
+            await asyncio.sleep(delay)
         except OSError as e:
             if e.errno in (errno.EMFILE, errno.ENFILE):
                 delay = min(2**fd_backoff, _FD_MAX_BACKOFF_SECONDS)
@@ -167,16 +184,6 @@ async def _post_logprobs_with_backoff(
             logger.warning(
                 f"pplx: connection error ({type(e).__name__}: {e}); backoff "
                 f"{conn_backoff}/{_MAX_CONN_BACKOFF_ATTEMPTS}, sleeping {delay}s"
-            )
-            await asyncio.sleep(delay)
-        except (PplxRequestError, asyncio.TimeoutError) as e:
-            attempt += 1
-            if attempt >= _MAX_ATTEMPTS:
-                raise
-            delay = min(2**attempt, 30)
-            logger.warning(
-                f"pplx: request failed ({type(e).__name__}: {e}); "
-                f"attempt {attempt}/{_MAX_ATTEMPTS}, sleeping {delay}s"
             )
             await asyncio.sleep(delay)
 
