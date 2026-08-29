@@ -17,8 +17,9 @@ tokens and must never be able to close a Chunk that still had room.
 in `pyproject.toml`, so counting is a new capability rather than a call to something that
 exists. The count is therefore asked of the server that holds the tokenizer actually in use
 (`tokenize` here is `client.EmbedClient.tokenize`, injected). That is why the shape of the
-algorithm is a *call budget*: one call for the whole Document, and only a Document that
-overflows pays a call per page.
+algorithm is a *call budget*: one call for the whole Document, a call per page only for a
+Document that overflows, and a call per piece only for the single page that overflows on its
+own. The rarest path pays the most, which is the right way round.
 
 **Assembled Chunks are never re-tokenized**, and the reason is a proof rather than a
 measurement: a BPE merge cannot span a split boundary, so splitting a string can only raise
@@ -26,6 +27,19 @@ its token count -- `sum(tokenize(page_i)) >= tokenize(concat(page_i))`. Packing 
 per-page counts errs in the safe direction, so a Chunk whose pages sum under the budget
 cannot exceed it when tokenized whole. This is what keeps the Overflow path at N calls
 instead of N plus one re-check per Chunk.
+
+**A boundary inside a page is measured, never estimated.** That proof covers only Chunks
+assembled out of whole pages; it says nothing about a boundary placed *inside* one. Such a
+boundary used to be placed with the Document's average chars-per-token ratio, and an average
+cannot vouch for a page denser than itself: a page of formulae or CJK is short in characters
+and long in tokens, so the estimated budget position landed past the page's own end, the
+cut collapsed onto that end, and the whole over-budget page shipped as a single Chunk. The
+server answers such a Chunk with a 400 and fails the Document, and the token count recorded
+for it -- the pooling weight `vectors.py` reads -- came out several times too small. So
+every piece cut out of an oversized page is counted on the wire before it is closed, and so
+is the remainder left open for the following pages to pack onto. Those counts are the only
+thing that makes the size of a Chunk a fact rather than a hope, and they fall only on a page
+that alone exceeds the budget.
 
 **Chunks do not overlap.** Overlap would double-count the shared spans in the pooled
 Document vector and stop the stored offsets describing a partition, so reconstruction from
@@ -42,7 +56,6 @@ and model-independent.
 from __future__ import annotations
 
 import logging
-import math
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
@@ -59,11 +72,12 @@ class Chunk:
     shows a human. Pages alone would lose the partial-page case; offsets alone would make
     every Consumer re-derive pages from `pdf_page_numbers`.
 
-    `token_count` is exact when the Document fits in one Chunk, an upper bound (the sum of
-    the per-page counts, by the subadditivity argument in the module docstring) for a packed
-    one, and an estimate from this Document's own chars-per-token ratio on the
-    oversized-page path. `vectors.py` uses it as a pooling weight, which needs a relative
-    size and not an exact one.
+    `token_count` is exact when the Document fits in one Chunk and exact for every piece cut
+    out of an oversized page; for a Chunk packed out of whole pages it is an upper bound (the
+    sum of the per-page counts, by the subadditivity argument in the module docstring). It is
+    never an estimate. `vectors.py` uses it as a pooling weight, so a count that is wrong by a
+    factor is text weighted wrongly in the Document vector, which is a silent error rather
+    than a loud one.
 
     `is_partial_page` marks the one path that puts a boundary inside a page, so a Consumer
     can tell a Chunk that is quotable as "pages 4-6" from one that is not.
@@ -86,9 +100,10 @@ async def chunk_document(text: str, spans: list[list[int]], budget: int, tokeniz
 
     The common case -- a Document that fits whole -- costs exactly one call and returns one
     Chunk. Only a Document that overflows pays one further call per non-empty page, and only
-    a single page that overflows on its own produces a boundary inside a page. Text is never
-    dropped and no input fails the Document; a Document with nothing to embed comes back as
-    zero Chunks, which is a recorded outcome (an empty output) and not a failure.
+    a single page that overflows on its own produces a boundary inside a page -- and pays the
+    further calls that placing those boundaries exactly costs. Text is never dropped and no
+    input fails the Document; a Document with nothing to embed comes back as zero Chunks,
+    which is a recorded outcome (an empty output) and not a failure.
     """
     if not text or not text.strip():
         return []
@@ -104,13 +119,9 @@ async def chunk_document(text: str, spans: list[list[int]], budget: int, tokeniz
     if total <= budget:
         return [Chunk(start_char=0, end_char=len(text), first_page=spans[0][2], last_page=spans[-1][2], token_count=total, is_partial_page=False)]
 
-    # Overflow path. The one call above already yielded both `total` and `len(text)`, so this
-    # Document hands over its own chars-per-token ratio at zero extra cost -- no corpus-wide
-    # constant and no second request. It is only ever used to estimate where the budget falls
-    # inside an oversized page; every whole-page decision below uses an exact server count.
-    chars_per_token = len(text) / total
-    budget_chars = max(1, int(budget * chars_per_token))
-
+    # Overflow path. Every size decision from here down rests on a count the server gave, not
+    # on a ratio derived from the Document as a whole: whole pages are packed by their own
+    # exact counts here, and a page that has to be cut is measured piece by piece below.
     counts: list[int] = []
     for start, end, _page in spans:
         # A zero-width page is answered here rather than on the wire. /tokenize prepends
@@ -126,7 +137,7 @@ async def chunk_document(text: str, spans: list[list[int]], budget: int, tokeniz
         if count > budget:
             logger.debug("page %s spans %d chars and %d tokens, over the %d-token budget; cutting inside the page", page, page_end - page_start, count, budget)
             open_chunk.close(page_start, chunks, page)
-            _cut_oversized_page(text, page_start, page_end, page, budget, budget_chars, chars_per_token, open_chunk, chunks)
+            await _cut_oversized_page(text, page_start, page_end, page, count, budget, tokenize, open_chunk, chunks)
         elif open_chunk.token_count + count > budget:
             # Close at the page's first character: the previous page's span already carries
             # the `\n` joiner, so the two Chunks meet exactly and neither loses a byte.
@@ -182,44 +193,73 @@ class _OpenChunk:
         self.is_partial_page = False
 
 
-def _cut_oversized_page(
+async def _cut_oversized_page(
     text: str,
     page_start: int,
     page_end: int,
     page: int,
+    page_tokens: int,
     budget: int,
-    budget_chars: int,
-    chars_per_token: float,
+    tokenize: Callable[[str], Awaitable[int]],
     open_chunk: _OpenChunk,
     chunks: list[Chunk],
 ) -> None:
     """Split a page that alone exceeds the budget, at newlines where there are any.
 
-    Cut at the last `\\n` at or before the estimated budget position; a page with no newline
-    in reach takes a hard character cut. Never drop text, never fail the Document -- this is
-    the only path that produces a boundary inside a page, and it is why `is_partial_page`
-    exists as a recorded field.
+    Cut at the last `\\n` at or before the budget position; a page with no newline in reach
+    takes a hard character cut. Never drop text, never fail the Document -- this is the only
+    path that produces a boundary inside a page, and it is why `is_partial_page` exists as a
+    recorded field.
 
-    The first cut is unconditional because the *exact* count already said the page does not
-    fit; only the remainder is judged by the estimate. Trusting the estimate for that first
-    decision would let a page denser than its Document's average (formulae, CJK) through
-    whole and blow the context window on the server.
+    `remaining` is what makes this exact: it always holds the *server's* count of
+    `text[pos:page_end]`, starting from the count the caller already paid for. Two things
+    come out of it. The loop condition is a fact rather than an estimate, so the last piece
+    is cut when the rest genuinely does not fit and not when a ratio suggests it might. And
+    the ratio handed to `_fit_piece` is measured on exactly the text still to be cut, so
+    density that drifts *within* a page -- prose, then a formula block -- is re-anchored
+    after every cut rather than averaged away over a Document.
 
     The tail is left open rather than closed, so following pages pack onto it: the remainder
     of a cut page is usually far short of the budget, and closing it would waste most of a
-    32K context on the Document that could least afford it.
+    32K context on the Document that could least afford it. It carries its exact count out
+    with it, which is what keeps the packing decisions that follow inside the budget too.
     """
     pos = page_start
-    must_cut = True
-    while pos < page_end and (must_cut or _estimate_tokens(page_end - pos, chars_per_token) > budget):
-        cut = _cut_point(text, pos, min(pos + budget_chars, page_end))
-        open_chunk.add(page, _estimate_tokens(cut - pos, chars_per_token), partial=True)
+    remaining = page_tokens
+    while remaining > budget and pos < page_end:
+        cut, count = await _fit_piece(text, pos, page_end, budget, (page_end - pos) / remaining, tokenize)
+        # Derived rather than asserted. A piece is partial unless it runs from one edge of
+        # the page to the other, and a Consumer reading the flag is being told whether it may
+        # cite whole pages -- so it has to describe the span that was actually cut.
+        open_chunk.add(page, count, partial=pos > page_start or cut < page_end)
         open_chunk.close(cut, chunks, page)
         pos = cut
-        must_cut = False
+        remaining = await tokenize(text[pos:page_end]) if pos < page_end else 0
     if pos < page_end:
-        # At least one cut always happened above, so this tail begins inside the page.
-        open_chunk.add(page, _estimate_tokens(page_end - pos, chars_per_token), partial=True)
+        open_chunk.add(page, remaining, partial=pos > page_start)
+
+
+async def _fit_piece(text: str, start: int, page_end: int, budget: int, chars_per_token: float, tokenize: Callable[[str], Awaitable[int]]) -> tuple[int, int]:
+    """The next piece of an oversized page: its exclusive end, and its exact token count.
+
+    `chars_per_token` is measured on the text still to be cut, so the first candidate is
+    usually right and usually costs a single call. It is still only a ratio, so a candidate
+    the server counts over the budget is shrunk by the density it just measured *on that
+    candidate* and asked again -- one Newton-ish step, which lands inside the budget in one
+    or two tries even when the page's own density is uneven.
+
+    The loop terminates because each attempt is strictly shorter than the last (`cut - 1`
+    caps the next limit) and never shorter than one character. Bottoming out at a single
+    character returns it over budget rather than raising: a budget no character can meet is
+    a broken budget, and failing the Document is the one thing this path may never do.
+    """
+    limit = min(start + max(1, int(budget * chars_per_token)), page_end)
+    while True:
+        cut = _cut_point(text, start, limit)
+        count = await tokenize(text[start:cut])
+        if count <= budget or cut - start <= 1:
+            return cut, count
+        limit = min(start + max(1, int((cut - start) * budget / count)), cut - 1)
 
 
 def _cut_point(text: str, start: int, limit: int) -> int:
@@ -227,20 +267,8 @@ def _cut_point(text: str, start: int, limit: int) -> int:
 
     The newline stays with the piece it terminates, matching how a page span keeps its own
     joiner, so the pieces still tile. `limit` is exclusive in the search as well, so a piece
-    never reaches past the estimated budget position. The result is always greater than
-    `start`, which is what guarantees the caller's loop terminates.
+    never reaches past the candidate budget position. The result is always greater than
+    `start`, which is what guarantees the caller's loops terminate.
     """
     newline = text.rfind("\n", start, limit)
     return limit if newline < 0 else newline + 1
-
-
-def _estimate_tokens(n_chars: int, chars_per_token: float) -> int:
-    """Tokens in `n_chars` characters at this Document's own ratio, rounded up.
-
-    Rounded up, and floored at 1 for any non-empty piece, because every use of this number is
-    a budget decision: overestimating cuts one piece smaller than it had to be, while
-    underestimating sends an over-budget Chunk to a server that answers with a 400.
-    """
-    if n_chars <= 0:
-        return 0
-    return max(1, math.ceil(n_chars / chars_per_token))
