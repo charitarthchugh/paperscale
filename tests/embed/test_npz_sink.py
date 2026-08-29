@@ -22,7 +22,8 @@ import numpy as np
 
 from paperscale.embed.chunking import Chunk
 from paperscale.embed.names import NameCollisionError
-from paperscale.embed.npz_sink import CHUNKER, FAILURES_NAME, MANIFEST_NAME, POOLING, Invariants, NpzSink, SinkInvariantError
+from paperscale.embed.invariants import Invariants, SinkInvariantError, compare_invariant_facts
+from paperscale.embed.npz_sink import CHUNKER, FAILURES_NAME, MANIFEST_NAME, POOLING, NpzSink
 from paperscale.embed.vectors import EmbeddedDocument
 
 LOGGER = "paperscale.embed.npz_sink"
@@ -204,6 +205,31 @@ class LabelledLayoutTest(_SinkTestCase):
         self.sink.write(_document(run_label="nemotron"))
         self.assertEqual(self.sink.known(), {("qwen", "law/case.pdf"), ("nemotron", "law/case.pdf")})
 
+    def test_the_label_comes_from_the_path_and_no_sidecar_is_opened(self):
+        # Design 11.1 budgets one walk over `<out>` and nothing else. Here the run label is
+        # the first path component, so the walk answers the whole key on its own -- a read
+        # per Document would cost more than the name manifest that section rejects.
+        self.sink.write(_document(run_label="qwen"))
+        self.sink.write(_document(document_name="other.pdf", run_label="nemotron"))
+        with mock.patch.object(NpzSink, "_sidecar_run_label", side_effect=AssertionError("a sidecar was opened")) as opened:
+            self.assertEqual(self.sink.known(), {("qwen", "law/case.pdf"), ("nemotron", "other.pdf")})
+        opened.assert_not_called()
+
+    def test_a_document_whose_sidecar_was_removed_is_re_embedded(self):
+        # The pair is still checked -- against the names the walk already returned, which
+        # costs no syscall -- so a broken pair is re-embedded rather than counted as done.
+        self.sink.write(_document(run_label="qwen"))
+        (self.out / "qwen" / "law" / "case.pdf.json").unlink()
+        with self.assertLogs(LOGGER, level="WARNING"):
+            self.assertEqual(self.sink.known(), set())
+
+    def test_a_stray_npz_at_the_root_names_no_document(self):
+        # Every Document in this layout sits under its Run's directory, so a file at the
+        # root has no label and names nothing.
+        (self.out / "loose.npz").write_bytes(b"")
+        (self.out / "loose.json").write_text("{}")
+        self.assertEqual(self.sink.known(), set())
+
 
 class EmptyDocumentTest(_SinkTestCase):
     """Design 11.4: a Document with no usable text is a recorded outcome, not a failure."""
@@ -376,28 +402,32 @@ class ManifestTest(unittest.TestCase):
         self.assertIn("'labelled'", message)
         self.assertIn("run set", message)
 
-    def test_an_added_sink_warns_and_does_not_stop(self):
+    def test_an_added_sink_is_recorded_for_the_next_invocation(self):
+        # The *warning* about an added Sink belongs to `resume.sink_set_warning`, which
+        # says it once from run.py with the corpus size in hand; test_resume.py owns those
+        # assertions. What is this Sink's own is the record: `previous_sinks` for the
+        # caller to compare, and the new set written back to the manifest.
         NpzSink(self.out, _invariants(), ["npz"]).open()
-        with self.assertLogs(LOGGER, level="WARNING") as captured:
-            sink = NpzSink(self.out, _invariants(), ["npz", "lancedb"])
-            sink.open()
-        self.assertIn("lancedb", "\n".join(captured.output))
-        self.assertIn("re-embedded", "\n".join(captured.output))
+        sink = NpzSink(self.out, _invariants(), ["npz", "lancedb"])
+        sink.open()
         self.assertEqual(sink.previous_sinks, ["npz"])
         self.assertEqual(self.manifest()["sinks"], ["npz", "lancedb"])
 
-    def test_a_dropped_sink_does_not_warn(self):
-        # Dropping a Sink only makes more Documents count as done, so it costs no GPU time
-        # and a warning there would train the operator to ignore the one that matters.
+    def test_a_dropped_sink_is_recorded_the_same_way(self):
+        # Recorded identically whichever direction the set moved. Only the caller judges
+        # which direction is expensive, and it cannot judge without both lists.
         NpzSink(self.out, _invariants(), ["npz", "lancedb"]).open()
-        with self.assertLogs(LOGGER, level="INFO") as captured:
-            NpzSink(self.out, _invariants(), ["npz"]).open()
-        self.assertEqual([r.levelname for r in captured.records], ["INFO"])
+        sink = NpzSink(self.out, _invariants(), ["npz"])
+        sink.open()
+        self.assertEqual(sink.previous_sinks, ["npz", "lancedb"])
+        self.assertEqual(self.manifest()["sinks"], ["npz"])
 
-    def test_an_unchanged_sink_set_is_silent(self):
+    def test_opening_a_tree_says_nothing_about_the_sink_set(self):
+        # This Sink no longer speaks about the set at all, in any direction: one fact
+        # reported twice in two wordings reads as two facts.
         NpzSink(self.out, _invariants(), ["npz"]).open()
         with self.assertNoLogs(LOGGER, level="INFO"):
-            NpzSink(self.out, _invariants(), ["npz"]).open()
+            NpzSink(self.out, _invariants(), ["npz", "lancedb"]).open()
 
     def test_an_unreadable_manifest_stops_rather_than_being_replaced(self):
         self.out.mkdir(parents=True)
@@ -450,6 +480,50 @@ class ReservedNameTest(_SinkTestCase):
         self.assertTrue((self.out / "law" / "paperscale-embed.pdf.npz").exists())
 
 
+class SharedComparisonTest(unittest.TestCase):
+    """`compare_invariant_facts` -- the one comparison both Sinks stop through.
+
+    The `.npz` manifest and the LanceDB table metadata disagree in the same shape and report
+    it in the same shape; only the artifact they name and the fix they offer differ.
+    """
+
+    def _compare(self, recorded, current, **overrides):
+        options = {
+            "subject": "/out/paperscale-embed.json",
+            "holder": "this tree",
+            "nothing_yet": "nothing has been embedded.",
+            "remedy": "Re-run with the settings that built this tree.",
+        }
+        options.update(overrides)
+        compare_invariant_facts(recorded, current, **options)
+
+    def test_a_matching_output_is_silent(self):
+        self.assertIsNone(self._compare({"model_id": "a", "stored_dim": 768}, {"model_id": "a", "stored_dim": 768}))
+
+    def test_every_disagreement_is_listed_with_both_values(self):
+        with self.assertRaises(SinkInvariantError) as caught:
+            self._compare({"model_id": "a", "stored_dim": 768}, {"model_id": "b", "stored_dim": 512})
+        message = str(caught.exception)
+        self.assertIn("2 invariant fact(s) disagree", message)
+        self.assertIn("nothing has been embedded.", message)
+        for fragment in ("model_id", "'a'", "'b'", "stored_dim", "768", "512", "this tree has"):
+            self.assertIn(fragment, message)
+
+    def test_a_fact_the_output_does_not_record_is_a_disagreement(self):
+        # Otherwise an output with no facts at all would read as agreeing with everything.
+        with self.assertRaises(SinkInvariantError) as caught:
+            self._compare({}, {"model_id": "b"})
+        self.assertIn("<absent>", str(caught.exception))
+
+    def test_a_note_is_added_only_for_the_fact_that_disagreed(self):
+        notes = {"layout": "      pass the same run set", "model_id": "      unreachable note"}
+        with self.assertRaises(SinkInvariantError) as caught:
+            self._compare({"model_id": "a", "layout": "bare"}, {"model_id": "a", "layout": "labelled"}, notes=notes)
+        message = str(caught.exception)
+        self.assertIn("pass the same run set", message)
+        self.assertNotIn("unreachable note", message)
+
+
 class KnownTest(_SinkTestCase):
     def test_it_reports_the_run_label_and_the_document_name(self):
         self.sink.write(_document(document_name="law/case.pdf", run_label="qwen"))
@@ -458,7 +532,9 @@ class KnownTest(_SinkTestCase):
 
     def test_a_bare_tree_can_hold_two_labels(self):
         # A `bare` tree accumulates single-Run Invocations, and the layout carries no
-        # label, which is why the label is read from the sidecar rather than the path.
+        # label, which is why the label is read from the sidecar rather than the path --
+        # the one `open()` per Document design 11.1 does not budget for, kept because
+        # assuming the current label would reduce the key to the Document name alone.
         self.sink.write(_document(document_name="a.pdf", run_label="qwen"))
         self.sink.write(_document(document_name="b.pdf", run_label="nemotron"))
         self.assertEqual(self.sink.known(), {("qwen", "a.pdf"), ("nemotron", "b.pdf")})

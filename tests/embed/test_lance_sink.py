@@ -22,7 +22,7 @@ import pyarrow as pa
 
 from paperscale.embed.chunking import Chunk
 from paperscale.embed.lance_sink import CHUNKS_TABLE, DOCUMENTS_TABLE, METADATA_FACTS, LanceSink, _sql_literal, table_metadata
-from paperscale.embed.npz_sink import Invariants, SinkInvariantError
+from paperscale.embed.invariants import Invariants, SinkInvariantError
 from paperscale.embed.vectors import EmbeddedDocument
 
 _STORED_DIM = 8
@@ -228,6 +228,19 @@ class MetadataGuardTest(_SinkTestCase):
         self.assertIn("3 invariant fact(s) disagree", message)
         for fact in ("model_id", "native_dim", "query_instruction"):
             self.assertIn(fact, message)
+
+    def test_the_message_names_this_table_and_the_fix_that_is_not_the_manifests(self):
+        # Both Sinks stop through one comparison (`npz_sink.compare_invariant_facts`). What
+        # differs is what the message names: a `.lance` table rather than the manifest, and a
+        # fix that cannot be "repair it", because table metadata is write-once.
+        self.sink().close()
+        with self.assertRaises(SinkInvariantError) as caught:
+            LanceSink(self.path, _invariants(model_id="other")).open()
+        message = str(caught.exception)
+        self.assertIn(f"{self.path / DOCUMENTS_TABLE}.lance", message)
+        self.assertIn("this table has", message)
+        self.assertIn("nothing has been written.", message)
+        self.assertIn("write-once", message)
 
     def test_a_matching_second_invocation_opens_and_appends(self):
         self.write_all(self.sink(), [_document("a.pdf")])

@@ -69,6 +69,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, TYPE_CHECKING
 
+from paperscale.embed.invariants import Invariants, SinkInvariantError, compare_invariant_facts
 from paperscale.embed.names import RESERVED_PREFIX, NameCollisionError
 from paperscale.version import VERSION
 
@@ -88,43 +89,6 @@ FAILURES_NAME = f"{RESERVED_PREFIX}-failures.txt"
 # string literals that the manifest comparison would then reject on a typo.
 POOLING = "token_weighted_mean"
 CHUNKER = "greedy_page_pack"
-
-
-@dataclasses.dataclass(frozen=True)
-class Invariants:
-    """The nine manifest facts a second Invocation must agree with, or stop.
-
-    This is the check the Adapter's `native_dim` assertion cannot make. That assertion
-    catches a server serving a model of the wrong *width*; it says nothing about an
-    Invocation appended to a tree an earlier Invocation built with a **different model of
-    the same width** -- `qwen3-embedding-8b` over `nemotron-3-embed-8b`, both 4096. With
-    content detection removed (standing decision 7) Resume will not catch that either: the
-    names match, so every Document is skipped and the tree ends up half one model's
-    vectors and half another's, in one search index, silently.
-
-    `layout` is in the block for a related reason (design 11.3). The run-label directory
-    appears only when one Invocation embeds more than one Run, so `bare` and `labelled`
-    are two layouts over one output directory. The failure a change causes is not silent
-    *mixing* but silent **duplication**: the new paths match nothing, every Document is
-    re-embedded into a parallel subtree, and the old tree is orphaned.
-
-    `sinks` is deliberately **not** here -- the enabled-Sink set is allowed to change, and
-    a change warns rather than stops (design 8.2).
-    """
-
-    model_id: str
-    stored_dim: int
-    native_dim: int
-    document_instruction: str
-    query_instruction: str
-    pooling: str
-    chunker: str
-    chunk_budget_tokens: int
-    layout: str
-
-
-class SinkInvariantError(RuntimeError):
-    """This output tree was built by an Invocation whose settings differ from this one's."""
 
 
 def _utc_iso(when: datetime.datetime) -> str:
@@ -235,8 +199,10 @@ class NpzSink:
             manifest = {}
         else:
             self._compare_invariants(manifest)
+            # Recorded, not warned about here. `resume.sink_set_warning` says the same
+            # thing from `run.py` with the corpus size in hand, and an operator who is
+            # told twice in two wordings has to work out whether it is one fact or two.
             self.previous_sinks = [s for s in manifest.get("sinks") or [] if isinstance(s, str)]
-            self._warn_if_sinks_changed(self.previous_sinks)
 
         invocations = [e for e in manifest.get("invocations") or [] if isinstance(e, dict)]
         # Rebuilt rather than mutated in place so the key order on disk always matches
@@ -269,52 +235,22 @@ class NpzSink:
         return manifest
 
     def _compare_invariants(self, manifest: dict[str, Any]) -> None:
-        """Report **every** disagreeing fact with **both** values, then stop.
+        """The nine manifest facts, through the comparison both Sinks report with.
 
-        Every fact, not the first: a tree built with a different model usually differs in
-        several at once (`model_id`, both Instructions, often `native_dim`), and reporting
-        one at a time turns one operator decision into four failed runs.
+        The one fact that needs more than its two values is `layout`: its fix is not "change
+        a flag back" but "pass the same set of Runs", which the two strings do not say.
         """
-        current = dataclasses.asdict(self.invariants)
-        diffs: list[tuple[str, Any, Any]] = []
-        for field, value in current.items():
-            if field not in manifest:
-                diffs.append((field, "<absent>", value))
-            elif manifest[field] != value:
-                diffs.append((field, manifest[field], value))
-        if not diffs:
-            return
-
-        lines = [f"  {field}: this tree has {was!r}, this Invocation has {now!r}" for field, was, now in diffs]
-        if any(field == "layout" for field, _was, _now in diffs):
-            # The layout guard's fix is not "change a flag back" but "pass the same set of
-            # Runs", which is not obvious from the two values alone.
-            lines.append("      layout is 'bare' for a single --run and 'labelled' for two or more; pass the same run set, or use a fresh --out directory.")
-        raise SinkInvariantError(
-            f"{self.manifest_path} was written by a different Invocation: {len(diffs)} invariant fact(s) disagree; nothing has been embedded.\n"
-            + "\n".join(lines)
-            + "\n  Re-run with the settings that built this tree, or embed into a fresh --out directory."
+        compare_invariant_facts(
+            manifest,
+            dataclasses.asdict(self.invariants),
+            subject=str(self.manifest_path),
+            holder="this tree",
+            nothing_yet="nothing has been embedded.",
+            remedy="Re-run with the settings that built this tree, or embed into a fresh --out directory.",
+            notes={
+                "layout": "      layout is 'bare' for a single --run and 'labelled' for two or more; pass the same run set, or use a fresh --out directory."
+            },
         )
-
-    def _warn_if_sinks_changed(self, previous: list[str]) -> None:
-        """Say the expensive thing out loud before it happens (design 8.2).
-
-        Only an *added* Sink costs GPU time: a Document is done when every enabled Sink
-        holds it, so a Sink that holds nothing empties the Resume intersection and the
-        whole corpus is re-embedded. Dropping a Sink only makes more Documents count as
-        done, so it is recorded and not warned about.
-        """
-        added = [s for s in self.sinks if s not in previous]
-        removed = [s for s in previous if s not in self.sinks]
-        if added:
-            logger.warning(
-                "enabled Sinks changed: this tree was built with %s, this Invocation enables %s. "
-                "A newly enabled Sink holds no Documents, so Resume's intersection is empty and every Document will be re-embedded.",
-                previous or ["none recorded"],
-                self.sinks,
-            )
-        if removed and not added:
-            logger.info("enabled Sinks changed: this tree was built with %s, this Invocation enables %s.", previous, self.sinks)
 
     # -- Documents --------------------------------------------------------------
 
@@ -427,41 +363,68 @@ class NpzSink:
         Documents in 29 ms against 3 ms to read a 1.3 MB JSON of the same names -- buys 26
         milliseconds once per Invocation.
 
-        The `.npz` alone is the completion marker, which the write ordering makes sound.
-        The `run_label` half of the key comes from the sidecar rather than the path,
-        because the `bare` layout does not carry it: one tree can accumulate Documents from
-        several single-Run Invocations under different labels, so there is no single label
-        to assume. That costs one `open()` per Document on this path -- the same cost
-        design 8.6 already accepts on the Consumer's read path, and the price of the
-        sidecar being the readable record of identity.
+        The `.npz` alone is the completion marker, which the write ordering makes sound, so
+        the budget design 11.1 sets is one walk and nothing else: *"walk `<out>` once and
+        collect the `.npz` paths"*. A per-Document read here would cost more than the name
+        manifest that section rejects for buying only 26 milliseconds.
 
-        A missing or unreadable sidecar means the pair was broken by something other than
-        this Sink. The Document is reported as *not* known, so it is re-embedded and both
-        files are rewritten -- the same self-healing the two-Sink intersection relies on.
+        **In the `labelled` layout the budget is met exactly.** The run label *is* the first
+        path component -- design 10 records it as living in "the sidecar (and the path, in
+        `labelled` layout)" -- so the walk answers the whole key and no sidecar is opened.
+        Whether a sidecar exists is read out of the names `os.walk` has already returned for
+        that directory, which costs no syscall of its own.
+
+        **In the `bare` layout it is not met, and cannot be from inside this Sink.** That
+        layout carries no label in the path, and one tree accumulates Documents from several
+        single-Run Invocations that may each have used a different label, so the sidecar is
+        the only record of which Run an `.npz` came from. Assuming the current label instead
+        would quietly reduce the key `(run_label, document_name)` to the name alone, and a
+        corpus re-OCR'd under a new label would be reported as embedded rather than
+        re-embedded. So this layout still pays one `open()` per Document: the cost design
+        11.1 does not budget for, and the one place where its cost model and the Resume key
+        disagree. Closing it needs a decision the design has not made -- the run labels a
+        tree holds would have to be recorded where the manifest already records `sinks`.
+
+        A sidecar that is missing -- or, where it is still read, unreadable -- means the pair
+        was broken by something other than this Sink. The Document is reported as *not*
+        known, so it is re-embedded and both files are rewritten: the same self-healing the
+        two-Sink intersection relies on.
         """
         found: set[tuple[str, str]] = set()
         if not self.out.is_dir():
             return found
         labelled = self.invariants.layout == "labelled"
         for dirpath, _dirnames, filenames in os.walk(self.out):
+            names = set(filenames)
             for filename in filenames:
                 if not filename.endswith(".npz"):
                     continue
                 npz = Path(dirpath) / filename
                 parts = npz.relative_to(self.out).parts
-                if labelled:
-                    if len(parts) < 2:
-                        # A stray `.npz` at the root of a labelled tree names no Document:
-                        # every Document there sits under its Run's directory.
-                        continue
-                    parts = parts[1:]
-                run_label = self._sidecar_run_label(npz)
+                if not labelled:
+                    run_label = self._sidecar_run_label(npz)
+                elif len(parts) < 2:
+                    # A stray `.npz` at the root of a labelled tree names no Document:
+                    # every Document there sits under its Run's directory.
+                    continue
+                elif filename[: -len(".npz")] + ".json" not in names:
+                    # The pair, checked against names the walk already collected. The label
+                    # itself comes from the path, so the sidecar's *content* is not read.
+                    logger.warning("%s has no sidecar; treating its Document as not embedded and re-embedding it", npz)
+                    run_label = None
+                else:
+                    run_label, parts = parts[0], parts[1:]
                 if run_label is None:
                     continue
                 found.add((run_label, "/".join(parts)[: -len(".npz")]))
         return found
 
     def _sidecar_run_label(self, npz: Path) -> str | None:
+        """The label recorded beside one `.npz`, for the `bare` layout only.
+
+        The one place Resume opens a file per Document, and it is confined to the layout
+        whose paths cannot answer the question -- see `known()`.
+        """
         sidecar = npz.with_suffix(".json")
         try:
             payload = json.loads(sidecar.read_text(encoding="utf-8"))
@@ -499,4 +462,4 @@ class NpzSink:
         _atomic_write(path, lambda handle: handle.write(body.encode("utf-8")))
 
 
-__all__ = ["CHUNKER", "FAILURES_NAME", "MANIFEST_NAME", "POOLING", "Invariants", "NpzSink", "SinkInvariantError"]
+__all__ = ["CHUNKER", "FAILURES_NAME", "MANIFEST_NAME", "POOLING", "NpzSink"]

@@ -39,7 +39,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from paperscale.embed.npz_sink import Invariants, SinkInvariantError
+from paperscale.embed.invariants import Invariants, compare_invariant_facts
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -346,23 +346,22 @@ class LanceSink:
         return table
 
     def _compare_metadata(self, name: str, recorded_raw: dict[Any, Any] | None) -> None:
-        """Report **every** disagreeing fact with **both** values, then stop.
+        """The eight metadata facts, through the comparison both Sinks report with.
 
-        Every fact, not the first: a table built with a different model usually differs in several at
-        once (`model_id`, both Instructions, often `native_dim`), and reporting them one at a time
-        turns one operator decision into four failed runs.
+        The recorded side is decoded first: Arrow schema metadata is a bytes-to-bytes map, so the
+        stringified forms are what both sides compare -- `stored_dim` is `"768"` in the table and
+        `768` in the `Invariants`.
         """
-        current = table_metadata(self.invariants)
-        recorded = {_decode(key): _decode(value) for key, value in (recorded_raw or {}).items()}
-        diffs = [(fact, recorded.get(fact, "<absent>"), value) for fact, value in current.items() if recorded.get(fact, "<absent>") != value]
-        if not diffs:
-            return
-        lines = [f"  {fact}: this table has {was!r}, this Invocation has {now!r}" for fact, was, now in diffs]
-        raise SinkInvariantError(
-            f"{self.path / name}.lance was built by a different Invocation: {len(diffs)} invariant fact(s) disagree; nothing has been written.\n"
-            + "\n".join(lines)
-            + "\n  Re-run with the settings that built these tables, or point the LanceDB Sink at a fresh directory -- the table metadata is "
-            "write-once and cannot be corrected in place."
+        compare_invariant_facts(
+            {_decode(key): _decode(value) for key, value in (recorded_raw or {}).items()},
+            table_metadata(self.invariants),
+            subject=f"{self.path / name}.lance",
+            holder="this table",
+            nothing_yet="nothing has been written.",
+            remedy=(
+                "Re-run with the settings that built these tables, or point the LanceDB Sink at a fresh directory -- the table metadata is "
+                "write-once and cannot be corrected in place."
+            ),
         )
 
     def _ensure_index(self, table: Table) -> None:

@@ -237,7 +237,8 @@ async def _embed_invocation(args, *, runs: list[tuple[str, str]], adapter, store
     from paperscale.embed.budget import chunk_budget, request_budget, resolve_context_length
     from paperscale.embed.client import EmbedClient, ServerGoneError
     from paperscale.embed.lance_sink import LanceSink
-    from paperscale.embed.npz_sink import CHUNKER, FAILURES_NAME, POOLING, Invariants, NpzSink, SinkInvariantError
+    from paperscale.embed.invariants import Invariants, SinkInvariantError
+    from paperscale.embed.npz_sink import CHUNKER, FAILURES_NAME, POOLING, NpzSink
     from paperscale.embed.resume import KnownSink, LayoutChangeError, check_layout, derive_resume_state, invocation_layout, sink_set_warning
     from paperscale.tui import NullReporter, install_tui_logging, make_reporter, open_log_file, restore_console_logging
     from paperscale.vllm_stats import VLLMStats, VLLMStatsPoller, metrics_url
