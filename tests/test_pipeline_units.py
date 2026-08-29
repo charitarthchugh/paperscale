@@ -1,6 +1,7 @@
 """Tests for pure pipeline helpers (no server, no rendering)."""
 
 import errno
+import inspect
 import logging
 import os
 import tempfile
@@ -11,6 +12,7 @@ from unittest import mock
 
 from paperscale import pipeline
 from paperscale.pipeline import PageResult, _build_arg_parser, _tui_log_path, classify_document, count_documents, count_retries
+from paperscale.quality.verifier import QUALITY_CHECK_CODES
 from paperscale.prompts import PageResponse
 from paperscale.tui import install_tui_logging, restore_console_logging
 
@@ -649,6 +651,54 @@ class TuiCleanupTest(unittest.IsolatedAsyncioTestCase):
         for log, handlers in before:
             for handler in handlers:
                 self.assertIn(handler, log.handlers)
+
+
+class DisableQualityCheckFlagTests(unittest.TestCase):
+    """--disable-quality-check, from argv through to the verifier a page is judged by."""
+
+    # A page dominated by one repeated 22-token sentence. The loop unit is long
+    # enough that repeated_ngram provably cannot score it (its ceiling is
+    # 5 / period), so repeated_tail is the *only* check that rejects this page —
+    # which is what makes it a clean probe for disabling that one check.
+    LOOPING_PAGE = ("The Court finds that the respondent failed to establish a prima facie case. " * 20) + (
+        "Payment of the sum shall be made to the clerk within thirty (30) calendar days of the invoice date. " * 160
+    )
+
+    def test_default_is_no_checks_disabled(self):
+        args = _build_arg_parser().parse_args(["/tmp/ws"])
+        self.assertEqual(args.disabled_quality_checks, [])
+        # A run that never reaches main() still gets a fully armed gate.
+        self.assertFalse(args.quality_verifier.classify(self.LOOPING_PAGE).accepted)
+
+    def test_flag_is_repeatable_and_reaches_the_verifier(self):
+        args = _build_arg_parser().parse_args(["/tmp/ws", "--disable-quality-check", "repeated_tail", "--disable-quality-check", "mojibake"])
+        self.assertEqual(args.disabled_quality_checks, ["repeated_tail", "mojibake"])
+        verifier = pipeline._build_verifier(args.disabled_quality_checks)
+        self.assertEqual(verifier.disabled_checks, frozenset({"repeated_tail", "mojibake"}))
+        finding = verifier.classify(self.LOOPING_PAGE)
+        self.assertTrue(finding.accepted, finding.kind)
+        self.assertNotEqual(finding.kind, "repeated_tail")
+
+    def test_disabling_an_unrelated_check_leaves_the_page_rejected(self):
+        args = _build_arg_parser().parse_args(["/tmp/ws", "--disable-quality-check", "mojibake"])
+        self.assertFalse(pipeline._build_verifier(args.disabled_quality_checks).classify(self.LOOPING_PAGE).accepted)
+
+    def test_all_disables_every_check(self):
+        args = _build_arg_parser().parse_args(["/tmp/ws", "--disable-quality-check", "all"])
+        verifier = pipeline._build_verifier(args.disabled_quality_checks)
+        self.assertEqual(verifier.disabled_checks, frozenset(QUALITY_CHECK_CODES))
+        for text in ("", self.LOOPING_PAGE, "I cannot provide that."):
+            self.assertTrue(verifier.classify(text).accepted)
+
+    def test_unknown_check_is_rejected_by_argparse(self):
+        with self.assertRaises(SystemExit):
+            _build_arg_parser().parse_args(["/tmp/ws", "--disable-quality-check", "not_a_check"])
+
+    def test_try_single_page_uses_the_verifier_on_args(self):
+        # The judged-by path: whatever verifier main() puts on args is the one
+        # try_single_page consults, with no silent fallback to the module default.
+        source = inspect.getsource(pipeline.try_single_page)
+        self.assertIn("args.quality_verifier.classify(", source)
 
 
 if __name__ == "__main__":

@@ -17,8 +17,9 @@ It keeps olmOCR's document management, queueing, and CLI 1:1, with two additions
   SOTA 1B Markdown-OCR model — image-only prompt, rendered at 1540px by default;
   `lightonocr2-soup` is the same adapter on the more-robust
   [`-ocr-soup`](https://huggingface.co/lightonai/LightOnOCR-2-1B-ocr-soup)
-  merged checkpoint; `glm-ocr`, `qianfan-ocr`, `infinity-parser2-flash`, and
-  `surya2` add four more document-OCR VLMs, documented below).
+  merged checkpoint; `glm-ocr`, `qianfan-ocr`, `infinity-parser2-flash`,
+  `surya2`, `unlimited-ocr`, and `ovisocr2` add six more document-OCR VLMs,
+  documented below).
 - **Opt-out resume** — completed work items are skipped on restart by default
   (olmOCR's done-flag behavior). `--no-resume` wipes prior progress and
   reprocesses the workspace from scratch.
@@ -69,10 +70,19 @@ poetry run paperscale ./workspace \
   flags, `results/*.jsonl`, and (with `--markdown`) `markdown/` live.
 - `--pdfs` — local PDF/image paths, a glob (`'docs/*.pdf'`), `.tar.gz` tarballs,
   or a `.txt` file listing one path per line.
-- `--ocr-model {glm-ocr,infinity-parser2-flash,lightonocr2,lightonocr2-soup,markdown,olmocr,qianfan-ocr,surya2}`
+- `--ocr-model {glm-ocr,infinity-parser2-flash,lightonocr2,lightonocr2-soup,markdown,olmocr,ovisocr2,qianfan-ocr,surya2,unlimited-ocr}`
   — which OCR adapter drives prompting/parsing.
 - `--model` — the served model id sent in each request (or a Hugging Face path
   for the internal server).
+- `--disable-quality-check CHECK` — turn off one deterministic quality check so
+  it can no longer reject a page. Repeatable; `all` disables the gate entirely.
+  Checks: `empty_output`, `mojibake`, `control_characters`,
+  `refusal_boilerplate`, `malformed_frontmatter`, `repeated_character`,
+  `repeated_ngram`, `repeated_tail`, `truncation_indicator`, `length_anomaly`.
+  Prefer this over raising `--max_page_error_rate` when a corpus trips one
+  specific gate: it keeps the other checks armed instead of accepting every
+  failure mode at once. Pair it with `PAPERSCALE_DEBUG_REJECTS=<path>.jsonl` to
+  see what a gate was dropping before you switch it off.
 
 Inputs are added to the workspace queue, grouped into work items, and processed
 concurrently by `--workers`. Re-running the same command **resumes**: finished
@@ -239,6 +249,35 @@ vllm serve datalab-to/surya-ocr-2 --port 8000 --limit-mm-per-prompt '{"image": 1
 poetry run paperscale ./workspace --pdfs './docs/*.pdf' \
   --ocr-model surya2 --server http://127.0.0.1:8000/v1 --markdown
 ```
+
+### OvisOCR2
+
+`--ocr-model ovisocr2` drives
+[OvisOCR2](https://huggingface.co/ATH-MaaS/OvisOCR2) (`ATH-MaaS/OvisOCR2`, 0.8B,
+`Qwen3_5ForConditionalGeneration`), a compact end-to-end page parser post-trained
+from Qwen3.5-0.8B. It scores 96.58 on OmniDocBench v1.6 — the first end-to-end
+model to top that leaderboard — and 75.06 Avg3 on PureDocBench. One call returns
+the full page as Markdown, with LaTeX formulas and HTML `<table>` markup;
+paperscale strips the `<img src="images/bbox_…">` placeholders the model emits for
+charts and figures (their crops are never written) and flags those pages as
+diagrams instead.
+
+The vendor pins `vllm==0.22.1` and selects the Triton GDN prefill backend — the
+model interleaves Gated-DeltaNet `linear_attention` layers with full attention:
+
+```bash
+vllm serve ATH-MaaS/OvisOCR2 --port 8000 \
+  --gdn-prefill-backend triton \
+  --limit-mm-per-prompt '{"image": 1}' \
+  --mm-processor-kwargs '{"images_kwargs": {"min_pixels": 200704, "max_pixels": 8294400}}'
+
+poetry run paperscale ./workspace --pdfs './docs/*.pdf' \
+  --ocr-model ovisocr2 --server http://127.0.0.1:8000/v1 --markdown
+```
+
+Pages render at 1540px by default, comfortably inside the vendor's
+`448²`–`2880²` pixel band; that band tolerates roughly 3270px on the long edge
+via `--target_longest_image_dim` if a corpus has fine print.
 
 ## Outputs
 

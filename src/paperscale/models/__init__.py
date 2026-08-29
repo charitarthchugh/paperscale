@@ -12,6 +12,7 @@ from paperscale.models.infinity_parser import InfinityParser2FlashModel
 from paperscale.models.lightonocr import LightOnOCRModel, LightOnOCRSoupModel
 from paperscale.models.markdown import MarkdownModel
 from paperscale.models.olmocr import OlmOCRModel
+from paperscale.models.ovisocr2 import OvisOCR2Model
 from paperscale.models.qianfan import QianfanOCRModel
 from paperscale.models.surya import Surya2Model
 from paperscale.models.unlimited_ocr import UnlimitedOCRModel
@@ -28,6 +29,7 @@ MODEL_REGISTRY: dict[str, type[OCRModel]] = {
     "infinity-parser2-flash": InfinityParser2FlashModel,
     "surya2": Surya2Model,
     "unlimited-ocr": UnlimitedOCRModel,
+    "ovisocr2": OvisOCR2Model,
 }
 
 
@@ -52,6 +54,7 @@ __all__ = [
     "InfinityParser2FlashModel",
     "Surya2Model",
     "UnlimitedOCRModel",
+    "OvisOCR2Model",
     "MODEL_REGISTRY",
     "DEFAULT_MODEL",
     "build_ocr_model",
