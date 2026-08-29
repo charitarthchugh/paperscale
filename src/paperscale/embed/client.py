@@ -157,10 +157,13 @@ class EmbedClient:
     and therefore cannot cause the queue it is being compared against.
 
     ``native_dim`` is the width every payload must have. It is latched from the first
-    response if the caller has not pinned it, but design 12.1 step 8 pins it from the
-    Adapter before the probe: a server with a different size of the same family
-    loaded produces vectors that slice, normalize and store perfectly, and nothing
-    downstream ever notices (design 3.6).
+    response if the caller has not pinned it, and design 12.1 step 8 leans on exactly
+    that: the startup probe runs with it still **unset**, so the first response latches
+    the *server's* width and the mismatch can be reported with both numbers in hand.
+    The Adapter's value is assigned afterwards, and that assignment is what arms this
+    backstop for the rest of the Invocation. Without it, a server with a different size
+    of the same family loaded produces vectors that slice, normalize and store
+    perfectly, and nothing downstream ever notices (design 3.6).
 
     ``post`` is the injection seam for tests; the default is the raw-socket
     :func:`paperscale.pipeline.apost` that the OCR and pplx paths already use.

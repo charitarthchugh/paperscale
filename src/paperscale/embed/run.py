@@ -27,7 +27,7 @@ a `/tokenize` failure or an exhausted response axis fails **the Document**; a
 `ServerGoneError` is terminal for **the Invocation** and propagates, because a dead
 server would otherwise burn through the corpus at six connection attempts each,
 marking every Document failed -- and a Document recorded failed is one Resume retries,
-so the damage would outlive the run.
+so the damage would outlive the Invocation.
 """
 
 from __future__ import annotations
