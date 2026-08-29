@@ -45,9 +45,14 @@ __all__ = ["EmbedClient", "EmbedRequestError", "ServerGoneError", "TerminalDocum
 # Both budgets count *attempts*, not retries-after-the-first: design 12.6's table
 # reads "connection error | 6" and "bad response / timeout | --max-request-retries
 # 8", so six failed connections give up and eight failed responses give up. The two
-# axes therefore test the same way (``>=``); an exclusive ``>`` here would spend a
-# seventh attempt while every message still said six.
-_MAX_CONN_BACKOFF_ATTEMPTS = 6
+# axes therefore test the same way (``>=``).
+#
+# The name carries the same fact, because the old one did not. Read as a count of
+# *backoffs* -- which the guard and the warning line both did -- six sleeps need a
+# seventh send, and `ServerGoneError` was left saying "after 6 connection attempts"
+# about seven. Read as attempts, the guard, both messages and the table agree: six
+# sends, five sleeps.
+_MAX_CONN_ATTEMPTS = 6
 _CONN_MAX_BACKOFF_SECONDS = 120
 _FD_MAX_BACKOFF_SECONDS = 30
 _RESPONSE_MAX_BACKOFF_SECONDS = 30
@@ -218,7 +223,7 @@ class EmbedClient:
         timeout onto the connection axis and, at six failures, ends the Invocation
         for what design 12.6 classes as a per-request fault.
         """
-        attempt = conn_backoff = fd_backoff = 0
+        attempt = conn_attempt = fd_backoff = 0
         while True:
             try:
                 return await send()
@@ -245,18 +250,18 @@ class EmbedClient:
                     logger.warning(f"embed: out of file descriptors (errno {e.errno}); retrying {what} in {delay}s")
                     await self._backoff(delay)
                     continue
-                conn_backoff += 1
-                if conn_backoff >= _MAX_CONN_BACKOFF_ATTEMPTS:
+                conn_attempt += 1
+                if conn_attempt >= _MAX_CONN_ATTEMPTS:
                     raise ServerGoneError(
-                        f"embed: cannot reach {self.url} for {what} after {_MAX_CONN_BACKOFF_ATTEMPTS} connection attempts "
+                        f"embed: cannot reach {self.url} for {what} after {_MAX_CONN_ATTEMPTS} connection attempts "
                         f"({type(e).__name__}: {e}); stopping the invocation rather than failing every remaining document"
                     ) from e
                 # Full jitter -- new to paperscale, and load-bearing at this
                 # concurrency. A server restart fails all 64 in-flight requests from a
                 # single cause; unjittered, all 64 wake in the same instant and
                 # stampede a server that is still loading weights.
-                delay = random.uniform(0, min(10 * 2 ** (conn_backoff - 1), _CONN_MAX_BACKOFF_SECONDS))
-                logger.warning(f"embed: connection error ({type(e).__name__}: {e}); backoff {conn_backoff}/{_MAX_CONN_BACKOFF_ATTEMPTS}, sleeping {delay:.1f}s")
+                delay = random.uniform(0, min(10 * 2 ** (conn_attempt - 1), _CONN_MAX_BACKOFF_SECONDS))
+                logger.warning(f"embed: connection error ({type(e).__name__}: {e}); attempt {conn_attempt}/{_MAX_CONN_ATTEMPTS}, sleeping {delay:.1f}s")
                 await self._backoff(delay)
 
     async def _backoff(self, delay: float) -> None:

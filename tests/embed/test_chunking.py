@@ -276,16 +276,21 @@ class OversizedPageTests(unittest.IsolatedAsyncioTestCase, TilingMixin):
 
     async def test_a_whole_page_chunk_after_a_cut_page_is_not_marked_partial(self):
         # The flag has to describe the Chunk, not the Document: a Chunk that begins and ends
-        # on page boundaries is quotable as whole pages even when a neighbour was cut. Which
-        # page boundary the last Chunk opens on is arithmetic and moves with the cut sizes,
-        # so the assertion is that it opens on one, not which one.
+        # on page boundaries is quotable as whole pages even when a neighbour was cut.
+        #
+        # Which page it lands on is pinned, and the pin is doing the work. Measured cuts
+        # leave page 3 alone in the last Chunk; the estimated cuts this commit removed left
+        # pages 2 and 3 in it together. Both land on a page boundary and both come out
+        # whole, so "opens on some boundary and is not partial" is satisfied by the
+        # behaviour that was wrong -- asserted that way, this test passes unchanged on the
+        # previous commit and witnesses nothing.
         text, spans = _document(["z" * 400, "w" * 20, "v" * 20])
 
         chunks = await chunk_document(text, spans, 12, _FakeTokenizer())
 
         self.assert_tiles(chunks, text)
         self.assertFalse(chunks[-1].is_partial_page)
-        self.assertIn(chunks[-1].start_char, {start for start, _end, _page in spans})
+        self.assertEqual((chunks[-1].first_page, chunks[-1].last_page), (3, 3))
         self.assertTrue(chunks[-2].is_partial_page)
 
 
