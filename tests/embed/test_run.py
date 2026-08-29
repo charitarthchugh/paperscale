@@ -77,7 +77,11 @@ class _FakeServer:
             if self.refuse and any(_POISON in text for text in texts):
                 if self.oversize:
                     return 400, b'{"error": {"message": "This model\'s maximum context length is 4096 tokens"}}'
-                return 400, b'{"error": {"message": "bad request"}}'
+                # 413, not a plain 400. Design 12.6 makes only a context-overflow `400` and a
+                # `413` terminal for the Document; every other `400` rides the response axis for
+                # eight attempts. The split exists for a refusal the Document cannot come back
+                # from, so the poison has to be one.
+                return 413, b'{"error": {"message": "request entity too large"}}'
             data = [{"index": i, "embedding": _b64(self._vector(text))} for i, text in enumerate(texts)]
             return 200, json.dumps({"data": data}).encode()
         raise AssertionError(f"unexpected route {url}")
@@ -308,7 +312,7 @@ class SplitOnFailureTest(unittest.TestCase):
     def _embed(self, *, oversize: bool = False):
         server = _FakeServer()
         server.oversize = oversize
-        with _serving(server):
+        with _serving(server), _NoSleep():
             code, report = _run(
                 "--run",
                 f"r={self.root / 'run'}",

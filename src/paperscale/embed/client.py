@@ -41,6 +41,12 @@ __all__ = ["EmbedClient", "EmbedRequestError", "ServerGoneError", "TerminalDocum
 
 # Retry shape, design 12.6. The connection axis is the only one with jitter, and
 # the only one whose exhaustion ends the Invocation rather than the Document.
+#
+# Both budgets count *attempts*, not retries-after-the-first: design 12.6's table
+# reads "connection error | 6" and "bad response / timeout | --max-request-retries
+# 8", so six failed connections give up and eight failed responses give up. The two
+# axes therefore test the same way (``>=``); an exclusive ``>`` here would spend a
+# seventh attempt while every message still said six.
 _MAX_CONN_BACKOFF_ATTEMPTS = 6
 _CONN_MAX_BACKOFF_SECONDS = 120
 _FD_MAX_BACKOFF_SECONDS = 30
@@ -172,6 +178,7 @@ class EmbedClient:
         self.tokenize_concurrency = max(1, (self.concurrency * 3) // 2)
         self.max_request_retries = max(1, max_request_retries)
         self.outstanding = 0
+        self.retrying = 0
         self.native_dim: int | None = None
         self._post = apost if post is None else post
         self._loop = None
@@ -224,24 +231,22 @@ class EmbedClient:
             except (EmbedRequestError, asyncio.TimeoutError) as e:
                 attempt += 1
                 if attempt >= self.max_request_retries:
-                    raise EmbedRequestError(
-                        f"embed: {what} failed {attempt} times ({type(e).__name__}: {e}); giving up on this request"
-                    ) from e
+                    raise EmbedRequestError(f"embed: {what} failed {attempt} times ({type(e).__name__}: {e}); giving up on this request") from e
                 delay = min(2**attempt, _RESPONSE_MAX_BACKOFF_SECONDS)
                 # No jitter here, deliberately. This axis fails per request for
                 # per-request reasons, so there is no herd to break up and the extra
                 # variance would only slow the retry down.
                 logger.warning(f"embed: {what} failed ({type(e).__name__}: {e}); attempt {attempt}/{self.max_request_retries}, sleeping {delay}s")
-                await asyncio.sleep(delay)
+                await self._backoff(delay)
             except OSError as e:
                 if e.errno in (errno.EMFILE, errno.ENFILE):
                     delay = min(2**fd_backoff, _FD_MAX_BACKOFF_SECONDS)
                     fd_backoff += 1
                     logger.warning(f"embed: out of file descriptors (errno {e.errno}); retrying {what} in {delay}s")
-                    await asyncio.sleep(delay)
+                    await self._backoff(delay)
                     continue
                 conn_backoff += 1
-                if conn_backoff > _MAX_CONN_BACKOFF_ATTEMPTS:
+                if conn_backoff >= _MAX_CONN_BACKOFF_ATTEMPTS:
                     raise ServerGoneError(
                         f"embed: cannot reach {self.url} for {what} after {_MAX_CONN_BACKOFF_ATTEMPTS} connection attempts "
                         f"({type(e).__name__}: {e}); stopping the invocation rather than failing every remaining document"
@@ -251,10 +256,26 @@ class EmbedClient:
                 # single cause; unjittered, all 64 wake in the same instant and
                 # stampede a server that is still loading weights.
                 delay = random.uniform(0, min(10 * 2 ** (conn_backoff - 1), _CONN_MAX_BACKOFF_SECONDS))
-                logger.warning(
-                    f"embed: connection error ({type(e).__name__}: {e}); backoff {conn_backoff}/{_MAX_CONN_BACKOFF_ATTEMPTS}, sleeping {delay:.1f}s"
-                )
-                await asyncio.sleep(delay)
+                logger.warning(f"embed: connection error ({type(e).__name__}: {e}); backoff {conn_backoff}/{_MAX_CONN_BACKOFF_ATTEMPTS}, sleeping {delay:.1f}s")
+                await self._backoff(delay)
+
+    async def _backoff(self, delay: float) -> None:
+        """Sleep out one retry axis, counted in ``retrying`` for as long as it lasts.
+
+        Design 13.2 asks for a gauge, not a tally: the row answers "how many requests
+        are asleep right now", so it has to fall back to zero when the server recovers.
+        A tally would only ever climb, and a panel row that never falls stops carrying
+        information about the present.
+
+        All three axes count. A request waiting on a file descriptor is as stalled as
+        one waiting on a server that has gone; the operator watching the panel wants
+        the number of requests that are not moving, not a taxonomy of why.
+        """
+        self.retrying += 1
+        try:
+            await asyncio.sleep(delay)
+        finally:
+            self.retrying -= 1
 
     async def models(self) -> tuple[str, int]:
         """``GET /v1/models`` -> ``(served_model_id, max_model_len)``.
@@ -380,10 +401,16 @@ class EmbedClient:
             finally:
                 self.outstanding -= 1
         snippet = (raw or b"")[:300]
+        # Design 12.6 scopes terminal-without-retry, for the Document, to exactly two
+        # responses: "a `400` context overflow, and `413`". A 400 that says nothing
+        # about context length is a request the server would not parse, which is a bad
+        # response like any other -- it belongs on the bad-response axis below, rather
+        # than in a taxonomy wider than the design draws. Failing the whole status
+        # would deny such a request the eight attempts one of which may well succeed.
         if status == 400 and _CONTEXT_OVERFLOW.search(raw or b""):
             raise TerminalDocumentError(f"embed: /v1/embeddings returned 400 context overflow: {snippet!r}", oversize=True)
-        if status in (400, 413):
-            raise TerminalDocumentError(f"embed: /v1/embeddings returned {status}: {snippet!r}")
+        if status == 413:
+            raise TerminalDocumentError(f"embed: /v1/embeddings returned 413: {snippet!r}")
         if status != 200:
             raise EmbedRequestError(f"embed: /v1/embeddings returned {status}: {snippet!r}")
         try:
