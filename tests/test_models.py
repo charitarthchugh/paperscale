@@ -11,6 +11,7 @@ from paperscale.models import (
     LightOnOCRSoupModel,
     MarkdownModel,
     OlmOCRModel,
+    OvisOCR2Model,
     QianfanOCRModel,
     Surya2Model,
     UnlimitedOCRModel,
@@ -18,6 +19,7 @@ from paperscale.models import (
 )
 from paperscale.models.glmocr import GLM_OCR_PROMPT
 from paperscale.models.markdown import _strip_code_fence
+from paperscale.models.ovisocr2 import OVIS_OCR2_PROMPT
 from paperscale.prompts import PageResponse
 
 
@@ -35,6 +37,7 @@ class RegistryTests(unittest.TestCase):
         self.assertIsInstance(build_ocr_model("infinity-parser2-flash"), InfinityParser2FlashModel)
         self.assertIsInstance(build_ocr_model("surya2"), Surya2Model)
         self.assertIsInstance(build_ocr_model("unlimited-ocr"), UnlimitedOCRModel)
+        self.assertIsInstance(build_ocr_model("ovisocr2"), OvisOCR2Model)
 
     def test_registry_contents(self):
         self.assertEqual(
@@ -49,6 +52,7 @@ class RegistryTests(unittest.TestCase):
                 "infinity-parser2-flash",
                 "surya2",
                 "unlimited-ocr",
+                "ovisocr2",
             },
         )
 
@@ -120,31 +124,14 @@ class OlmOCRModelTests(unittest.TestCase):
         self.assertIsNotNone(self.model.guided_regex())
 
     def test_parse_front_matter(self):
-        content = (
-            "---\n"
-            "primary_language: en\n"
-            "is_rotation_valid: True\n"
-            "rotation_correction: 0\n"
-            "is_table: False\n"
-            "is_diagram: False\n"
-            "---\n"
-            "Hello world"
-        )
+        content = "---\nprimary_language: en\nis_rotation_valid: True\nrotation_correction: 0\nis_table: False\nis_diagram: False\n---\nHello world"
         result = self.model.parse(content)
         self.assertEqual(result.natural_text, "Hello world")
         self.assertEqual(result.primary_language, "en")
         self.assertTrue(result.is_rotation_valid)
 
     def test_parse_rotation_flag(self):
-        content = (
-            "---\n"
-            "primary_language: null\n"
-            "is_rotation_valid: False\n"
-            "rotation_correction: 90\n"
-            "is_table: False\n"
-            "is_diagram: False\n"
-            "---\n"
-        )
+        content = "---\nprimary_language: null\nis_rotation_valid: False\nrotation_correction: 90\nis_table: False\nis_diagram: False\n---\n"
         result = self.model.parse(content)
         self.assertFalse(result.is_rotation_valid)
         self.assertEqual(result.rotation_correction, 90)
@@ -421,7 +408,7 @@ class Surya2ModelTests(unittest.TestCase):
         # is_table/is_diagram must not depend on the model's quoting style.
         single = "<div data-label='Table'><table><tr><td>x</td></tr></table></div>"
         self.assertTrue(self.model.parse(single).is_table)
-        spaced = "<div data-label = \"Figure\">fig</div>"
+        spaced = '<div data-label = "Figure">fig</div>'
         self.assertTrue(self.model.parse(spaced).is_diagram)
 
 
@@ -449,10 +436,7 @@ class UnlimitedOCRModelTests(unittest.TestCase):
         self.assertEqual(image_part["image_url"]["url"], "data:image/png;base64,QUJD")
 
     def test_parse_unwraps_ref_and_drops_det(self):
-        raw = (
-            "<|ref|># Heading<|/ref|><|det|>[[10,20,900,60]]<|/det|>\n\n"
-            "Body text with <|ref|>a grounded span<|/ref|><|det|>[[1,2,3,4]]<|/det|> inline."
-        )
+        raw = "<|ref|># Heading<|/ref|><|det|>[[10,20,900,60]]<|/det|>\n\nBody text with <|ref|>a grounded span<|/ref|><|det|>[[1,2,3,4]]<|/det|> inline."
         result = self.model.parse(raw)
         self.assertEqual(
             result.natural_text,
@@ -472,6 +456,80 @@ class UnlimitedOCRModelTests(unittest.TestCase):
     def test_parse_empty_page_is_none(self):
         self.assertIsNone(self.model.parse("").natural_text)
         self.assertIsNone(self.model.parse("<|ref|><|/ref|><|det|>[[0,0,0,0]]<|/det|>").natural_text)
+
+
+class OvisOCR2ModelTests(unittest.TestCase):
+    def setUp(self):
+        self.model = OvisOCR2Model()
+
+    def test_recipe(self):
+        self.assertEqual(self.model.default_model_name, "ATH-MaaS/OvisOCR2")
+        self.assertEqual(self.model.preferred_longest_image_dim, 1540)
+        # Vendor decodes at 16384 tokens; temperature stays pipeline-owned.
+        self.assertEqual(self.model.sampling_params(), {"max_tokens": 16384})
+        self.assertNotIn("temperature", self.model.sampling_params())
+        self.assertIsNone(self.model.guided_regex())
+
+    def test_prompt_is_vendor_verbatim(self):
+        # The leading newline separates the image from the instruction once the
+        # chat template renders the turn; the braces are literal, not a format spec.
+        self.assertTrue(OVIS_OCR2_PROMPT.startswith("\nExtract all readable content from the image"))
+        self.assertIn('<img src="images/bbox_{left}_{top}_{right}_{bottom}.jpg" />', OVIS_OCR2_PROMPT)
+        self.assertIn("Format tables as HTML: <table>...</table>.", OVIS_OCR2_PROMPT)
+        self.assertTrue(OVIS_OCR2_PROMPT.endswith("without translation or paraphrasing."))
+
+    def test_build_messages_puts_image_before_prompt(self):
+        # Order is load-bearing: the chat template trims the ends of the rendered
+        # user turn, so a text-first layout would eat the prompt's leading newline.
+        messages = self.model.build_messages("QUJD")
+        self.assertEqual(len(messages), 1)
+        image_part, text_part = messages[0]["content"]
+        self.assertEqual(image_part["image_url"]["url"], "data:image/png;base64,QUJD")
+        self.assertEqual(text_part, {"type": "text", "text": OVIS_OCR2_PROMPT})
+
+    def test_parse_passes_markdown_through(self):
+        result = self.model.parse("# Title\n\nBody text.")
+        self.assertEqual(result.natural_text, "# Title\n\nBody text.")
+        self.assertTrue(result.is_rotation_valid)
+        self.assertEqual(result.rotation_correction, 0)
+        self.assertFalse(result.is_table)
+        self.assertFalse(result.is_diagram)
+
+    def test_parse_drops_bbox_image_tags_and_flags_diagram(self):
+        raw = '# Report\n\n<img src="images/bbox_100_200_800_600.jpg" />\n\nFigure 1 shows the trend.'
+        result = self.model.parse(raw)
+        self.assertEqual(result.natural_text, "# Report\n\nFigure 1 shows the trend.")
+        self.assertNotIn("<img", result.natural_text)
+        self.assertTrue(result.is_diagram)
+
+    def test_parse_drops_inline_bbox_image_tag(self):
+        # The vendor filters whole blocks; a dead reference mid-paragraph is just
+        # as dangling here, since paperscale never writes the crop files.
+        result = self.model.parse('See <img src="images/bbox_1_2_3_4.jpg" /> below.')
+        self.assertEqual(result.natural_text, "See  below.")
+        self.assertTrue(result.is_diagram)
+
+    def test_parse_detects_html_table(self):
+        result = self.model.parse("<table><tr><td>1</td></tr></table>")
+        self.assertTrue(result.is_table)
+        self.assertFalse(result.is_diagram)
+
+    def test_parse_strips_think_block(self):
+        result = self.model.parse("<think>\n\n</think>\n\n# Heading")
+        self.assertEqual(result.natural_text, "# Heading")
+
+    def test_parse_keeps_content_before_stray_think_close(self):
+        # Matched-pair only: a transcribed "</think>" must not truncate the page.
+        result = self.model.parse("Body mentioning </think> literally.")
+        self.assertEqual(result.natural_text, "Body mentioning </think> literally.")
+
+    def test_parse_empty_page_is_none(self):
+        self.assertIsNone(self.model.parse("").natural_text)
+        # A page whose only output was a figure placeholder is empty text, but is
+        # still a diagram page.
+        figure_only = self.model.parse('<img src="images/bbox_0_0_999_999.jpg" />')
+        self.assertIsNone(figure_only.natural_text)
+        self.assertTrue(figure_only.is_diagram)
 
 
 if __name__ == "__main__":

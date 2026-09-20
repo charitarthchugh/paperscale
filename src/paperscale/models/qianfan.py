@@ -15,16 +15,10 @@ the final ``</think>``.
 
 from __future__ import annotations
 
-import re
 from dataclasses import replace
 
-from paperscale.models.markdown import MarkdownModel
+from paperscale.models.markdown import MarkdownModel, has_html_table, strip_think_blocks
 from paperscale.prompts import PageResponse
-
-# A complete <think>...</think> reasoning block (only emitted when
-# enable_thinking=True, which paperscale never sets). Matched-pair only, so a
-# literal "</think>" transcribed from the page can't truncate real content.
-_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 
 class QianfanOCRModel(MarkdownModel):
@@ -45,9 +39,8 @@ class QianfanOCRModel(MarkdownModel):
         # Defensive: drop any <think>...</think> reasoning block. paperscale never
         # sets enable_thinking, so this is normally a no-op; matched-pair only, so a
         # literal "</think>" in the page can't truncate the transcription.
-        content = _THINK_BLOCK.sub("", content)
+        content = strip_think_blocks(content)
         result = super().parse(content)
         # Qianfan returns tables as HTML, which paperscale accepts as-is. Recompute
         # is_table from the emitted Markdown rather than convert it.
-        is_table = "<table" in (result.natural_text or "").lower()
-        return replace(result, is_table=is_table)
+        return replace(result, is_table=has_html_table(result.natural_text))
