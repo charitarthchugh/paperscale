@@ -7,6 +7,7 @@ from paperscale.models import (
     MODEL_REGISTRY,
     GLMOCRModel,
     InfinityParser2FlashModel,
+    JinaOCRModel,
     LightOnOCRModel,
     LightOnOCRSoupModel,
     MarkdownModel,
@@ -17,6 +18,7 @@ from paperscale.models import (
     build_ocr_model,
 )
 from paperscale.models.glmocr import GLM_OCR_PROMPT
+from paperscale.models.jina_ocr import JINA_OCR_PROMPT
 from paperscale.models.markdown import _strip_code_fence
 from paperscale.prompts import PageResponse
 
@@ -31,6 +33,7 @@ class RegistryTests(unittest.TestCase):
         self.assertIsInstance(build_ocr_model("lightonocr2"), LightOnOCRModel)
         self.assertIsInstance(build_ocr_model("lightonocr2-soup"), LightOnOCRSoupModel)
         self.assertIsInstance(build_ocr_model("glm-ocr"), GLMOCRModel)
+        self.assertIsInstance(build_ocr_model("jina-ocr"), JinaOCRModel)
         self.assertIsInstance(build_ocr_model("qianfan-ocr"), QianfanOCRModel)
         self.assertIsInstance(build_ocr_model("infinity-parser2-flash"), InfinityParser2FlashModel)
         self.assertIsInstance(build_ocr_model("surya2"), Surya2Model)
@@ -45,6 +48,7 @@ class RegistryTests(unittest.TestCase):
                 "lightonocr2",
                 "lightonocr2-soup",
                 "glm-ocr",
+                "jina-ocr",
                 "qianfan-ocr",
                 "infinity-parser2-flash",
                 "surya2",
@@ -251,6 +255,69 @@ class GLMOCRModelTests(unittest.TestCase):
 
     def test_parse_empty_page_is_none(self):
         self.assertIsNone(self.model.parse("   ").natural_text)
+
+
+class JinaOCRModelTests(unittest.TestCase):
+    def setUp(self):
+        self.model = JinaOCRModel()
+
+    def test_recipe(self):
+        self.assertEqual(self.model.default_model_name, "jinaai/jina-ocr-v1")
+        # processor_config.json: base_size=1024, image_size=640, crop_mode=true
+        # (DeepSeek-OCR "gundam" tiling), the same geometry as unlimited-ocr.
+        self.assertEqual(self.model.preferred_longest_image_dim, 1024)
+        self.assertIsNone(self.model.guided_regex())
+
+    def test_sampling_params_leave_temperature_to_the_pipeline(self):
+        # The pipeline escalates temperature per retry attempt; an adapter that
+        # pinned it would defeat the retry ladder.
+        self.assertNotIn("temperature", self.model.sampling_params())
+
+    def test_prompt_is_vendor_verbatim(self):
+        # DEFAULT_OCR_PROMPT from the snapshot's deepseek_ocr_mtp.py. The card's
+        # stricter benchmark prompt is deliberately not used: it drops headers
+        # and footers, which carry page numbers and citations in scanned legal
+        # documents, and it answers "null" on a blank page.
+        self.assertEqual(
+            JINA_OCR_PROMPT,
+            "Transcribe the provided document image into a clean Markdown format, preserving the natural reading order.",
+        )
+
+    def test_build_messages_puts_image_before_prompt(self):
+        # Vendor content order (prepare_vllm_input / example.py): the chat
+        # template emits the image/instruction separator only in this order.
+        messages = self.model.build_messages("QUJD")
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["role"], "user")
+        image_part, text_part = messages[0]["content"]
+        self.assertEqual(image_part["type"], "image_url")
+        self.assertEqual(image_part["image_url"]["url"], "data:image/png;base64,QUJD")
+        self.assertEqual(text_part, {"type": "text", "text": JINA_OCR_PROMPT})
+
+    def test_parse_passes_markdown_through(self):
+        page = self.model.parse("# Heading\n\nBody text.")
+        self.assertEqual(page.natural_text, "# Heading\n\nBody text.")
+        self.assertIsNone(page.primary_language)
+        self.assertTrue(page.is_rotation_valid)
+        self.assertEqual(page.rotation_correction, 0)
+        self.assertFalse(page.is_table)
+        self.assertFalse(page.is_diagram)
+
+    def test_parse_keeps_markdown_tables(self):
+        # The recommended prompt yields Markdown tables, not HTML, so there is
+        # no <table> for the pipeline to keep as-is.
+        raw = "| a | b |\n| - | - |\n| 1 | 2 |"
+        page = self.model.parse(raw)
+        self.assertEqual(page.natural_text, raw)
+        self.assertNotIn("<table", page.natural_text)
+
+    def test_parse_strips_wrapping_code_fence(self):
+        page = self.model.parse("```markdown\n# Heading\n\nBody.\n```")
+        self.assertEqual(page.natural_text, "# Heading\n\nBody.")
+
+    def test_parse_empty_page_is_none(self):
+        self.assertIsNone(self.model.parse("").natural_text)
+        self.assertIsNone(self.model.parse("   \n  ").natural_text)
 
 
 class QianfanOCRModelTests(unittest.TestCase):

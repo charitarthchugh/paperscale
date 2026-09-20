@@ -17,8 +17,8 @@ It keeps olmOCR's document management, queueing, and CLI 1:1, with two additions
   SOTA 1B Markdown-OCR model — image-only prompt, rendered at 1540px by default;
   `lightonocr2-soup` is the same adapter on the more-robust
   [`-ocr-soup`](https://huggingface.co/lightonai/LightOnOCR-2-1B-ocr-soup)
-  merged checkpoint; `glm-ocr`, `qianfan-ocr`, `infinity-parser2-flash`, and
-  `surya2` add four more document-OCR VLMs, documented below).
+  merged checkpoint; `glm-ocr`, `qianfan-ocr`, `infinity-parser2-flash`,
+  `surya2`, and `jina-ocr` add five more document-OCR VLMs, documented below).
 - **Opt-out resume** — completed work items are skipped on restart by default
   (olmOCR's done-flag behavior). `--no-resume` wipes prior progress and
   reprocesses the workspace from scratch.
@@ -69,7 +69,7 @@ poetry run paperscale ./workspace \
   flags, `results/*.jsonl`, and (with `--markdown`) `markdown/` live.
 - `--pdfs` — local PDF/image paths, a glob (`'docs/*.pdf'`), `.tar.gz` tarballs,
   or a `.txt` file listing one path per line.
-- `--ocr-model {glm-ocr,infinity-parser2-flash,lightonocr2,lightonocr2-soup,markdown,olmocr,qianfan-ocr,surya2}`
+- `--ocr-model {glm-ocr,infinity-parser2-flash,jina-ocr,lightonocr2,lightonocr2-soup,markdown,olmocr,qianfan-ocr,surya2}`
   — which OCR adapter drives prompting/parsing.
 - `--model` — the served model id sent in each request (or a Hugging Face path
   for the internal server).
@@ -239,6 +239,61 @@ vllm serve datalab-to/surya-ocr-2 --port 8000 --limit-mm-per-prompt '{"image": 1
 poetry run paperscale ./workspace --pdfs './docs/*.pdf' \
   --ocr-model surya2 --server http://127.0.0.1:8000/v1 --markdown
 ```
+
+### Jina-OCR-v1
+
+`--ocr-model jina-ocr` drives
+[jina-ocr-v1](https://huggingface.co/jinaai/jina-ocr-v1) (`jinaai/jina-ocr-v1`,
+3.4B total / ~570M active), Jina AI's document parser built on the DeepSeek-OCR
+backbone — a DeepEncoder vision tower that spends only 256 visual tokens on a
+1024×1024 global view, plus a mixture-of-experts decoder. It scores 91.14 on
+OmniDocBench v1.6 and 83.4 on olmOCR-Bench while emitting the shortest output of
+any system above 83 (~1085 tokens/page), which is what makes it fast: 2.57
+pages/s on one A100 at concurrency 32. One call returns the page as plain
+Markdown with Markdown tables — no grounding tokens or bbox placeholders to
+strip. **It is CC BY-NC 4.0**: non-commercial use only, unlike every other
+adapter here.
+
+paperscale sends the vendor's recommended prompt, which transcribes the whole
+page. The model card documents a stricter benchmark instruction (the one behind
+the scores above) that emits HTML tables and `$…$` LaTeX but *drops headers and
+footers* — a bad trade for scanned legal documents, where those carry the page
+numbers and citations.
+
+Jina's hosted endpoint is OpenAI-compatible, so no local GPU is needed:
+
+```bash
+poetry run paperscale ./workspace --pdfs './docs/*.pdf' \
+  --ocr-model jina-ocr --model jina-ocr-v1 \
+  --server https://api.jina.ai/v1 --api_key "$JINA_API_KEY" --markdown
+```
+
+A cold start there answers HTTP 503; the pipeline's retry/backoff rides it out.
+
+Self-hosting takes more than a plain `vllm serve`: the checkpoint carries
+FastMTP speculative-decoding tensors that stock vLLM's `DeepseekOCRForCausalLM`
+loader rejects, so the snapshot's `deepseek_ocr_mtp.register()` has to run in
+every vLLM process. The vendor documents that call only for the offline
+`LLM(...)` API; wrap it in a `vllm.general_plugins` entry point (see the module
+docstring in `src/paperscale/models/jina_ocr.py` for the six-line shim) and the
+server comes up with FastMTP enabled:
+
+```bash
+vllm serve jinaai/jina-ocr-v1 --port 8000 --trust-remote-code --dtype bfloat16 \
+  --hf-overrides '{"architectures":["DeepseekOCRForCausalLMOCR"],"num_nextn_predict_layers":1,"mtp_recursive":true,"image_token_index":128815}' \
+  --speculative-config '{"model":"jinaai/jina-ocr-v1","num_speculative_tokens":3,"method":"eagle"}'
+```
+
+The `--hf-overrides` are needed with or without speculation; drop
+`--speculative-config` to serve the decoder alone. `method` must be `eagle`, not
+`mtp` — FastMTP's draft head is recursive, and vLLM's `mtp` re-grounds each step
+on the target, which collapses the acceptance rate (it cannot corrupt output:
+greedy verification accepts only a token-equality prefix). Speculation helps
+most at low concurrency, so check the `SpecDecoding metrics` line before
+assuming it speeds up a run with many `--workers`.
+
+Pages render at 1024px, matching the processor's `base_size=1024` / `crop_mode`
+gundam tiling.
 
 ## Outputs
 

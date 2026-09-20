@@ -9,6 +9,7 @@ from __future__ import annotations
 from paperscale.models.base import OCRModel
 from paperscale.models.glmocr import GLMOCRModel
 from paperscale.models.infinity_parser import InfinityParser2FlashModel
+from paperscale.models.jina_ocr import JinaOCRModel
 from paperscale.models.lightonocr import LightOnOCRModel, LightOnOCRSoupModel
 from paperscale.models.markdown import MarkdownModel
 from paperscale.models.olmocr import OlmOCRModel
@@ -24,6 +25,7 @@ MODEL_REGISTRY: dict[str, type[OCRModel]] = {
     "lightonocr2": LightOnOCRModel,
     "lightonocr2-soup": LightOnOCRSoupModel,
     "glm-ocr": GLMOCRModel,
+    "jina-ocr": JinaOCRModel,
     "qianfan-ocr": QianfanOCRModel,
     "infinity-parser2-flash": InfinityParser2FlashModel,
     "surya2": Surya2Model,
@@ -48,6 +50,7 @@ __all__ = [
     "LightOnOCRModel",
     "LightOnOCRSoupModel",
     "GLMOCRModel",
+    "JinaOCRModel",
     "QianfanOCRModel",
     "InfinityParser2FlashModel",
     "Surya2Model",
